@@ -102,6 +102,24 @@ def _prepend_to_user(user_msg: dict[str, Any], context_text: str) -> dict[str, A
     return out
 
 
+# The agent's entire tool surface. Every other tool is discovered through
+# ``search_tools`` and invoked through ``execute_tool`` (which triggers a
+# forced parameter-fill call — see ``_prepare_fill_call``). These names are a
+# string convention, like the "llm"/"parser" service names, so the kernel loop
+# needs no import edge into the plugin tree that ships the tools.
+AGENT_KERNEL_TOOLS: tuple[str, ...] = ("search_tools", "execute_tool")
+# Name of the escape hatch injected alongside the target during a fill: forced
+# tool choice cannot otherwise decline, and confident garbage is the worst
+# failure mode, so every fill offers an abort that bounces back to search.
+ABORT_FILL_TOOL = "abort_fill"
+
+
+def _schema_name(schema: dict[str, Any]) -> str | None:
+    """Extract the function name from an OpenAI-style tool schema."""
+    fn = (schema or {}).get("function", schema) or {}
+    return fn.get("name")
+
+
 class ConversationLoop:
     """Drive a participant's turn until they end it.
 
@@ -425,6 +443,12 @@ class ConversationLoop:
         if queued is not None:
             return queued
 
+        # 1c) A tool was selected via execute_tool and is waiting for its
+        #     parameters. Shape exactly one forced call over [target, abort_fill]
+        #     — the fill stage, split from the decision stage. Sets the once-flags
+        #     consumed by the model call below; falls through to it.
+        self._prepare_fill_call()
+
         # 2) Final text was already emitted but turn isn't ended → end it.
         if self._final_text is not None and cs.turn_priority == "agent":
             text = self._final_text
@@ -438,7 +462,7 @@ class ConversationLoop:
         #    toolbox and ephemeral notes shown to the model but kept out of
         #    history.
         from attachments.attachment import AttachmentBundle
-        schemas = self.tool_registry.get_all_schemas() if self.tool_registry else None
+        schemas = self._agent_facing_schemas()
         if self._tools_override_once is not None:
             schemas = self._tools_override_once
         if self._suppress_tools_once:
@@ -1045,6 +1069,91 @@ class ConversationLoop:
             if fn.get("name") == name:
                 return schema
         return None
+
+    def _schema_for_tool(self, name: str):
+        """Resolve a tool's schema for a forced call, even when it is hidden.
+
+        The agent only ever *sees* the kernel tools, but a fill call must
+        present the chosen target (and abort_fill) regardless of what the normal
+        agent-facing view or a profile scope exposes. Falls back to building the
+        schema straight off the registered instance."""
+        schema = self._tool_schema(name)
+        if schema is not None:
+            return schema
+        tool = (getattr(self.tool_registry, "tools", {}) or {}).get(name)
+        return tool.to_schema() if tool is not None else None
+
+    def _agent_facing_schemas(self):
+        """The tools the agent sees on a normal turn.
+
+        When the two-tool interface is installed, the LLM's schema list collapses
+        to exactly ``search_tools`` + ``execute_tool`` — the full catalog stays
+        registered and searchable (search_tools reads it, execute_tool dispatches
+        it), but per-turn context cost is one catalog line, so the catalog can
+        grow without bound.
+
+        When the interface is *not* installed (a bare kernel, or a test that
+        registers tools directly), the collapse would leave the agent with no
+        way to reach those tools, so we fall back to presenting the full
+        registry. This is not a configurable "classic mode" — in a real kernel
+        the two tools ship built-in, so the agent always sees exactly two; the
+        fallback only covers the degenerate no-interface case.
+        """
+        all_schemas = self.tool_registry.get_all_schemas() if self.tool_registry else None
+        if not all_schemas:
+            return None
+        kernel = [s for s in all_schemas if _schema_name(s) in AGENT_KERNEL_TOOLS]
+        return kernel or all_schemas
+
+    def _prepare_fill_call(self) -> None:
+        """If a tool selection is awaiting its fill, shape the next model call.
+
+        Consumes ``session.pending_fill`` (set by execute_tool) and arms the
+        once-flags so the upcoming model call presents exactly the chosen target
+        plus abort_fill, forced. The intent sentence — the *why* carried across
+        the decision→fill boundary — and the tool's own fill prompt ride as an
+        ephemeral note (shown to the model, kept out of history)."""
+        session = self._session()
+        fill = getattr(session, "pending_fill", None) if session is not None else None
+        if not fill:
+            return
+        lock = getattr(session, "lock", None)
+        if lock is not None:
+            with lock:
+                session.pending_fill = None
+        else:
+            session.pending_fill = None
+        name = fill.get("name")
+        intent = (fill.get("intent") or "").strip()
+        target_schema = self._schema_for_tool(name)
+        if target_schema is None:
+            # The tool vanished between selection and fill (rare). Nudge the
+            # agent back to search rather than forcing a call it can't make.
+            self._pending_ephemeral_notes.append(
+                f"The tool '{name}' is no longer available. Use search_tools to find another."
+            )
+            return
+        schemas = [target_schema]
+        abort_schema = self._schema_for_tool(ABORT_FILL_TOOL)
+        if abort_schema is not None:
+            schemas.append(abort_schema)
+        self._tools_override_once = schemas
+        if getattr(self.llm, "supports_tool_choice", False):
+            # "Call one of these" — with only the target + abort present, the
+            # model is forced to either fill the target or explicitly abort.
+            self._tool_choice_once = "required"
+        tool = (getattr(self.tool_registry, "tools", {}) or {}).get(name)
+        fill_prompt = (getattr(tool, "fill_prompt", "") or "").strip()
+        note = [
+            f"You selected the tool `{name}`" + (f" to: {intent}" if intent else "") + ".",
+            f"Fill in its parameters and call `{name}` now",
+            (f", or call `{ABORT_FILL_TOOL}` if it is the wrong tool for this."
+             if abort_schema is not None else "."),
+        ]
+        message = "".join(note)
+        if fill_prompt:
+            message += "\n\n" + fill_prompt
+        self._pending_ephemeral_notes.append(message)
 
     def _pop_agent_action(self):
         """Return the next doorway-queued agent action as a call_tool, if any.

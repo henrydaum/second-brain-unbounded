@@ -31,10 +31,14 @@ future store) — *not* by deleting them. What remains:
   install/uninstall substrate). If another tracked service remains, treat it as
   kernel-boundary debt unless the user explicitly keeps it.
 - **Tasks:** none.
-- **Tools:** none in the tracked kernel tree. `tool_read_file`,
-  `tool_ask_user_question`, shell/file-editing tools, SQL tools, and plugin
-  authoring tools are package capabilities unless discovery shows they are
-  installed.
+- **Tools:** the kernel ships the **two-tool interface** and nothing else:
+  `search_tools` (BM25 over the catalog's one-line descriptions), `execute_tool`
+  (select a tool by name + intent), and the fill-time escape hatch `abort_fill`.
+  The agent never sees a catalog of schemas — every other capability
+  (`read_file`, shell/SQL/editing tools, …) is discovered via `search_tools` and
+  invoked via `execute_tool`, which triggers a separate forced parameter-fill
+  model call. See "The effect system + two-tool agent" below. Catalog tools are
+  package capabilities unless discovery shows they are installed.
 - **Frontend:** `frontend_repl` only. Telegram and the MCP server
   (`frontend_mcp_server` — exposes Second Brain to external MCP clients over
   streamable HTTP; tested from main via `tests/test_frontend_mcp.py`, which
@@ -71,10 +75,17 @@ effect live. The attachment system is unified onto this one registry:
 ## The kernel boundary (the one rule)
 
 Core code (`pipeline/`, `runtime/`, `state_machine/`, `agent/`, `events/`,
-`config/`, `attachments/`, `main.pyw`) hard-imports **exactly two** plugin
-modules. Keep these two resolvable in any kernel:
+`config/`, `attachments/`, `effects/`, `sandbox/`, `main.pyw`) hard-imports
+**exactly two** plugin *implementations*. Keep these two resolvable in any kernel:
 1. `service_llm` — `runtime/conversation_loop.py`.
 2. `parser_registry` — `pipeline/orchestrator.py`, `pipeline/watcher.py`.
+
+`effects/` (typed-request vocabulary + interpreter) and `sandbox/` (the
+pure-tool subprocess rim) are core: pure Python with no plugin-implementation
+imports. The one plugin edge they carry is `sandbox/entry.py` →
+`plugins.BaseSandboxTool`, which is plugin *substrate* (a base class, like
+`BaseTool`), not an implementation — the child process needs the base to locate
+the tool class it execs.
 
 This rule is executable: `tests/test_kernel_boundary.py` AST-walks every core
 module and pins the complete set of `plugins.*` import edges (the plugin
@@ -86,6 +97,56 @@ Everything else is discovery-based. The agent system prompt collects optional
 guidance from each in-scope plugin's `agent_prompt_for(ctx)` (see `_collect` in
 `agent/system_prompt.py`), so missing plugins degrade silently and correctly —
 uninstalling a package removes its prompt text with it.
+
+## The effect system + two-tool agent
+
+The tool layer is being rearchitected (ported from Second Brain Art's
+canvas/technique model) so tools are **pure functions in subprocess sandboxes**
+whose only wire to the world is yielding **typed requests** to a kernel-side
+interpreter. Rice's-theorem framing: never judge tool code statically; mediate
+behavior at a small fixed boundary.
+
+- **`effects/`** — the closed request vocabulary (`vocabulary.py`), tier
+  derivation (`declarations.py`), and the kernel-side interpreter
+  (`interpreter.py`). Requests are graded in three tiers: `read` (local, safe) ·
+  `write` (reversible; journalled onto a `TurnJournal`, undo unit = the turn) ·
+  `egress` (boundary-crossing — HTTP, LLM `Complete`; gated through the approval
+  surface, because any transmission is exfiltration-capable regardless of verb).
+  A tool **declares** its request types; its danger tier is *derived* from the
+  declarations (never author-asserted), and an undeclared request at runtime is a
+  hard reject. LLM access is the `Complete` request, served kernel-side by
+  `service_llm` — keys/sockets stay in the kernel. Every fulfilment is
+  ledger-recorded (origin `effect`); write-tier fulfilments also leave a durable
+  `effect_journal` audit row. Pruned by the single `data_retention_days` knob.
+
+- **`sandbox/`** — the pure-tool subprocess rim: `validate.py` (AST import gate +
+  banned names/attrs), `entry.py` (the child: exec under restricted builtins,
+  drive the tool generator), `runner.py` (the parent boss: spawn, fulfil each
+  yielded request through an `Interpreter`, wall-clock timeout), `protocol.py`
+  (JSON-lines yield/resume wire format). A sandboxed tool's `run(self, params)`
+  is a **generator** that yields requests and returns a `Respond`.
+  `plugins/BaseSandboxTool.py` is the artifact contract (code + `fill_prompt` +
+  `declared_requests` + `view`) plus a `SandboxToolAdapter(BaseTool)` so a
+  sandboxed tool is indistinguishable from an in-process one to the registry,
+  state machine, `_absorb`, and ledger. Discovery wraps `BaseSandboxTool`
+  subclasses via `build_sandbox_adapters` (see `plugin_discovery.discover_tools`).
+
+- **The two-tool agent** — the agent's whole tool surface collapses to
+  `search_tools` + `execute_tool` (`plugins/tools/`), so per-turn context cost is
+  one catalog line and the catalog can grow without bound. The collapse lives in
+  the ConversationLoop (`_agent_facing_schemas`, hard cutover when the interface
+  is installed; falls back to the full registry only on a bare kernel — not a
+  config mode). `execute_tool` parks a selection on `session.pending_fill`; the
+  loop's `_prepare_fill_call` shapes a single **forced** model call presenting
+  only the chosen target + `abort_fill` (reusing the doorman's
+  `_tools_override_once`/`_tool_choice_once` once-flags). Fill is a separate,
+  on-distribution tool call; `abort_fill` is the escape hatch so forced choice can
+  decline. Usefulness (selection rate, fill-abort rate) is read straight off the
+  action ledger — no metrics table.
+
+Deferred (recorded, not yet built): the conversation-as-DAG / content-addressed
+turn hashing / branch-and-replay UI (Art's pool-hash pattern applied to
+conversations), and a warm sandbox worker pool (v1 is subprocess-per-call).
 
 ## Hardening applied for kernel reliability
 

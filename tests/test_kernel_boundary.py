@@ -18,9 +18,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Everything outside plugins/ that boots or runs the kernel.
-CORE_DIRS = ("agent", "attachments", "config", "events", "pipeline",
-             "runtime", "state_machine")
+# Everything outside plugins/ that boots or runs the kernel. ``effects`` (the
+# typed-request vocabulary + interpreter) and ``sandbox`` (the pure-tool
+# subprocess rim) are core infrastructure: pure Python that must not reach into
+# plugin implementations.
+CORE_DIRS = ("agent", "attachments", "config", "effects", "events", "pipeline",
+             "runtime", "sandbox", "state_machine")
 CORE_FILES = ("main.py", "main.pyw", "paths.py")
 
 # The plugin *substrate*: infrastructure the plugin system itself is made of.
@@ -29,6 +32,7 @@ CORE_FILES = ("main.py", "main.pyw", "paths.py")
 SUBSTRATE = frozenset({
     "plugins.BaseCommand",
     "plugins.BaseService",
+    "plugins.BaseSandboxTool",
     "plugins.BaseTask",
     "plugins.BaseTool",
     "plugins.plugin_discovery",

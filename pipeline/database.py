@@ -337,6 +337,26 @@ class Database:
 		""")
 		self.conn.execute("CREATE INDEX IF NOT EXISTS idx_ledger_ts ON action_ledger(ts)")
 
+		# Effect journal — durable audit of reversible (write-tier) effect
+		# requests fulfilled for sandboxed tools. The in-turn undo mechanism is
+		# the in-memory TurnJournal (effects/interpreter.py); these rows are the
+		# cross-restart audit trail, not the rollback mechanism. Like the ledger:
+		# no foreign keys (rows outlive what they describe), pruned by the single
+		# ``data_retention_days`` knob.
+		self.conn.execute("""
+			CREATE TABLE IF NOT EXISTS effect_journal (
+				id              INTEGER PRIMARY KEY AUTOINCREMENT,
+				ts              REAL NOT NULL,
+				session_key     TEXT,
+				conversation_id INTEGER,
+				tool_name       TEXT,
+				request_type    TEXT,
+				request_json    TEXT,
+				rolled_back     INTEGER NOT NULL DEFAULT 0
+			)
+		""")
+		self.conn.execute("CREATE INDEX IF NOT EXISTS idx_effect_journal_ts ON effect_journal(ts)")
+
 		self.conn.commit()
 
 	# =================================================================
@@ -1144,6 +1164,25 @@ class Database:
 		except Exception as e:
 			logger.warning(f"Action-ledger write failed (ignored): {e}")
 
+	def record_effect_journal(self, *, session_key=None, conversation_id=None,
+							  tool_name=None, request=None) -> None:
+		"""Append one durable audit row for a reversible effect request.
+
+		Best-effort, like ``record_action``: the journal observes the system and
+		must never break a turn. ``request`` is the request's ``to_wire()`` dict.
+		"""
+		try:
+			with self.lock:
+				self.conn.execute("""
+					INSERT INTO effect_journal
+					(ts, session_key, conversation_id, tool_name, request_type, request_json)
+					VALUES (?, ?, ?, ?, ?, ?)
+				""", (time.time(), session_key, conversation_id, tool_name,
+					  (request or {}).get("type"), self._ledger_json(request)))
+				self.conn.commit()
+		except Exception as e:
+			logger.warning(f"Effect-journal write failed (ignored): {e}")
+
 	def prune_expired(self, days, *, ledger_only: bool = False) -> int:
 		"""Delete data older than ``days`` — the single retention knob.
 
@@ -1161,6 +1200,8 @@ class Database:
 		with self.lock:
 			deleted["action_ledger"] = self.conn.execute(
 				"DELETE FROM action_ledger WHERE ts < ?", (cutoff,)).rowcount
+			deleted["effect_journal"] = self.conn.execute(
+				"DELETE FROM effect_journal WHERE ts < ?", (cutoff,)).rowcount
 			if not ledger_only:
 				deleted["task_runs"] = self.conn.execute(
 					"DELETE FROM task_runs WHERE finished_at IS NOT NULL AND finished_at < ?",
