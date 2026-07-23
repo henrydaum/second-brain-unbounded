@@ -1,0 +1,18 @@
+# Second Brain — kernel dependencies
+#
+# The kernel aims to stay close to pure Python. Capabilities beyond the core
+# (search, embeddings, OCR, audio, integrations, Telegram, …) are installed from
+# the store, and each store plugin declares its own extra dependencies.
+
+# --- File watcher (pipeline/watcher) ---
+watchdog
+
+# --- Timekeeper (services/timekeeper) ---
+cron-descriptor
+croniter
+
+# --- Plugin supervisor memory watchdog (degrades to no-op if absent) ---
+psutil
+
+# --- Pytest ---
+pytest

@@ -1,0 +1,1219 @@
+"""Drive one participant's turn through cs.enact() until end_turn.
+
+This file is the agent-side equivalent of PokerMonster's `run_game` inner
+loop. While turn priority belongs to a participant, repeatedly:
+    1. ask the participant for the next action  (`_next_action`)
+    2. enact it through the state machine       (`cs.enact(...)`)
+    3. translate the action's events back into provider-shaped history rows
+
+There is exactly ONE labeled `cs.enact(...)` call site in this file — inside
+`_enact_logged`, the gateway every agent-side enact flows through so the
+action ledger records each move (the `end_turn` and over-budget enacts
+included).
+
+The class is named `ConversationLoop` (not `AgentMachine`) because the same
+shape supports user-user or agent-agent conversations in the future. Today
+only the agent path is wired; a user-side `_next_action` would just block
+until input arrives.
+"""
+
+from __future__ import annotations
+
+
+import json
+import logging
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+from agent.system_prompt import SYSTEM_CONTEXT_MARKER
+from events.event_bus import bus
+from events.event_channels import (
+    AGENT_LLM_CALL_FINISHED,
+    AGENT_LLM_CALL_STARTED,
+    SESSION_COMPACTED,
+    SESSION_MESSAGE,
+)
+from state_machine.serialization import save_compaction_marker, save_history_message
+from runtime.ledger import record_enact
+from runtime.token_stripper import StreamingTokenFilter, strip_model_tokens
+
+logger = logging.getLogger("ConversationLoop")
+
+
+def _clean(text: str | None) -> str:
+    """Internal helper to handle clean."""
+    return strip_model_tokens(text or "")[0]
+
+
+def _truncate_middle(text: str, max_chars: int) -> str:
+    """Cap a string by keeping the head and tail and inserting a marker.
+
+    Used to keep oversized tool results from blowing the context window
+    while preserving enough signal that the LLM can tell what kind of
+    payload was elided.
+    """
+    if not text or len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    tail = max_chars - head
+    return f"{text[:head]}\n…[truncated {len(text) - max_chars} chars]…\n{text[-tail:]}"
+
+
+def _prompt_sections(prompt: Any) -> list[dict[str, Any]]:
+    """Normalize legacy string prompts and sectioned prompt messages.
+
+    Accepts ``system``-role messages (the cacheable prefix) and a single
+    ``user``-role message tagged ``[SYSTEM CONTEXT UPDATE]`` (the dynamic
+    block that gets merged into the latest user turn).
+    """
+    if isinstance(prompt, list):
+        out = []
+        for m in prompt:
+            if not isinstance(m, dict) or not m.get("content"):
+                continue
+            role = m.get("role", "system")
+            if role == "system":
+                out.append(dict(m))
+            elif role == "user" and (m.get("content") or "").lstrip().startswith(SYSTEM_CONTEXT_MARKER):
+                out.append(dict(m))
+        return out
+    return [{"role": "system", "content": prompt or ""}]
+
+
+def _split_current_turn(history: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split prior transcript from the latest user-led turn."""
+    idx = next((i for i in range(len(history) - 1, -1, -1) if history[i].get("role") == "user"), None)
+    return (history, []) if idx is None else (history[:idx], history[idx:])
+
+
+def _prepend_to_user(user_msg: dict[str, Any], context_text: str) -> dict[str, Any]:
+    """Return a copy of ``user_msg`` with ``context_text`` prepended to its content.
+
+    Handles both string content and OpenAI content-block list shapes.
+    """
+    out = dict(user_msg)
+    content = out.get("content")
+    if isinstance(content, list):
+        out["content"] = [{"type": "text", "text": context_text}, *content]
+    else:
+        text = str(content or "").strip()
+        out["content"] = f"{context_text}\n\n{text}" if text else context_text
+    return out
+
+
+class ConversationLoop:
+    """Drive a participant's turn until they end it.
+
+    For an agent: ask the LLM, translate the response into typed actions
+    (`send_text`, `call_tool`, `end_turn`), dispatch each through
+    `cs.enact()`. Tool execution lives inside `CallTool` (via the shared
+    `_CallableAction._run` path), so this loop never touches the registry
+    directly — it only orchestrates.
+    """
+
+    OVER_BUDGET_MESSAGE = "I've made too many tool calls. Could you try a more specific question?"
+    OVER_BUDGET_NUDGE = "You've hit the tool-call limit. Summarize what you have and stop calling tools."
+    MAX_TOOL_RESULT_CHARS = 12000
+    # How many times the doormen at the end_turn doorway may send the agent
+    # back inside per drive. A stubborn doorman can never trap the agent
+    # (the Claude Code stop_hook_active lesson): past this, the turn ends.
+    DOORMAN_FIRE_LIMIT = 3
+
+    def __init__(
+        self,
+        llm,
+        tool_registry,
+        config: dict,
+        system_prompt: str | Callable[[], str],
+        on_tool_start=None,
+        on_tool_result=None,
+        on_notice=None,
+        cancel_event=None,
+        runtime=None,
+        session_key: str | None = None,
+        on_delta=None,
+    ):
+        """Initialize the conversation loop."""
+        self.llm = llm
+        self.tool_registry = tool_registry
+        self.config = config
+        self.system_prompt = system_prompt
+        self.on_tool_start = on_tool_start
+        self.on_tool_result = on_tool_result
+        self.on_notice = on_notice
+        # Sink for streamed text-delta payloads (see AGENT_TEXT_DELTA in
+        # events/event_channels.py). None = streaming off; the loop then
+        # calls the blocking chat_with_tools exactly as before.
+        self.on_delta = on_delta
+        self.cancel_event = cancel_event
+        self.runtime = runtime
+        self.session_key = session_key
+        self.cancelled = False
+        self.running = False
+        # One-shot guard for the empty-response nudge retry (per turn).
+        self._empty_response_retried = False
+        # Set by the compaction layer around overflow retries: the retried
+        # call runs non-streaming (the aborted stream was already closed).
+        self._retry_without_streaming = False
+        self._tool_call_counts: dict[str, int] = {}
+        # Pending tool calls from the latest LLM response. The loop drains this
+        # one-per-iteration so each tool call goes through its own `enact()`.
+        self._pending_tool_calls: list[dict[str, Any]] = []
+        # The LLM's accompanying text for the current tool-call batch. It
+        # rides along on the FIRST CallTool action of the batch so the
+        # provider transcript keeps its assistant-text-with-tool-calls shape.
+        self._assistant_text_for_pending: str | None = None
+        self._final_text: str | None = None
+        self._used_attachments_for_last_action = False
+        self._active_db = None
+        self._active_conversation_id = None
+        # Live-stream bookkeeping for the current LLM call (see _emit_delta /
+        # _finish_stream). A stream is "open" between the first delta and its
+        # done event; abnormal exits close it with aborted=True.
+        self._stream_id: str | None = None
+        self._stream_seq = 0
+        self._stream_emitted = False
+        # Streaming twin of the _clean() applied to whole responses: keeps
+        # <think> blocks and EOS tokens out of the displayed deltas.
+        self._stream_filter: StreamingTokenFilter | None = None
+        # The brain that actually took the most recent call (escorts may swap
+        # request.llm per call); the ledger records this, not the default.
+        self._last_llm_used = None
+        # End-turn doorman state (reset per drive). The once-flags shape the
+        # NEXT model call only: ephemeral notes are shown to the model without
+        # entering history; the overrides narrow/force the toolbox for a
+        # doorman-demanded call.
+        self._doorman_fires = 0
+        self._pending_ephemeral_notes: list[str] = []
+        self._tools_override_once: list | None = None
+        self._tool_choice_once = None
+        self._suppress_tools_once = False
+
+    @property
+    def max_tool_calls(self) -> int:
+        """Return max tool calls."""
+        return (
+            getattr(self.tool_registry, "max_tool_calls", 0)
+            or sum(getattr(t, "max_calls", 1) for t in getattr(self.tool_registry, "tools", {}).values())
+            or 1
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public entrypoint
+    # ──────────────────────────────────────────────────────────────────────
+
+    def drive(
+        self,
+        cs,
+        actor_id: str,
+        history: list[dict[str, Any]],
+        db=None,
+        conversation_id: int | None = None,
+    ) -> tuple[str | None, list[dict[str, Any]], list[str]]:
+        """Run iterations of choose-action / enact / record until turn ends.
+
+        `history` is the provider-shaped transcript and is mutated in place;
+        `new_messages` is what was appended this turn (returned for adapters).
+
+        Attachments queued on ``cs.pending_attachments`` are bundled and
+        passed to the LLM on the first call of the turn; the bundle is
+        then cleared (``per_turn`` lifecycle) or kept for the next turn
+        (``persistent`` lifecycle).
+        """
+        self.running = True
+        self.cancelled = False
+        self._empty_response_retried = False
+        self._tool_call_counts.clear()
+        self._pending_tool_calls.clear()
+        self._assistant_text_for_pending = None
+        self._final_text = None
+        self._active_db = db
+        self._active_conversation_id = conversation_id
+        self._doorman_fires = 0
+        self._pending_ephemeral_notes.clear()
+        self._tools_override_once = None
+        self._tool_choice_once = None
+        self._suppress_tools_once = False
+
+        new_messages: list[dict[str, Any]] = []
+        attachments: list[str] = []
+        action_failed = False
+        restarting = False
+
+        from attachments.attachment import AttachmentBundle
+        bundle = AttachmentBundle.from_iterable(cs.pending_attachments)
+        if getattr(cs, "attachment_lifecycle", "per_turn") == "per_turn":
+            cs.pending_attachments = []
+
+        # Generous upper bound so multi-call rounds (k tool calls per LLM turn,
+        # potentially several rounds) cannot infinite-loop.
+        max_iterations = (self.max_tool_calls + 1) * 4
+
+        try:
+            for _ in range(max_iterations):
+                if self._cancelled() or cs.turn_priority != actor_id:
+                    break
+
+                self._drain_queued_messages(history, new_messages)
+                self._used_attachments_for_last_action = False
+                action_type, content = self._next_action(cs, history, bundle)
+                if not action_type:
+                    break
+                if self._used_attachments_for_last_action:
+                    # Only the first LLM call of the turn sees the bundle.
+                    bundle = AttachmentBundle()
+
+                if self._cancelled():
+                    break
+                if action_type == "end_turn":
+                    # The doorman at the exit: the agent says "I'm done" —
+                    # registered end_turn hooks may let it leave, send it back
+                    # inside with a note, or demand one last tool call.
+                    gate = self._doorman_gate(cs, content, history, new_messages, db, conversation_id)
+                    if gate == "redrive":
+                        restarting = True
+                        break
+                    if gate == "again":
+                        continue
+                    # gate == "end": fall through and enact end_turn.
+                if action_type == "call_tool":
+                    # Refusals decided by the loop itself (unparseable JSON
+                    # arguments, per-tool budget) are synthesized as failed
+                    # results without enacting: the state machine never sees
+                    # garbage args, the frontend still gets its ✕ status,
+                    # and the error row lands in history for the LLM to read.
+                    args = (content or {}).get("args") or {}
+                    if "__invalid_arguments__" in args:
+                        refusal = (f"Invalid JSON in tool arguments: {args['__invalid_arguments__']}", "invalid_arguments")
+                    else:
+                        refusal = (self._tool_budget_error(content), "tool_budget_exceeded")
+                    if refusal[0]:
+                        from state_machine.errors import ActionResult
+                        result = ActionResult.fail("call_tool", refusal[0], code=refusal[1])
+                        started = self._tool_started(action_type, content)
+                        self._tool_finished(started, result=result)
+                        self._absorb(result, action_type, content, history, new_messages, attachments, db, conversation_id)
+                        continue
+                started = self._tool_started(action_type, content)
+                try:
+                    result = self._enact_logged(cs, action_type, content, actor_id)
+                except Exception as e:
+                    self._tool_finished(started, error=str(e))
+                    raise
+                self._tool_finished(started, result=result)
+
+                self._absorb(result, action_type, content, history, new_messages, attachments, db, conversation_id)
+                if action_type == "call_tool":
+                    staged = self._drain_hook_attachments()
+                    if staged:
+                        bundle = self._merge_bundles(bundle, staged)
+
+                if self._restart_requested():
+                    # A tool asked the runtime to re-drive this turn (e.g.
+                    # escalation). Exit without end_turn so the agent keeps
+                    # priority; the re-driven loop finishes the logical turn.
+                    restarting = True
+                    break
+                if not result.ok:
+                    if action_type == "call_tool":
+                        # A failed tool action (unknown/hallucinated tool name,
+                        # out-of-scope tool, invalid input) is feedback, not a
+                        # turn-ender: _absorb already recorded the error as the
+                        # tool result, so ask the LLM again and let it correct
+                        # course. max_iterations bounds a repeat offender.
+                        continue
+                    action_failed = True
+                    break
+                if action_type == "end_turn":
+                    break
+
+            if cs.turn_priority == actor_id and not restarting and not self._restart_requested():
+                # Only nudge the LLM for a wrap-up when the loop genuinely ran
+                # out of budget/iterations — a failed action ending the turn
+                # would make the "you've hit the tool-call limit" premise false.
+                if not self._cancelled() and not action_failed:
+                    self._finish_over_budget(cs, actor_id, history, new_messages, attachments, db, conversation_id)
+                if not self._restart_requested():
+                    self._enact_logged(cs, "end_turn", None, actor_id)
+
+            return self._final_text, new_messages, attachments
+        finally:
+            # Belt-and-braces: a cancel or unexpected exit can leave a stream
+            # open; close it so frontends drop the partial line.
+            self._finish_stream(aborted=True)
+            self._active_db = None
+            self._active_conversation_id = None
+            self.running = False
+
+    def _enact_logged(self, cs, action_type: str, content: Any, actor_id: str):
+        """Gateway for every agent-side enact: run it, append the outcome to
+        the action ledger, re-raise on failure. Ledger writes are best-effort
+        and can never break the turn (see runtime/ledger.py)."""
+        enact_started = time.perf_counter()
+        try:
+            # ──────────────────── THE enact() SITE ────────────────────
+            result = cs.enact(action_type, content, actor_id)
+            # ──────────────────────────────────────────────────────────
+        except Exception as e:
+            self._record_ledger(action_type, content, actor_id, None, str(e), enact_started)
+            raise
+        self._record_ledger(action_type, content, actor_id, result, None, enact_started)
+        return result
+
+    def _record_ledger(self, action_type, content, actor_id, result, error_message, enact_started):
+        """Internal helper to append one agent-side enact to the ledger."""
+        session = self._session()
+        data = {"llm": getattr(self._last_llm_used or self.llm, "model_name", None)}
+        # Doorway-forced acts (queued agent actions, doorman-required tools)
+        # carry their origin so the audit trail distinguishes model-chosen
+        # moves from script-forced ones.
+        forced_by = (content or {}).get("_forced_by") if isinstance(content, dict) else None
+        if forced_by:
+            data["hook"] = forced_by
+        record_enact(
+            self._active_db, origin="agent_enact",
+            session_key=self.session_key,
+            conversation_id=self._active_conversation_id,
+            user_id=getattr(session, "user_id", None),
+            actor_id=actor_id, action_type=action_type, content=content,
+            result=result, error_message=error_message,
+            duration_ms=int((time.perf_counter() - enact_started) * 1000),
+            data=data,
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Picking the next action (the LLM half of the loop)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _next_action(
+        self,
+        cs,
+        history: list[dict[str, Any]],
+        bundle,
+    ) -> tuple[str | None, Any]:
+        """Return `(action_type, content)` for the agent's next move.
+
+        Drains pending tool calls from the previous LLM response one at a time
+        before issuing the next LLM request. When the LLM returns text-only,
+        emits `send_text` first and then `end_turn` on the following iteration.
+        """
+        # 1) Still have pending tool calls? Issue one. The first call of a
+        #    batch carries the assistant's accompanying text (if any).
+        if self._cancelled():
+            return None, None
+        if self._pending_tool_calls:
+            tc = self._pending_tool_calls.pop(0)
+            try:
+                args = json.loads(tc.get("arguments") or "{}")
+            except json.JSONDecodeError as e:
+                args = {"__invalid_arguments__": str(e)}
+            content = {
+                "name": tc.get("name"),
+                "args": args,
+                "_tool_call_id": tc.get("id"),
+                "_assistant_text": self._assistant_text_for_pending,
+            }
+            self._assistant_text_for_pending = None  # only first call carries it
+            return "call_tool", content
+
+        # 1b) Doorway-queued agent actions (session.pending_agent_actions):
+        #     tool calls injected by hooks/tools, waiting at the loop
+        #     boundary. Never drained mid tool-call batch (step 1 runs
+        #     first), so an assistant/tool-result pair is never split.
+        queued = self._pop_agent_action()
+        if queued is not None:
+            return queued
+
+        # 2) Final text was already emitted but turn isn't ended → end it.
+        if self._final_text is not None and cs.turn_priority == "agent":
+            text = self._final_text
+            return "end_turn", {"final_text": text}
+
+        # 3) Otherwise call the LLM for the next response. The call travels
+        #    through the model-call escort chain (registered escorts outermost,
+        #    then the kernel's context guard, then the empty-response nudge —
+        #    see _invoke). The
+        #    doorman once-flags shape exactly one call: a narrowed/forced
+        #    toolbox and ephemeral notes shown to the model but kept out of
+        #    history.
+        from attachments.attachment import AttachmentBundle
+        schemas = self.tool_registry.get_all_schemas() if self.tool_registry else None
+        if self._tools_override_once is not None:
+            schemas = self._tools_override_once
+        if self._suppress_tools_once:
+            schemas = None
+        tool_choice = self._tool_choice_once
+        self._tools_override_once = None
+        self._tool_choice_once = None
+        self._suppress_tools_once = False
+        self._used_attachments_for_last_action = bool(bundle)
+        messages = self._messages(history)
+        if self._pending_ephemeral_notes:
+            messages = [*messages, *({"role": "user", "content": n} for n in self._pending_ephemeral_notes)]
+            self._pending_ephemeral_notes.clear()
+        response = self._invoke(messages, schemas or None, bundle, history, tool_choice=tool_choice)
+
+        if getattr(response, "has_tool_calls", False):
+            self._pending_tool_calls = list(response.tool_calls)
+            text = getattr(response, "content", None)
+            self._assistant_text_for_pending = text
+            # Surface the model's mid-turn explanatory text to live frontends
+            # (display-only; it still rides on the first tool-call history row).
+            cleaned = _clean(text or "")
+            self._finish_stream(cleaned, "narration")
+            if cleaned and self.runtime is not None and self.session_key:
+                self.runtime.push_message(self.session_key, cleaned)
+            # Recurse to immediately return the first call as an action.
+            return self._next_action(cs, history, AttachmentBundle())
+
+        # Text-only response: emit `send_text` now; next iteration will end_turn.
+        text = _clean(getattr(response, "content", ""))
+        self._finish_stream(text, "final")
+        self._final_text = text
+        return "send_text", text
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Translating action results back into provider-shaped history rows
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _absorb(
+        self,
+        result,
+        action_type: str,
+        content: Any,
+        history: list[dict[str, Any]],
+        new_messages: list[dict[str, Any]],
+        attachments: list[str],
+        db,
+        conversation_id,
+    ) -> None:
+        """Read the action's outcome and append matching history rows."""
+        if action_type == "send_text":
+            text = content if isinstance(content, str) else ""
+            self._record({"role": "assistant", "content": text}, history, new_messages, db, conversation_id)
+            return
+
+        if action_type == "call_tool":
+            tc_id = (content or {}).get("_tool_call_id") or "tc_unknown"
+            name = (content or {}).get("name") or "unknown"
+            args = (content or {}).get("args") or {}
+            assistant_text = (content or {}).get("_assistant_text")
+            assistant_msg = {
+                "role": "assistant",
+                "content": assistant_text,
+                "tool_calls": [{
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args, default=str)},
+                }],
+            }
+            self._record(assistant_msg, history, new_messages, db, conversation_id)
+
+            tool_text, tool_paths = self._format_tool_result(name, result, args)
+            attachments.extend(tool_paths)
+            self._record(
+                {"role": "tool", "tool_call_id": tc_id, "name": name, "content": tool_text},
+                history, new_messages, db, conversation_id,
+            )
+            return
+
+        if action_type == "end_turn":
+            # Final text, if any, was already recorded as a SendText. EndTurn
+            # itself does not emit a history row.
+            return
+
+    def _format_tool_result(self, name: str, result, args: dict[str, Any]) -> tuple[str, list[str]]:
+        """Serialize the action's outcome into `(text, attachment_paths)`."""
+        if "__invalid_arguments__" in (args or {}):
+            return json.dumps({"error": f"Invalid JSON in tool arguments: {args['__invalid_arguments__']}"}), []
+
+        # The `call_tool` action's data carries the underlying ToolResult.
+        payload = (getattr(result, "data", None) or {})
+        tool_result = payload.get("result")
+
+        # Action-level failure (legality, exec error) → tool error message.
+        if not getattr(result, "ok", True):
+            err = getattr(result, "error", None)
+            return json.dumps({"error": err.message if err else "Tool failed."}), []
+
+        # ToolResult-level failure.
+        if tool_result is not None and not getattr(tool_result, "success", True):
+            return json.dumps({"error": getattr(tool_result, "error", "Tool failed.")}), []
+
+        # Ok action with no underlying ToolResult (e.g. an approval was
+        # requested): surface the action's own message, never a bare "null"
+        # the model can't interpret.
+        if tool_result is None:
+            return getattr(result, "message", None) or "(tool produced no result)", []
+
+        paths = list(getattr(tool_result, "attachment_paths", []) or [])
+        try:
+            text = (
+                getattr(tool_result, "llm_summary", None)
+                or json.dumps(getattr(tool_result, "data", None), default=str)
+            )
+            return _truncate_middle(text, self.MAX_TOOL_RESULT_CHARS), paths
+        except (TypeError, ValueError) as e:
+            return json.dumps({"error": f"Result serialization failed: {e}"}), []
+
+    def _drain_hook_attachments(self):
+        """Collect attachments staged by tools/services for the next LLM call."""
+        from attachments.attachment import AttachmentBundle
+        session = self._session()
+        hooks = getattr(self.runtime, "hooks", None) if self.runtime else None
+        return AttachmentBundle.from_iterable(hooks.drain_attachments(session)) if hooks and session else AttachmentBundle()
+
+    def _merge_bundles(self, current, staged):
+        """Append newly staged attachments without losing an existing bundle."""
+        from attachments.attachment import AttachmentBundle
+        bundle = AttachmentBundle.from_iterable(current)
+        for attachment in staged:
+            bundle.append(attachment)
+        return bundle
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Helpers
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _messages(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Build provider messages with the dynamic context attached to the turn.
+
+        Sectioned prompts come in as ``[system_combined, user_context_update]``.
+        The system message stays at position 0 (cacheable). The user-role
+        context-update message is merged into the latest real user turn so
+        the request keeps strict role alternation and stays valid for
+        providers that only accept ``system`` at position 0 (e.g. MiniMax).
+        """
+        prompt = self.system_prompt() if callable(self.system_prompt) else self.system_prompt
+        sections = _prompt_sections(prompt)
+        clean_history = [m for m in history if m.get("role") != "system"]
+
+        ctx_idx = next(
+            (i for i, m in enumerate(sections)
+             if m.get("role") == "user"
+             and (m.get("content") or "").lstrip().startswith(SYSTEM_CONTEXT_MARKER)),
+            None,
+        )
+        if ctx_idx is None:
+            return [*sections, *clean_history]
+
+        ctx_msg = sections[ctx_idx]
+        prefix = sections[:ctx_idx] + sections[ctx_idx + 1:]
+        prior, tail = _split_current_turn(clean_history)
+        if not tail:
+            return [*prefix, *prior, ctx_msg]
+        merged = _prepend_to_user(tail[0], ctx_msg["content"])
+        return [*prefix, *prior, merged, *tail[1:]]
+
+    def _tool_budget_error(self, content: Any) -> str | None:
+        """Internal helper to handle tool budget error."""
+        name = (content or {}).get("name") or "unknown"
+        tool = (getattr(self.tool_registry, "tools", {}) or {}).get(name) if self.tool_registry else None
+        if not tool:
+            return None
+        used, limit = self._tool_call_counts.get(name, 0), getattr(tool, "max_calls", 1)
+        if used >= limit:
+            return f"Tool '{name}' has reached its call limit ({limit}). Try a different approach."
+        self._tool_call_counts[name] = used + 1
+        return None
+
+    def _invoke(self, messages, tools, attachments=None, history=None, tool_choice=None):
+        """Issue one model call through the escort chain.
+
+        The request is materialized as a ``ModelRequest`` so escorts standing
+        at the ``model_call`` doorway can rewrite it (swap the brain, edit
+        messages, force a tool), place the call themselves, and inspect the
+        response before the loop sees it. The onion, outermost first:
+        registered escorts → the kernel's context guard (compaction) → the
+        kernel's empty-response nudge → the backend. The two kernel layers are
+        always installed by the loop itself — context safety never depends on
+        what happens to be registered.
+        """
+        from runtime.hooks import ModelRequest
+
+        request = ModelRequest(
+            llm=self.llm, messages=messages, tools=tools,
+            tool_choice=tool_choice, attachments=attachments or None,
+        )
+
+        handler = self._empty_response_layer(self._call_backend)
+        if history is not None:
+            handler = self._compaction_layer(handler, history)
+        session = self._session()
+        hooks = getattr(self.runtime, "hooks", None) if self.runtime else None
+        if hooks is not None and session is not None:
+            handler = hooks.wrap_model_call(session, self.runtime, handler)
+        return handler(request)
+
+    def _empty_response_layer(self, proceed):
+        """The kernel's own innermost escort: retry an empty response once.
+
+        Empty text-only responses happen with weak models (or a bare think
+        block that strips to nothing — often right after a tool error). Nudge
+        once with an ephemeral message that is NOT recorded in history, then
+        accept whatever comes back. One retry per turn.
+        """
+        def layer(request):
+            response = proceed(request)
+            if getattr(response, "has_tool_calls", False):
+                return response
+            if _clean(getattr(response, "content", "") or ""):
+                return response
+            if self._empty_response_retried:
+                return response
+            self._empty_response_retried = True
+            logger.warning("LLM returned an empty response; retrying once with a nudge.")
+            self._finish_stream(aborted=True)  # drop any streamed whitespace
+            from runtime.hooks import ModelRequest
+            retry = ModelRequest(
+                llm=request.llm,
+                messages=[*request.messages, {"role": "user", "content": (
+                    "Your last response was empty. Send the user a substantive "
+                    "reply summarizing where things stand (or call a tool)."
+                )}],
+                tools=request.tools, tool_choice=request.tool_choice,
+                params=request.params, attachments=None,
+            )
+            return proceed(retry)
+        return layer
+
+    def _call_backend(self, request):
+        """The innermost step of the escort onion: the actual backend call,
+        bracketed by the AGENT_LLM_CALL_STARTED / _FINISHED bus events (which
+        report the brain that actually took the call, post-escorts)."""
+        llm = request.llm or self.llm
+        self._last_llm_used = llm
+        streaming = (self.on_delta is not None
+                     and getattr(llm, "supports_streaming", False)
+                     and not self._retry_without_streaming)
+        llm_call_started = time.time()
+        bus.emit(AGENT_LLM_CALL_STARTED, {
+            "session_key": self.session_key,
+            "model": getattr(llm, "model_name", None),
+            "streaming": streaming,
+        })
+        try:
+            response = self._invoke_inner(request, streaming)
+        except Exception as e:
+            self._emit_llm_finished(llm, llm_call_started, ok=False, error=str(e))
+            raise
+        self._emit_llm_finished(llm, llm_call_started, ok=True, response=response)
+        return response
+
+    def _emit_llm_finished(self, llm, started_at, *, ok, response=None, error=None):
+        """Announce the outcome of one LLM call (paired with AGENT_LLM_CALL_STARTED)."""
+        bus.emit(AGENT_LLM_CALL_FINISHED, {
+            "session_key": self.session_key,
+            "model": getattr(llm, "model_name", None),
+            "ok": ok,
+            "error": error,
+            "duration_s": round(time.time() - started_at, 3),
+            "prompt_tokens": getattr(response, "prompt_tokens", None),
+            "has_tool_calls": bool(getattr(response, "has_tool_calls", False)),
+        })
+
+    def _invoke_inner(self, request, streaming):
+        """Issue one LLM call with streaming.
+
+        Wrapped by ``_call_backend``, which brackets it with the
+        AGENT_LLM_CALL_STARTED / _FINISHED bus events. Extra provider kwargs
+        (``request.params``, ``tool_choice``) are forwarded only when set, so
+        backends and test fakes that don't accept them are never surprised.
+        Failures — including error-shaped responses — are raised; the
+        compaction layer above catches context-limit ones and retries."""
+        llm = request.llm or self.llm
+        messages, tools, bundle = request.messages, request.tools, request.attachments
+        kwargs = dict(request.params or {})
+        if request.tool_choice is not None and getattr(llm, "supports_tool_choice", False):
+            kwargs["tool_choice"] = request.tool_choice
+        try:
+            if streaming:
+                import uuid
+                self._stream_id = f"st_{uuid.uuid4().hex[:12]}"
+                self._stream_seq = 0
+                self._stream_emitted = False
+                self._stream_filter = StreamingTokenFilter()
+                response = llm.chat_with_tools_streaming(
+                    messages, tools, attachments=bundle, on_delta=self._emit_delta, **kwargs)
+            else:
+                response = llm.chat_with_tools(messages, tools, attachments=bundle, **kwargs)
+        except Exception:
+            # Any deltas already shown are now stale — tell frontends to
+            # discard the partial line before the retry/raise above.
+            self._finish_stream(aborted=True)
+            raise
+        if getattr(response, "is_error", False):
+            self._finish_stream(aborted=True)
+            err = getattr(response, "error", None) or getattr(response, "content", None) or "LLM provider error."
+            raise RuntimeError(err)
+        return response
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Streaming (AGENT_TEXT_DELTA emission; only active when both on_delta
+    # is wired AND the backend advertises supports_streaming)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _emit_delta(self, fragment: str) -> bool:
+        """Backend-facing on_delta callback. Returns False to abort the stream.
+
+        Fragments pass through the streaming token filter so thinking blocks
+        and EOS tokens never reach frontends — matching the _clean() applied
+        to the whole response on the non-streaming path."""
+        if fragment and self._stream_id is not None:
+            if self._stream_filter is not None:
+                fragment = self._stream_filter.feed(fragment)
+            self._send_delta(fragment)
+        return not self._cancelled()
+
+    def _send_delta(self, fragment: str) -> None:
+        """Emit one already-filtered delta payload."""
+        if not fragment:
+            return
+        self._stream_seq += 1
+        self._stream_emitted = True
+        try:
+            self.on_delta({
+                "stream_id": self._stream_id,
+                "seq": self._stream_seq,
+                "delta": fragment,
+                "done": False,
+                "aborted": False,
+            })
+        except Exception:
+            logger.exception("on_delta sink raised; continuing")
+
+    def _finish_stream(self, final_text: str | None = None, kind: str | None = None,
+                       aborted: bool = False) -> None:
+        """Close the open stream, if any. No-op unless deltas were emitted.
+
+        A clean close carries ``final_text`` — the CLEANED text, byte-identical
+        to what the whole-message path delivers — so frontends that rendered
+        the deltas can dedup the duplicate whole message.
+        """
+        # Release any tail the filter was withholding as a possible partial
+        # tag (it wasn't one if we got here without more input).
+        if not aborted and self._stream_filter is not None and self._stream_id is not None:
+            self._send_delta(self._stream_filter.flush())
+        emitted, stream_id, seq = self._stream_emitted, self._stream_id, self._stream_seq
+        self._stream_id, self._stream_seq, self._stream_emitted = None, 0, False
+        self._stream_filter = None
+        if not emitted:
+            return
+        payload = {"stream_id": stream_id, "seq": seq + 1, "delta": "",
+                   "done": True, "aborted": aborted}
+        if not aborted:
+            payload["final_text"] = final_text or ""
+            payload["kind"] = kind or "final"
+        try:
+            self.on_delta(payload)
+        except Exception:
+            logger.exception("on_delta sink raised on done; continuing")
+
+    def _compaction_layer(self, proceed, history):
+        """The kernel's context-safety escort, always installed by the loop.
+
+        Outward (reactive): a context-limit failure from any inner layer is
+        caught here — compact ``history``, rebuild the prompt from it, and
+        retry through the same inner onion, so the retry gets the post-escort
+        brain, bus events, and streaming like any other call. If the
+        post-compact retry still overflows, emergency-truncate and try once
+        more before surfacing the unrecoverable error. Inward (proactive):
+        after a successful call, compact when it used most of the brain's
+        context window, so the next call starts small.
+        """
+        from plugins.services.service_llm import is_context_limit_error
+        from runtime.hooks import ModelRequest
+
+        def rebuilt(request):
+            # The prompt is rebuilt from the (now smaller) history; ephemeral
+            # additions and attachments from the failed call are dropped.
+            return ModelRequest(
+                llm=request.llm, messages=self._messages(history),
+                tools=request.tools, tool_choice=request.tool_choice,
+                params=request.params, attachments=None,
+            )
+
+        def layer(request):
+            try:
+                response = proceed(request)
+            except Exception as e:
+                if not is_context_limit_error(e):
+                    raise
+                logger.warning("Context limit hit, compacting and retrying: %s", e)
+                self._compact(history)
+                # Retries run non-streaming: the aborted stream was already
+                # closed, and a second partial line would only confuse.
+                self._retry_without_streaming = True
+                try:
+                    try:
+                        return proceed(rebuilt(request))
+                    except Exception as retry_error:
+                        if not is_context_limit_error(retry_error):
+                            raise
+                        logger.warning("Post-compact retry still over context, doing emergency truncation: %s", retry_error)
+                    self._emergency_truncate(history)
+                    try:
+                        return proceed(rebuilt(request))
+                    except Exception as final_error:
+                        if is_context_limit_error(final_error):
+                            raise RuntimeError("Context limit reached even after compacting. Use /new to start fresh.") from final_error
+                        raise
+                finally:
+                    self._retry_without_streaming = False
+            self._compact_if_needed(request, response, history)
+            return response
+        return layer
+
+    def _emergency_truncate(self, history) -> None:
+        """Last-resort shrink that does NOT call the LLM. Keeps only the
+        most recent user message (and any in-flight tool_call/result pair
+        that immediately follows it), aggressively truncating any string
+        content. Used when compaction itself can't help — either because
+        the compactor service did not produce a summary, the summary came
+        back empty, or the post-compact retry still overflowed."""
+        if not history:
+            return
+        last_user_idx = next((i for i in range(len(history) - 1, -1, -1) if history[i].get("role") == "user"), None)
+        if last_user_idx is None:
+            keep = history[-1:]
+        else:
+            keep = history[last_user_idx:]
+        cap = 2000
+        shrunk = []
+        for msg in keep:
+            content = msg.get("content")
+            if isinstance(content, str) and len(content) > cap:
+                msg = {**msg, "content": _truncate_middle(content, cap)}
+            shrunk.append(msg)
+        original_count = len(history)
+        history[:] = [
+            {"role": "user", "content": "[Earlier conversation dropped to fit context. Continue from the message below.]"},
+            {"role": "assistant", "content": "Understood."},
+            *shrunk,
+        ]
+        logger.warning(f"Emergency-truncated history from {original_count} -> {len(history)} messages.")
+        if self.on_notice:
+            self.on_notice(f"Context overflow: dropped earlier messages to keep going (was {original_count}).")
+
+    def _compact_if_needed(self, request, response, history) -> None:
+        # Proactive compaction: trigger before hitting the context limit when
+        # the model's context_size is set. context_size == 0 disables proactive
+        # compaction; the reactive path of the compaction layer is the safety
+        # net. Measured against the brain that actually took the call
+        # (post-escort), not the loop's default.
+        """Internal helper to compact if needed."""
+        llm = request.llm or self.llm
+        ctx, tok = getattr(llm, "context_size", 0), getattr(response, "prompt_tokens", 0)
+        if not ctx or not tok or tok / ctx < 0.80 or len(history) <= 2:
+            return
+        self._compact(history)
+
+    def _compact(self, history) -> None:
+        """Summarize the head of `history` in place via the compactor service."""
+        if len(history) <= 2 or self.runtime is None:
+            return
+        try:
+            compactor = (getattr(self.runtime, "services", {}) or {}).get("compactor")
+            if compactor is None or not getattr(compactor, "loaded", False):
+                logger.warning("Compactor service is not loaded. History will not shrink via summary.")
+                return
+            transcript = "\n".join(f"{m.get('role', '').upper()}: {(m.get('content') or '')[:1000]}" for m in history)
+            # Keep head + tail so the summary covers both how the conversation
+            # started and what was most recently said, instead of silently
+            # dropping everything after the first 20k chars.
+            transcript = _truncate_middle(transcript, 20000)
+            if self.on_notice:
+                self.on_notice("Compacting conversation...")
+            summary = compactor.compact(runtime=self.runtime, session_key=self.session_key, transcript=transcript)
+            if not summary:
+                logger.warning("Compaction returned no summary. History will not shrink via summary.")
+                return
+            old_count = len(history)
+            if self._active_db is not None and self._active_conversation_id is not None:
+                save_compaction_marker(self._active_db, self._active_conversation_id, summary)
+                session = getattr(self.runtime, "sessions", {}).get(self.session_key)
+                if session is not None:
+                    session.has_compaction_checkpoint = True
+            bus.emit(SESSION_COMPACTED, {
+                "session_key": self.session_key,
+                "conversation_id": self._active_conversation_id,
+                "messages_compacted": old_count,
+                "summary": summary,
+            })
+            tail = [self._shrink_for_tail(m) for m in history[-2:]]
+            history[:] = [
+                {"role": "user", "content": (
+                    "[Conversation summary from earlier]\n"
+                    "Earlier turns were compacted away; only this summary remains "
+                    "visible. The full transcript is preserved in the "
+                    "conversation_messages table and is queryable if a SQL/history "
+                    "tool is installed. If the user references something absent from "
+                    "this summary, say you can't see that far back (or query for it) "
+                    "— never deny it was said.\n"
+                    f"{summary}"
+                )},
+                {"role": "assistant", "content": "Understood - I have the earlier context."},
+                *tail,
+            ]
+            if self.on_notice:
+                self.on_notice(f"Compacted {old_count} messages.")
+        except Exception as e:
+            logger.debug("Compaction failed: %s", e, exc_info=True)
+
+    def _shrink_for_tail(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Aggressively truncate any oversized message preserved through
+        compaction. Without this, a huge ``role: tool`` result in the last
+        two messages would survive compaction intact and the post-compact
+        retry would overflow again."""
+        content = msg.get("content")
+        if not isinstance(content, str) or len(content) <= self.MAX_TOOL_RESULT_CHARS:
+            return msg
+        return {**msg, "content": _truncate_middle(content, self.MAX_TOOL_RESULT_CHARS)}
+
+    # ──────────────────────────────────────────────────────────────────────
+    # The end_turn doorway (doorman gate + budget exhaustion)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _doorman_gate(self, cs, content, history, new_messages, db, conversation_id) -> str:
+        """Consult the doormen when the agent tries to end its turn.
+
+        Returns ``"end"`` (let it leave), ``"again"`` (sent back inside — the
+        loop re-asks the model), or ``"redrive"`` (exit this drive; the
+        runtime re-drives the logical turn). Past the fire budget the doormen
+        are no longer consulted and the agent always gets to leave.
+        """
+        from runtime.hooks import Allow, Redrive, RequireTool, SendBack, TurnEnding
+
+        if self._doorman_fires >= self.DOORMAN_FIRE_LIMIT:
+            return "end"
+        session = self._session()
+        hooks = getattr(self.runtime, "hooks", None) if self.runtime else None
+        if hooks is None or session is None:
+            return "end"
+        ending = TurnEnding(
+            final_text=(content or {}).get("final_text"),
+            reason="model_finished",
+            doorman_fires=self._doorman_fires,
+        )
+        verdict = hooks.vet_end_turn(session, self.runtime, ending)
+        if verdict is None or isinstance(verdict, Allow):
+            return "end"
+        if isinstance(verdict, Redrive):
+            session.restart_turn = True
+            return "redrive"
+        self._doorman_fires += 1
+        if isinstance(verdict, SendBack):
+            note = (verdict.note or "").strip()
+            if note and not verdict.ephemeral:
+                # Recorded feedback keeps the transcript coherent: the note
+                # lands as a user row between the agent's two replies.
+                self._record({"role": "user", "content": note}, history, new_messages, db, conversation_id)
+            elif note:
+                self._pending_ephemeral_notes.append(note)
+            if not verdict.allow_tools:
+                self._suppress_tools_once = True
+            self._final_text = None
+            return "again"
+        if isinstance(verdict, RequireTool):
+            schema = self._tool_schema(verdict.name)
+            if schema is None:
+                logger.warning(f"Doorman required unknown tool {verdict.name!r}; allowing end of turn.")
+                return "end"
+            note = (verdict.note or "").strip() or (
+                f"Before finishing, you must call the '{verdict.name}' tool now."
+            )
+            self._pending_ephemeral_notes.append(note)
+            if getattr(self.llm, "supports_tool_choice", False):
+                # The real force: one call offering only that tool, with
+                # tool_choice pinned. (Checked against the drive's default
+                # brain; an escort that swaps llm per call keeps the pin only
+                # if its brain also honors tool_choice.)
+                self._tools_override_once = [schema]
+                self._tool_choice_once = {"type": "function", "function": {"name": verdict.name}}
+            # Without backend support this degrades to the prompt-level
+            # instruction alone — softer, but works on every backend.
+            self._final_text = None
+            return "again"
+        logger.warning(f"Unknown doorman verdict {verdict!r}; allowing end of turn.")
+        return "end"
+
+    def _tool_schema(self, name: str):
+        """Find one tool's provider schema in the current registry, if present."""
+        for schema in (self.tool_registry.get_all_schemas() if self.tool_registry else None) or []:
+            fn = schema.get("function", schema)
+            if fn.get("name") == name:
+                return schema
+        return None
+
+    def _pop_agent_action(self):
+        """Return the next doorway-queued agent action as a call_tool, if any.
+
+        Entries on ``session.pending_agent_actions`` are dicts:
+        ``{"name": tool_name, "args": {...}, "forced_by": <hook label>}``.
+        Each drains through the same enact/absorb/ledger path as a
+        model-chosen call, with a synthetic tool_call_id and a ledger stamp
+        marking who queued it.
+        """
+        session = self._session()
+        if session is None or not getattr(session, "pending_agent_actions", None):
+            return None
+        with session.lock:
+            if not session.pending_agent_actions:
+                return None
+            entry = session.pending_agent_actions.pop(0)
+        name = (entry or {}).get("name")
+        if not name:
+            logger.warning(f"Ignoring malformed queued agent action: {entry!r}")
+            return self._pop_agent_action()
+        import uuid
+        return "call_tool", {
+            "name": name,
+            "args": dict((entry or {}).get("args") or {}),
+            "_tool_call_id": f"tc_hook_{uuid.uuid4().hex[:8]}",
+            "_assistant_text": None,
+            "_forced_by": (entry or {}).get("forced_by") or "pending_agent_actions",
+        }
+
+    def _finish_over_budget(self, cs, actor_id, history, new_messages, attachments, db, conversation_id) -> None:
+        """The doorman consult at budget exhaustion.
+
+        The kernel's own default doorman lives here: when every registered
+        doorman abstains, the classic wrap-up runs — one text-only model call
+        nudging the agent to summarize what it has (this used to be the
+        hardcoded ``_over_budget_summary``). A registered doorman can wave
+        the exhausted turn through silently (``Allow``), replace the wrap-up
+        note (``SendBack``), or hand the turn back for a re-drive
+        (``Redrive``). ``RequireTool`` degrades to its note here: with the
+        iteration budget spent there is nothing left to run a tool with.
+        """
+        from runtime.hooks import Allow, Redrive, RequireTool, SendBack, TurnEnding
+
+        verdict = None
+        session = self._session()
+        hooks = getattr(self.runtime, "hooks", None) if self.runtime else None
+        if hooks is not None and session is not None and self._doorman_fires < self.DOORMAN_FIRE_LIMIT:
+            verdict = hooks.vet_end_turn(session, self.runtime, TurnEnding(
+                final_text=None, reason="budget_exhausted", doorman_fires=self._doorman_fires,
+            ))
+        if isinstance(verdict, Allow):
+            return  # a doorman explicitly waved the silent exit through
+        if isinstance(verdict, Redrive):
+            if session is not None:
+                session.restart_turn = True
+            return
+        note = self.OVER_BUDGET_NUDGE
+        if isinstance(verdict, SendBack) and (verdict.note or "").strip():
+            self._doorman_fires += 1
+            note = verdict.note.strip()
+        elif isinstance(verdict, RequireTool):
+            self._doorman_fires += 1
+            logger.warning(f"Doorman required tool {verdict.name!r} at budget exhaustion; degrading to a note.")
+            note = (verdict.note or "").strip() or note
+        try:
+            nudge = {"role": "user", "content": note}
+            response = self._invoke(self._messages([*history, nudge]), None, None, history)
+            text = _clean(getattr(response, "content", "")) or self.OVER_BUDGET_MESSAGE
+        except Exception:
+            text = self.OVER_BUDGET_MESSAGE
+        self._finish_stream(text, "final")
+        self._final_text = text
+        self._absorb(self._enact_logged(cs, "send_text", text, actor_id), "send_text", text, history, new_messages, attachments, db, conversation_id)
+
+    def _cancelled(self) -> bool:
+        """Internal helper to handle cancelled."""
+        return self.cancelled or bool(self.cancel_event and self.cancel_event.is_set())
+
+    def _session(self):
+        """The RuntimeSession this loop is driving, if the runtime knows it."""
+        if self.runtime is None or not self.session_key:
+            return None
+        return (getattr(self.runtime, "sessions", {}) or {}).get(self.session_key)
+
+    def _restart_requested(self) -> bool:
+        """True when this session asked for the turn to be re-driven."""
+        return bool(getattr(self._session(), "restart_turn", False))
+
+    def _drain_queued_messages(self, history, new_messages) -> None:
+        """Absorb user messages queued while this turn was running.
+
+        The busy guard in ``ConversationRuntime.handle_action`` appends
+        mid-turn ``send_text`` payloads to ``session.pending_user_messages``.
+        At each loop boundary (never mid tool-call batch, which would split an
+        assistant/tool-result pair) they are written straight into history as
+        user rows — mirroring ``inject_user_message``, NOT ``cs.enact`` (a
+        user send_text is wrong-turn illegal while the agent holds priority,
+        and ``SendText`` would flip priority). Draining also clears
+        ``_final_text`` so the loop asks the LLM again instead of taking the
+        end_turn shortcut in ``_next_action``.
+        """
+        if self._pending_tool_calls:
+            return
+        session = self._session()
+        if session is None or not getattr(session, "pending_user_messages", None):
+            return
+        with session.lock:
+            queued = list(session.pending_user_messages)
+            session.pending_user_messages.clear()
+        if not queued:
+            return
+        for text in queued:
+            # _record emits the SESSION_MESSAGE for each drained row.
+            self._record({"role": "user", "content": text}, history, new_messages,
+                         self._active_db, self._active_conversation_id)
+        self._final_text = None
+
+    def _record(self, msg, history, new_messages, db, conversation_id):
+        """Append one transcript row and announce it on the bus.
+
+        This is the single choke point for agent-turn history rows, so the
+        SESSION_MESSAGE emission here is what makes the channel a complete
+        live feed of the transcript (assistant text, tool-call rows, tool
+        results, and drained mid-turn user rows alike)."""
+        history.append(msg)
+        new_messages.append(msg)
+        if db is not None and conversation_id is not None:
+            save_history_message(db, conversation_id, msg)
+        role = msg.get("role", "")
+        payload = {
+            "session_key": self.session_key,
+            "role": role,
+            "content": msg.get("content") or "",
+            "actor_id": "user" if role == "user" else "agent",
+        }
+        if msg.get("name"):
+            payload["name"] = msg["name"]
+        if msg.get("tool_call_id"):
+            payload["tool_call_id"] = msg["tool_call_id"]
+        if msg.get("tool_calls"):
+            payload["tool_calls"] = msg["tool_calls"]
+        bus.emit(SESSION_MESSAGE, payload)
+
+    def _tool_started(self, action_type: str, content: Any):
+        """Internal helper to handle tool started."""
+        if action_type != "call_tool":
+            return None
+        name = (content or {}).get("name") or "unknown"
+        call_id = (content or {}).get("_tool_call_id") or "tc_unknown"
+        args = (content or {}).get("args") or {}
+        if self.on_tool_start:
+            try:
+                self.on_tool_start(name, call_id, args)
+            except TypeError:
+                self.on_tool_start(name)
+        return name, call_id
+
+    def _tool_finished(self, started, result=None, error: str | None = None):
+        """Internal helper to handle tool finished."""
+        if not started or not self.on_tool_result:
+            return
+        name, call_id = started
+        try:
+            self.on_tool_result(name, call_id, result, error)
+        except TypeError:
+            self.on_tool_result(name, (getattr(result, "data", None) or {}).get("result") if result else None)
+
+    @staticmethod
+    def _is_image(path: str) -> bool:
+        """Return whether image."""
+        return Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}

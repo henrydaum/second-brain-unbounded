@@ -1,0 +1,359 @@
+"""
+Kernel event channel registry.
+
+Declaring channels in one place is the discipline that keeps the event bus
+from becoming a dumping ground. If adding a channel feels like it needs
+justification, that's the point — use the bus only when the producer and
+consumer are architecturally far apart. For anything tightly coupled or on
+the hot path, call the function directly.
+
+**Scope: this file documents channels the *kernel* produces or consumes.**
+The bus itself needs no registration (a channel is just a string), so a plugin
+owns its own channels — it defines the constant + payload doc at the top of its
+module (relative-imported by siblings in the same family) and emits/subscribes
+there. A plugin channel must NOT be declared here, even speculatively: the
+kernel must not carry contracts for code it doesn't contain (uninstall the
+plugin and its channel should vanish with it). Kernel-produced channels may, of
+course, be *subscribed to* by plugins — that's the whole point of emitting them
+unconditionally.
+
+Payload shapes are documented here, not enforced at runtime.
+"""
+
+# ── Active channels ────────────────────────────────────────────────
+
+APPROVAL_REQUESTED = "approval_requested"
+"""A conversation session is waiting for user approval or typed input.
+Payload: a StateMachineApprovalRequest object."""
+
+FORM_REQUESTED = "form_requested"
+"""A restored session is sitting on a suspended command/tool form and needs the
+current field re-prompted. Used only on restore: in normal flow the form rides
+back as ``RuntimeResult.form`` on the submit() that produced it (tightly
+coupled), but after a process restart there is no submit() in flight, so the
+producer (runtime restore) and consumer (frontend) are far apart — same reason
+APPROVAL_REQUESTED is re-emitted on restore.
+Payload:
+    session_key: str
+    form:        dict — the descriptor render_form_field expects (see
+                        runtime/dispatch.py decorate_form)"""
+
+TASK_STARTED = "task_started"
+"""A task run was dispatched to a worker — completes the triad with
+TASK_COMPLETED / TASK_FAILED for a live pipeline view. Emitted unconditionally
+(even with no subscribers) so a plugin can observe the pipeline by subscribing,
+never by editing the kernel.
+Payload (path-triggered tasks):
+    task_name: str
+    paths:     list[str]   — the batch dispatched together
+Payload (event-triggered tasks):
+    task_name: str
+    run_id:    str"""
+
+TASK_COMPLETED = "task_completed"
+"""A task finished successfully.
+Payload (path-triggered tasks):
+    task_name:    str
+    path:         str
+    rows_written: int
+    duration_s:   float
+Payload (event-triggered tasks):
+    task_name:    str
+    run_id:       str
+    rows_written: int
+    duration_s:   float"""
+
+TASK_FAILED = "task_failed"
+"""A task failed.
+Payload (path-triggered tasks):
+    task_name: str
+    path:      str
+    error:     str
+Payload (event-triggered tasks):
+    task_name: str
+    run_id:    str
+    error:     str"""
+
+SERVICE_LOADED = "service_loaded"
+"""A service finished (un)loading or was swapped. Lets the orchestrator
+re-check tasks that were blocked on services without reaching sideways into it. Emitted on load, unload, and hot-reload.
+Payload:
+    name:   str   — service name (may be None for bulk events)
+    loaded: bool  — True after load, False after unload"""
+
+TOOLS_CHANGED = "tools_changed"
+"""A tool was registered, re-registered, or unregistered. Lets frontends
+rescope running agents so build_plugin / unload_plugin updates take effect
+without /restart.
+Payload:
+    name:   str — tool name
+    action: str — 'registered' or 'unregistered'"""
+
+TASKS_CHANGED = "tasks_changed"
+"""A task was registered or unregistered. Task registration creates a new
+output table via ensure_output_table, so agents rebuild their prompt context.
+Payload:
+    name:   str — task name
+    action: str — 'registered' or 'unregistered'"""
+
+CHAT_MESSAGE_PUSHED = "chat_message_pushed"
+"""Something in the system wants to proactively surface a message in the user's
+chat view. Used by any background producer that needs to reach the user.
+Payload:
+    message:  str            — the body text to display (required)
+    title:    str (optional) — rendered as a header above the message
+    kind:     str (optional) — categorical label (e.g. "note", "alert"); if
+                               title is empty, may be used as a fallback header
+    source:   str (optional) — identifier for the producer; frontends may
+                               show this as attribution
+    source_id:str (optional) — producer-specific id"""
+
+AGENT_TEXT_DELTA = "agent_text_delta"
+"""A fragment of streamed assistant text (emitted only when the
+``stream_responses`` config setting is on and the active LLM backend supports
+streaming). Frontends that set ``FrontendCapabilities.supports_streaming``
+render deltas incrementally; everyone else ignores the channel and receives
+the same text as whole messages.
+Payload:
+    session_key: str
+    stream_id:   str  — unique per LLM call
+    seq:         int  — monotonically increasing per stream
+    delta:       str  — raw text fragment ("" on done events)
+    done:        bool — stream finished
+    aborted:     bool — done-only: stream ended without a usable final
+                        (error / cancel / compaction retry)
+    final_text:  str (optional) — clean done only: the CLEANED full text,
+                        byte-identical to what arrives via the whole-message
+                        path (RuntimeResult / CHAT_MESSAGE_PUSHED) — the
+                        dedup key for frontends that streamed it
+    kind:        str (optional) — clean done only: "final" | "narration" """
+
+TOOL_CALL_STARTED = "tool_call_started"
+"""The agent started a tool call.
+Payload:
+    session_key: str
+    call_id:     str
+    tool_name:   str
+    args:        dict"""
+
+TOOL_CALL_FINISHED = "tool_call_finished"
+"""The agent finished a tool call.
+Payload:
+    session_key: str
+    call_id:     str
+    tool_name:   str
+    ok:          bool
+    error:       str (optional)"""
+
+COMMAND_CALL_STARTED = "command_call_started"
+"""The runtime started a slash command.
+Payload:
+    session_key:  str
+    call_id:      str
+    command_name: str
+    args:         dict"""
+
+COMMAND_CALL_PROGRESSED = "command_call_progressed"
+"""The runtime collected another slash-command form value.
+Payload:
+    session_key:  str
+    call_id:      str
+    command_name: str
+    args:         dict"""
+
+COMMAND_CALL_FINISHED = "command_call_finished"
+"""The runtime finished a slash command.
+Payload:
+    session_key:  str
+    call_id:      str
+    command_name: str
+    ok:           bool
+    error:        str (optional)"""
+
+
+# ── Plugin supervision ─────────────────────────────────────────────
+# The supervisor (runtime/supervisor.py) detects misbehaving plugins; the
+# plugin watcher executes the unload. Kept apart via the bus so the supervisor
+# carries no plugin imports.
+
+PLUGIN_QUARANTINE_REQUESTED = "plugin_quarantine_requested"
+"""The circuit breaker tripped for a plugin and wants it unloaded.
+Payload:
+    plugin_type: str — 'tool' | 'task' (the family to unregister)
+    source_path: str — resolved file path of the offending plugin
+    name:        str — plugin name (for the notification)
+    reason:      str — why it tripped (last strike's error / timeout)"""
+
+PLUGIN_QUARANTINED = "plugin_quarantined"
+"""A plugin was successfully quarantined (unloaded) by the watcher.
+Payload:
+    plugin_type: str
+    source_path: str
+    name:        str
+    reason:      str"""
+
+
+# ── Conversation lifecycle ─────────────────────────────────────────
+# Plugins (tools, tasks, services) subscribe to these to react to what
+# is happening inside the state machine without having to reach into
+# ConversationRuntime directly. Frontends emit and consume them too.
+
+SESSION_CREATED = "session_created"
+"""A new RuntimeSession was created (or replaced via /new or load_history).
+Payload:
+    session_key: str
+    agent_profile: str"""
+
+SESSION_CLOSED = "session_closed"
+"""A RuntimeSession was discarded (replaced, deleted, app shutdown).
+Payload:
+    session_key: str"""
+
+SESSION_PHASE_CHANGED = "session_phase_changed"
+"""The session's phase transitioned (awaiting_input -> calling_tool, etc.).
+Payload:
+    session_key: str
+    old_phase:   str
+    new_phase:   str"""
+
+SESSION_TURN_CHANGED = "session_turn_changed"
+"""Turn priority moved between participants on a session.
+Payload:
+    session_key: str
+    from_actor:  str
+    to_actor:    str"""
+
+SESSION_MESSAGE = "session_message"
+"""One transcript row landed on a session — a complete live feed of the
+conversation. Agent-turn rows (assistant text, assistant tool-call rows, tool
+results, drained mid-turn user messages) are emitted by the loop's single
+record point (``ConversationLoop._record``); user-side rows by the dispatch
+layer. Subscribers building per-message consumers (live transcript views,
+memory extractors) get every row in order without polling the DB.
+Payload:
+    session_key:  str
+    role:         str   — "user" | "assistant" | "tool"
+    content:      str
+    actor_id:     str   — "user" | "agent"
+    name:         str (optional)        — tool rows: the tool name
+    tool_call_id: str (optional)        — tool rows: id pairing with the call
+    tool_calls:   list[dict] (optional) — assistant rows that request tools"""
+
+SESSION_TURN_STARTED = "session_turn_started"
+"""An agent turn is about to be driven (foreground and background alike).
+Pairs with SESSION_TURN_COMPLETED — including on crash, which completes with
+``ok: False`` — so live surfaces can show busy state without watching flags.
+Payload:
+    session_key:     str
+    conversation_id: int | None
+    actor_id:        str — "agent" """
+
+SESSION_TURN_COMPLETED = "session_turn_completed"
+"""One driven agent turn finished. Emitted per drive from the runtime's
+single drive site (interim drives of a restarted turn — e.g. escalation —
+do not emit; the re-driven turn's completion covers the logical turn).
+Handlers run synchronously on the drive thread — heavy consumers (memory
+extraction, skill reflection) should be event-triggered pipeline tasks
+(``trigger="event"``), which just enqueue a task_runs row here and do the
+work on the orchestrator's schedule.
+Payload:
+    session_key:     str
+    conversation_id: int | None
+    user_id:         int — owner of the session (scope memory/skills per user)
+    ok:              bool — False when the drive crashed (error present)
+    cancelled:       bool (ok drives only) — the turn was interrupted
+    error:           str (crash only)
+    final_text:      str
+    new_messages:    list[dict]
+    attachments:     list[str]"""
+
+SESSION_COMPACTED = "session_compacted"
+"""The loop compacted a session's history into a summary. The summary text
+rides along so subscribers (memory builders, live UIs showing a "condensed"
+marker) don't have to re-read the compaction marker table.
+Payload:
+    session_key:        str
+    conversation_id:    int | None
+    messages_compacted: int — history rows replaced by the summary
+    summary:            str"""
+
+AGENT_LLM_CALL_STARTED = "agent_llm_call_started"
+"""The loop is issuing one LLM request (there are several per agent turn when
+tools are involved). Lets frontends show a "thinking" indicator even when
+streaming is off, and lets observers meter model usage per session.
+Payload:
+    session_key: str
+    model:       str | None
+    streaming:   bool"""
+
+AGENT_LLM_CALL_FINISHED = "agent_llm_call_finished"
+"""The LLM request finished (pairs with AGENT_LLM_CALL_STARTED).
+Payload:
+    session_key:    str
+    model:          str | None
+    ok:             bool
+    error:          str | None
+    duration_s:     float
+    prompt_tokens:  int | None
+    has_tool_calls: bool"""
+
+SESSION_AGENT_PROFILE_CHANGED = "session_agent_profile_changed"
+"""A plugin or command changed the agent profile pinned to a session.
+Payload:
+    session_key:  str
+    old_profile:  str
+    new_profile:  str"""
+
+SYSTEM_PROMPT_EXTRA_CHANGED = "system_prompt_extra_changed"
+"""A plugin added/updated/removed a system prompt extra on a session.
+Useful for frontends or subscribers that want to surface what's pinned to
+the agent's prompt.
+Payload:
+    session_key: str
+    key:         str
+    value:       str | None  (None on removal)"""
+
+SESSION_CONVERSATION_CHANGED = "session_conversation_changed"
+"""A live session switched to (or created) a conversation, or the one it is
+showing was retitled. Frontends with a persistent surface (pinned banner,
+window title, sidebar highlight) subscribe to mirror "where am I?" without
+polling. Emitted unconditionally.
+Payload:
+    session_key:     str
+    conversation_id: int
+    title:           str"""
+
+CONVERSATION_CHANGED = "conversation_changed"
+"""The conversation *catalog* changed, as opposed to a live session (SESSION_*).
+Lets a frontend refresh a conversation list/sidebar without polling. The kernel
+emits created/deleted/recategorized; a retitling plugin (e.g. update_titles)
+emits its own 'retitled'. Emitted unconditionally so a plugin can subscribe
+without kernel edits.
+Payload:
+    action:          str — 'created' | 'deleted' | 'recategorized' | 'retitled'
+    conversation_id: int
+    user_id:         int (optional) — owner, when known
+    category:        str | None (optional) — for created / recategorized"""
+
+
+# ── Configuration ──────────────────────────────────────────────────
+
+CONFIG_CHANGED = "config_changed"
+"""Persisted configuration was written. Lets multi-client frontends resync a
+settings panel without polling. Emitted unconditionally so a plugin can
+subscribe without kernel edits.
+Payload:
+    scope: str — 'core' | 'plugin'  (user-scoped settings live in the users
+                 table, written elsewhere, and are not covered here)"""
+
+
+# ── Reserved (kernel-owned, not yet emitted) ───────────────────────
+# Future *kernel* channels — the producer would live in the kernel but doesn't
+# exist yet. Documented so the work has an obvious home instead of an ad-hoc
+# name. (Plugin-owned futures are not listed here; they belong to the plugin.)
+#
+# TABLE_WRITTEN        — after DB.write_outputs; finer-grained than TASK_COMPLETED
+#                        (which already carries rows_written), for reactive
+#                        aggregate tasks that key off a specific table
+# TOOL_CALL_PROGRESSED — symmetry with COMMAND_CALL_PROGRESSED, once tools can
+#                        report incremental progress for a long-running call

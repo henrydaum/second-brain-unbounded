@@ -1,0 +1,90 @@
+"""Slash command plugin for `/tools`."""
+
+from plugins.BaseCommand import BaseCommand
+from plugins.commands.helpers.setting_links import quicklink_run, quicklink_value_steps, quicklinks, setting_rows
+from plugins.frontends.helpers.formatters import detail_card, format_tool_result, format_tools, quote_block
+from state_machine.conversation import FormStep
+from state_machine.forms import schema_to_form_steps
+
+
+ACTIONS = ["call", "toggle_skip_permissions"]
+ACTION_LABELS = ["Call tool", "Toggle skip permissions"]
+
+
+class ToolsCommand(BaseCommand):
+    """Slash-command handler for `/tools`."""
+    name = "tools"
+    description = "Select a tool, then call it"
+    category = "System"
+
+    def form(self, args, context):
+        """Handle form."""
+        registry = getattr(context, "tool_registry", None)
+        tools = getattr(registry, "tools", {}) or {}
+        steps = [FormStep("tool_name", "Select a tool to inspect or call.", True, enum=sorted(tools), columns=2)]
+        tool = tools.get(args.get("tool_name"))
+        if tool:
+            links, link_labels = quicklinks(tool)
+            steps.append(FormStep("action", f"What do you want to do with this tool?\n\n{_describe(tool, context)}", True, enum=ACTIONS + links, enum_labels=ACTION_LABELS + link_labels))
+        if tool and args.get("action") == "call":
+            steps += schema_to_form_steps(tool.to_schema()["function"].get("parameters"), prompt_optional=True)
+        steps += quicklink_value_steps(args.get("action"), context)
+        return steps
+
+    def run(self, args, context):
+        """Execute `/tools` for the active session."""
+        registry = getattr(context, "tool_registry", None)
+        if args.get("tool_name"):
+            tool = (getattr(registry, "tools", {}) or {}).get(args["tool_name"]) if registry else None
+            if not tool:
+                return "Unknown tool."
+            handled = quicklink_run(args.get("action"), args, context)
+            if handled is not None:
+                return handled
+            if args.get("action") == "call":
+                fields = tool.to_schema()["function"].get("parameters", {}).get("properties", {}).keys()
+                return format_tool_result(registry.call(args["tool_name"], _session_key=getattr(context, "session_key", None), _user_initiated=True, **{k: args[k] for k in fields if k in args}))
+            if args.get("action") == "toggle_skip_permissions":
+                skipped = args["tool_name"] in ((getattr(context, "config", None) or {}).get("skip_permissions") or [])
+                return _toggle_skip(context, args["tool_name"], not skipped)
+            return f"Unknown action: {args.get('action')}"
+        schemas = [tool.to_schema()["function"] for tool in registry.tools.values()] if registry else []
+        return format_tools([{
+            "name": s["name"],
+            "description": s.get("description", ""),
+            "parameters": s.get("parameters", {}),
+            "requires_services": getattr(registry.tools.get(s["name"]), "requires_services", []),
+        } for s in schemas])
+
+
+def _describe(tool, context=None):
+    """Internal helper to handle describe."""
+    schema = tool.to_schema()["function"]
+    params = schema.get("parameters", {})
+    required = set(params.get("required", []))
+    fields = [f"{name}{'*' if name in required else ''}" for name in (params.get("properties") or {})]
+    skipped = tool.name in ((getattr(context, "config", None) or {}).get("skip_permissions") or [])
+    pairs = [
+        ("Args", ", ".join(fields) or "(none)"),
+        ("Skip permissions", "enabled" if skipped else "disabled"),
+    ]
+    card = detail_card(tool.name, pairs + setting_rows(tool, context))
+    desc = (schema.get("description") or "").strip()
+    return f"{card}\n\n{quote_block(desc)}" if desc else card
+
+
+def _toggle_skip(context, tool_name: str, enabled: bool) -> str:
+    """Add or remove a tool from skip_permissions."""
+    runtime = getattr(context, "runtime", None)
+    session_key = getattr(context, "session_key", None)
+    db = getattr(context, "db", None)
+    if runtime is None or not session_key or db is None:
+        return "User settings are not available in this context."
+    names = [str(n) for n in ((getattr(context, "config", None) or {}).get("skip_permissions") or []) if str(n)]
+    if enabled and tool_name not in names:
+        names.append(tool_name)
+    if not enabled:
+        names = [n for n in names if n != tool_name]
+    runtime.set_user_setting(session_key, "skip_permissions", sorted(names))
+    context.config["skip_permissions"] = sorted(names)
+    return f"Skip permissions {'enabled' if enabled else 'disabled'} for {tool_name}."

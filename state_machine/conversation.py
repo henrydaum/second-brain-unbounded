@@ -1,0 +1,341 @@
+"""Small, serializable conversation-state primitives.
+
+This file intentionally does not know about frontends, LLM providers, or the
+database. It is the Poker Monster-style core: participants take actions, the
+current phase decides what is legal, and multi-step flows live in `cache`.
+"""
+
+from __future__ import annotations
+
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+from state_machine.conversation_phases import BASE_PHASE, PHASE_AWAITING_INPUT
+
+Validator = Callable[[Any], tuple[bool, str | None]]
+Handler = Callable[["ConversationState", str, dict[str, Any]], Any]
+FormFactory = Callable[[dict[str, Any], Any], list["FormStep"]]
+
+
+def normalize_path(value: Any) -> str:
+    """Normalize a single filesystem path for storage.
+
+    Accepts the separators a user might type on any platform (``/``, ``\\``, or
+    escaped ``\\\\``), strips wrapping quotes, expands ``~``, and collapses the
+    path with ``os.path.normpath`` so it lands in the OS-native form. Pure
+    stdlib; safe to call on already-clean paths.
+    """
+    s = str(value).strip().strip('"').strip("'")
+    if not s:
+        return s
+    return os.path.normpath(os.path.expanduser(s))
+
+
+def validate_existing_dir(path: str) -> tuple[bool, str | None]:
+    """A path that must already be an existing directory (e.g. a sync folder)."""
+    p = Path(path)
+    if p.is_dir():
+        return True, None
+    if p.exists():
+        return False, f"Not a directory: {path}"
+    return False, f"Directory does not exist: {path}"
+
+
+def validate_path_or_parent(path: str) -> tuple[bool, str | None]:
+    """A file/dir path that may not exist yet, but whose parent must exist.
+
+    Lets a not-yet-created target through (e.g. a new ``db_path`` file) while
+    still catching a typo'd or non-existent parent directory immediately.
+    """
+    p = Path(path)
+    if p.exists() or p.parent.is_dir():
+        return True, None
+    return False, f"Parent directory does not exist: {p.parent}"
+
+
+@dataclass
+class FormStep:
+    """One requested value in a multi-step command/tool form."""
+
+    name: str
+    prompt: str = ""
+    required: bool = True
+    type: str = "string"
+    enum: list[Any] | None = None
+    enum_labels: list[str] | None = None
+    default: Any = None
+    validator: Validator | None = None
+    prompt_when_missing: bool = False
+    columns: int | None = None
+
+    def coerce(self, value: Any) -> Any:
+        # Form values arrive from text boxes, buttons, or future callbacks, so
+        # normalize them before handlers see the collected args.
+        """Coerce raw frontend input into the field's declared type."""
+        if value in (None, "") and not self.required:
+            return self.default
+        if self.type in {"integer", "int"}:
+            value = int(value)
+        if self.type == "number":
+            value = float(value)
+        if self.type == "boolean":
+            value = value if isinstance(value, bool) else str(value).strip().lower() in {"true", "yes", "1", "y"}
+        if self.type in {"array", "path_list"} and isinstance(value, str):
+            import json
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = [line.strip() for line in value.splitlines() if line.strip()]
+            if not isinstance(value, list):
+                value = [value]
+        if self.type == "path" and isinstance(value, str):
+            value = normalize_path(value)
+        if self.type == "path_list" and isinstance(value, list):
+            value = [normalize_path(item) for item in value]
+        if self.type == "object" and isinstance(value, str):
+            import json
+            value = json.loads(value)
+        if self.enum and value not in self.enum and self.enum_labels:
+            label_map = {str(label).strip().lower(): self.enum[i] for i, label in enumerate(self.enum_labels[:len(self.enum)])}
+            value = label_map.get(str(value).strip().lower(), value)
+        if self.enum and value not in self.enum:
+            raise ValueError(f"{self.name} must be one of: {', '.join(map(str, self.enum))}.")
+        return value
+
+    def validate(self, value: Any) -> tuple[bool, str | None]:
+        """Validate one raw field value, including type coercion."""
+        if self.required and (value is None or value == ""):
+            return False, f"{self.name} is required."
+        try:
+            value = self.coerce(value)
+        except Exception as e:
+            return False, str(e)
+        if self.type == "path" and value:
+            ok, msg = validate_path_or_parent(value)
+            if not ok:
+                return False, msg
+        if self.type == "path_list":
+            for item in value or []:
+                ok, msg = validate_existing_dir(item)
+                if not ok:
+                    return False, msg
+        return self.validator(value) if self.validator else (True, None)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the form step into plain data for persistence or rendering."""
+        return {"name": self.name, "prompt": self.prompt, "required": self.required, "type": self.type, "enum": self.enum, "enum_labels": self.enum_labels, "default": self.default, "prompt_when_missing": self.prompt_when_missing, "columns": self.columns}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "FormStep":
+        """Rebuild a FormStep from its serialized representation."""
+        return cls(data["name"], data.get("prompt", ""), data.get("required", True), data.get("type", "string"), data.get("enum"), data.get("enum_labels"), data.get("default"), prompt_when_missing=data.get("prompt_when_missing", False), columns=data.get("columns"))
+
+
+@dataclass
+class CallableSpec:
+    """Runtime description of something callable: slash command or tool."""
+
+    name: str
+    handler: Handler | None = None
+    form: list[FormStep] = field(default_factory=list)
+    require_approval: bool = False
+    approval_actor_id: str | None = None
+    validator: Validator | None = None
+    form_factory: FormFactory | None = None
+
+
+@dataclass
+class Participant:
+    """A conversation actor.
+
+    `kind` controls default permissions, but explicit can_* flags let future
+    user-user or agent-agent conversations override those defaults.
+    """
+
+    id: str
+    kind: str
+    name: str | None = None
+    commands: dict[str, CallableSpec] = field(default_factory=dict)
+    tools: dict[str, CallableSpec] = field(default_factory=dict)
+    can_command: bool | None = None
+    can_tool: bool | None = None
+    can_attach: bool | None = None
+
+    def allows(self, action: str) -> bool:
+        """Return whether this participant may perform a given action type."""
+        defaults = {
+            "call_command": self.kind == "user",
+            "call_tool": self.kind == "agent",
+            "send_attachment": self.kind == "user",
+        }
+        explicit = {"call_command": self.can_command, "call_tool": self.can_tool, "send_attachment": self.can_attach}.get(action)
+        return defaults.get(action, True) if explicit is None else explicit
+
+
+@dataclass
+class PhaseFrame:
+    """One suspended multi-step flow on the phase stack.
+
+    The frame is deliberately serializable so in-progress forms/approvals can
+    be stored in existing conversation_messages rows and restored later.
+    """
+
+    phase: str
+    action_type: str
+    actor_id: str
+    name: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+    steps: list[FormStep] = field(default_factory=list)
+    step_index: int = 0
+    previous_phase: str = BASE_PHASE
+
+    @property
+    def step(self) -> FormStep | None:
+        """Return the current form step for this frame, if one exists."""
+        return self.steps[self.step_index] if self.step_index < len(self.steps) else None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the phase frame for persistence."""
+        return {
+            "phase": self.phase,
+            "action_type": self.action_type,
+            "actor_id": self.actor_id,
+            "name": self.name,
+            "data": self.data,
+            "steps": [s.to_dict() for s in self.steps],
+            "step_index": self.step_index,
+            "previous_phase": self.previous_phase,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PhaseFrame":
+        """Rebuild a phase frame from persisted data."""
+        return cls(data["phase"], data["action_type"], data["actor_id"], data.get("name"), data.get("data") or {}, [FormStep.from_dict(s) for s in data.get("steps", [])], data.get("step_index", 0), data.get("previous_phase", BASE_PHASE))
+
+
+class ConversationState:
+    """The pure state machine: turn priority, current phase, and phase stack."""
+
+    def __init__(
+        self,
+        participants: Iterable[Participant],
+        turn_priority: str | None = None,
+        phase: str = PHASE_AWAITING_INPUT,
+        cache: dict[str, Any] | None = None,
+        allowed_attachment_extensions: Iterable[str] = (),
+        attachment_parser: Callable[[dict[str, Any]], Any] | None = None,
+        attachment_lifecycle: str = "per_turn",
+    ):
+        """Initialize the conversation state."""
+        self.participants = {p.id: p for p in participants}
+        self.turn_order = list(self.participants)
+        if not self.turn_order:
+            raise ValueError("ConversationState needs at least one participant.")
+        self.turn_priority = turn_priority or self.turn_order[0]
+        if self.turn_priority not in self.participants:
+            raise KeyError(f"Unknown turn priority: {self.turn_priority}")
+        self.phase = phase
+        self.cache = cache or {"phases": []}
+        self.cache["phases"] = [PhaseFrame.from_dict(f) if isinstance(f, dict) else f for f in self.cache.get("phases", [])]
+        self.history: list[dict[str, Any]] = []
+        self.last_error = None
+        self.allowed_attachment_extensions = {e.lower().lstrip(".") for e in allowed_attachment_extensions}
+        self.attachment_parser = attachment_parser
+        # "per_turn" (default): drained after the first LLM call of the next
+        # agent turn. "persistent": kept on the cs and re-bundled every turn.
+        self.attachment_lifecycle = attachment_lifecycle if attachment_lifecycle in {"per_turn", "persistent"} else "per_turn"
+        # Holds Attachment dataclasses produced by SendAttachment until the
+        # next agent turn pulls them.
+        self.pending_attachments: list[Any] = []
+
+    @property
+    def active(self) -> Participant:
+        """Return the participant whose turn currently has priority."""
+        return self.participants[self.turn_priority]
+
+    @property
+    def frame(self) -> PhaseFrame | None:
+        """Return the top suspended phase frame, if any."""
+        frames = self.cache.setdefault("phases", [])
+        return frames[-1] if frames else None
+
+    def other_id(self, actor_id: str | None = None) -> str:
+        """Return the next participant in turn order."""
+        actor_id = actor_id or self.turn_priority
+        if len(self.turn_order) == 1:
+            return actor_id
+        return self.turn_order[(self.turn_order.index(actor_id) + 1) % len(self.turn_order)]
+
+    def switch_priority(self, actor_id: str | None = None) -> None:
+        """Switch priority."""
+        self.turn_priority = self.other_id(actor_id)
+
+    def set_priority(self, actor_id: str) -> None:
+        """Set priority."""
+        if actor_id not in self.participants:
+            raise KeyError(f"Unknown participant: {actor_id}")
+        self.turn_priority = actor_id
+
+    def push_phase(self, frame: PhaseFrame) -> None:
+        # Push instead of overwrite so an approval/form can pause another
+        # pending action and then resume it.
+        """Handle push phase."""
+        frame.previous_phase = self.phase
+        self.cache.setdefault("phases", []).append(frame)
+        self.phase = frame.phase
+
+    def pop_phase(self) -> PhaseFrame | None:
+        """Handle pop phase."""
+        frame = self.cache.setdefault("phases", []).pop() if self.cache.setdefault("phases", []) else None
+        self.phase = self.frame.phase if self.frame else BASE_PHASE
+        return frame
+
+    def reset_phase(self) -> None:
+        """Handle reset phase."""
+        self.cache["phases"] = []
+        self.phase = BASE_PHASE
+
+    def event(self, type_: str, actor_id: str | None = None, **data: Any) -> dict[str, Any]:
+        """Handle event."""
+        event = {"type": type_, "actor_id": actor_id or self.turn_priority, "phase": self.phase, **data}
+        self.history.append(event)
+        return event
+
+    def enact(self, action_type: str, content: Any = None, actor_id: str | None = None):
+        """Handle enact."""
+        from state_machine.action_map import create_action
+
+        return create_action(self, action_type, content, actor_id).enact()
+
+    def spec(self, actor_id: str, action_type: str, name: str) -> CallableSpec | None:
+        """Handle spec."""
+        table = self.participants[actor_id].commands if action_type == "call_command" else self.participants[actor_id].tools
+        return table.get(name)
+
+    def attachment_extension(self, content: dict[str, Any]) -> str:
+        """Handle attachment extension."""
+        return (content.get("extension") or Path(str(content.get("path", ""))).suffix).lower().lstrip(".")
+
+    def to_dict(self) -> dict[str, Any]:
+        # Only serialize pending attachments when the lifecycle says they
+        # should outlive the current turn — otherwise they're per-turn
+        # buffer state and replaying them after a restart is wrong.
+        """Handle to dict."""
+        attachments_payload: list[dict[str, Any]] = []
+        if self.attachment_lifecycle == "persistent":
+            for a in self.pending_attachments:
+                if hasattr(a, "to_dict"):
+                    attachments_payload.append(a.to_dict())
+                elif isinstance(a, dict):
+                    attachments_payload.append(a)
+        return {
+            "turn_priority": self.turn_priority,
+            "phase": self.phase,
+            "cache": {**self.cache, "phases": [f.to_dict() if hasattr(f, "to_dict") else f for f in self.cache.get("phases", [])]},
+            "history": self.history[-100:],
+            "participants": [{"id": p.id, "kind": p.kind, "name": p.name} for p in self.participants.values()],
+            "pending_attachments": attachments_payload,
+        }

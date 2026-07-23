@@ -1,0 +1,235 @@
+"""Tests for agent tool scoping (``agent_scope`` + ``ToolRegistry``).
+
+An agent profile whitelists/blacklists tools. Blacklisted tools stay callable
+as dependencies of visible tools but are hidden from the LLM's schema list, and
+the agent cannot invoke a hidden tool directly through the state machine.
+"""
+
+from agent.tool_registry import ToolRegistry
+from plugins.BaseTool import BaseTool, ToolResult
+from runtime.agent_scope import load_scope, registry_with_tools, scoped_registry
+from state_machine.conversation import CallableSpec, ConversationState, Participant
+from state_machine.conversation_phases import PHASE_AWAITING_INPUT
+
+
+class _Lexical(BaseTool):
+    """Lexical."""
+    name = "lexical_search"
+    description = "Hidden keyword helper."
+    parameters = {"type": "object", "properties": {"query": {"type": "string"}}}
+    max_calls = 9
+
+    def run(self, context, **kwargs):
+        """Run lexical."""
+        return ToolResult(data={"tool": self.name, **kwargs})
+
+
+class _Semantic(_Lexical):
+    """Semantic."""
+    name = "semantic_search"
+    description = "Hidden semantic helper."
+
+
+class _Hybrid(_Lexical):
+    """Hybrid."""
+    name = "hybrid_search"
+    description = "Visible composite search."
+    max_calls = 2
+
+    def run(self, context, **kwargs):
+        """Run hybrid."""
+        return ToolResult(data={
+            "lex": context.call_tool("lexical_search", **kwargs).data,
+            "sem": context.call_tool("semantic_search", **kwargs).data,
+        })
+
+
+class _Injected(_Lexical):
+    """Injected."""
+    name = "injected_tool"
+    description = "Session-scoped injected tool."
+
+
+def _registry():
+    """Internal helper to handle registry."""
+    registry = ToolRegistry(None, {"tool_timeout": 10})
+    for tool in (_Hybrid(), _Lexical(), _Semantic()):
+        registry.register(tool)
+    return registry
+
+
+def _config():
+    """Internal helper to handle config."""
+    return {"active_agent_profile": "default", "agent_profiles": {"default": {
+        "whitelist_or_blacklist_tools": "blacklist",
+        "tools_list": ["lexical_search", "semantic_search"],
+    }}}
+
+
+def test_blacklisted_dependencies_stay_callable_but_schema_hidden():
+    """Verify blacklisted dependencies stay callable but schema hidden."""
+    registry = scoped_registry(_registry(), load_scope("default", _config()))
+
+    assert set(registry.tools) == {"hybrid_search", "lexical_search", "semantic_search"}
+    assert [s["function"]["name"] for s in registry.get_all_schemas()] == ["hybrid_search"]
+    assert registry.get_schema("lexical_search") is None
+    assert registry.max_tool_calls == 2
+    assert registry.call("hybrid_search", query="Buddhism").data == {
+        "lex": {"tool": "lexical_search", "query": "Buddhism"},
+        "sem": {"tool": "semantic_search", "query": "Buddhism"},
+    }
+
+
+def test_agent_cannot_directly_call_blacklisted_dependency():
+    """Verify agent cannot directly call blacklisted dependency."""
+    registry = scoped_registry(_registry(), load_scope("default", _config()))
+    specs = {s["function"]["name"]: CallableSpec(s["function"]["name"]) for s in registry.get_all_schemas()}
+    cs = ConversationState(
+        [Participant("agent", "agent", tools=specs)],
+        "agent",
+        PHASE_AWAITING_INPUT,
+        {"agent_scoped_tool_names": ["lexical_search", "semantic_search"]},
+    )
+
+    result = cs.enact("call_tool", {"name": "lexical_search", "args": {"query": "Buddhism"}}, "agent")
+
+    assert not result.ok
+    assert result.error.code == "unknown_tool"
+    assert result.message == "Tool not in agent scope: 'lexical_search'."
+
+
+def test_registry_with_tools_clones_and_exposes_injected_tools():
+    """Verify registry_with_tools preserves registry wiring and exposes new tools."""
+    registry = _registry()
+    registry.orchestrator = object()
+    registry.runtime = object()
+    registry.visible_tool_names = {"hybrid_search"}
+
+    cloned = registry_with_tools(registry, [_Injected()])
+
+    assert cloned is not registry
+    assert cloned.db is registry.db
+    assert cloned.config is registry.config
+    assert cloned.services is registry.services
+    assert cloned.orchestrator is registry.orchestrator
+    assert cloned.runtime is registry.runtime
+    assert set(cloned.tools) == {"hybrid_search", "lexical_search", "semantic_search", "injected_tool"}
+    assert cloned.visible_tool_names == {"hybrid_search", "injected_tool"}
+    assert registry.visible_tool_names == {"hybrid_search"}
+
+
+def test_registry_with_tools_replaces_existing_tool():
+    """Verify injected tools replace by name."""
+    registry = _registry()
+    registry.visible_tool_names = {"hybrid_search"}
+    replacement = _Injected()
+    replacement.name = "hybrid_search"
+
+    cloned = registry_with_tools(registry, [replacement], visible=False)
+
+    assert cloned.tools["hybrid_search"] is replacement
+    assert cloned.visible_tool_names == {"hybrid_search"}
+
+
+def test_registry_with_tools_leaves_uncloneable_registries_unchanged():
+    """Verify stub registries are left untouched."""
+    registry = object()
+
+    assert registry_with_tools(registry, [_Injected()]) is registry
+
+
+class _Interactive(_Lexical):
+    """Interactive."""
+    name = "interactive_tool"
+    description = "Needs a human present."
+    background_safe = False
+
+
+def test_unattended_refusal_tells_model_how_to_proceed():
+    """An interactive tool refused in an unattended session should tell the
+    model what to do instead of just that it can't."""
+    from types import SimpleNamespace
+
+    registry = _registry()
+    registry.register(_Interactive())
+    registry.runtime = SimpleNamespace(is_attended=lambda key: False)
+
+    result = registry.call("interactive_tool", _session_key="spawn_subagent:7", query="x")
+
+    assert not result.success
+    assert "unattended" in result.error
+    assert "finish the turn" in result.error
+
+
+def _unattended_registry():
+    """Registry wired to a runtime with a hook registry and one unattended session."""
+    from types import SimpleNamespace
+
+    from runtime.hooks import HookRegistry
+
+    registry = _registry()
+    registry.register(_Interactive())
+    session = SimpleNamespace(key="spawn_subagent:7")
+    registry.runtime = SimpleNamespace(
+        is_attended=lambda key: False,
+        hooks=HookRegistry(),
+        sessions={"spawn_subagent:7": session},
+    )
+    return registry
+
+
+def test_permission_gate_can_allow_an_unattended_interactive_call():
+    """The background refusal is the kernel DEFAULT at the vet_permission
+    doorway, not a hard rule: a gate answering allow lets the call through."""
+    from runtime.hooks import PermissionVerdict
+
+    registry = _unattended_registry()
+    asked = []
+
+    def gate(ctx, query):
+        asked.append((query.tool_name, query.stage, query.command))
+        return PermissionVerdict(True)
+
+    registry.runtime.hooks.add("vet_permission", gate)
+
+    result = registry.call("interactive_tool", _session_key="spawn_subagent:7", query="x")
+
+    assert result.success
+    assert asked == [("interactive_tool", "unattended_call", "")]
+
+
+def test_permission_gate_can_replace_the_unattended_refusal_reason():
+    from runtime.hooks import PermissionVerdict
+
+    registry = _unattended_registry()
+    registry.runtime.hooks.add(
+        "vet_permission",
+        lambda ctx, query: PermissionVerdict(False, "Interactive tools are off overnight."),
+    )
+
+    result = registry.call("interactive_tool", _session_key="spawn_subagent:7", query="x")
+
+    assert not result.success
+    assert result.error == "Interactive tools are off overnight."
+
+
+def test_abstaining_gates_fall_through_to_the_unattended_refusal():
+    registry = _unattended_registry()
+    registry.runtime.hooks.add("vet_permission", lambda ctx, query: None)
+
+    result = registry.call("interactive_tool", _session_key="spawn_subagent:7", query="x")
+
+    assert not result.success
+    assert "unattended" in result.error
+
+
+def test_attended_sessions_never_consult_the_unattended_stage():
+    registry = _unattended_registry()
+    registry.runtime.is_attended = lambda key: True
+    asked = []
+    registry.runtime.hooks.add("vet_permission", lambda ctx, query: asked.append(query) or None)
+
+    result = registry.call("interactive_tool", _session_key="spawn_subagent:7", query="x")
+
+    assert result.success
+    assert asked == []

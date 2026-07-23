@@ -1,0 +1,197 @@
+"""
+Service interface.
+
+Services are long-lived capabilities shared across tools and tasks.
+They wrap models, schedulers, external APIs, runtime extensions, or other
+reusable state and give the rest of the system a consistent lifecycle.
+"""
+
+import logging
+import threading
+import time
+from abc import ABC
+
+logger = logging.getLogger("BaseService")
+
+MANAGED = "managed"
+EXTENSION = "extension"
+
+
+class BaseService(ABC):
+    """
+    The contract every service implements.
+
+    Class attributes:
+        model_name:
+            Human-readable name shown in frontends and service listings.
+        shared:
+            If True, one instance is shared across threads.
+            If False, callers should use get_client() for thread-safe access.
+        lifecycle:
+            "managed" services are user-loadable backends. "extension" services
+            are runtime hook carriers that auto-load whenever installed.
+
+    Lifecycle:
+        load():
+            Initialize the service. Returns True on success. Timing and basic
+            logging are handled by the base class wrapper.
+        unload():
+            Release resources. Must be safe to call repeatedly.
+        loaded:
+            Property indicating whether the service is ready for use.
+
+    Per-call services (shared = False):
+        Override get_client() to return a fresh client for each caller. The
+        base implementation raises NotImplementedError to make misuse obvious.
+    """
+
+    model_name: str = ""
+    shared: bool = True
+    is_llm_backend: bool = False
+    lifecycle: str = MANAGED
+
+    # Wall-clock seconds before load() abandons a hung _load() and reports
+    # failure. Generous by default because heavy services download models on
+    # first run — a timeout short enough to catch a real deadlock would wrongly
+    # kill a legitimate slow load. Set to 0 to disable, or raise it for a
+    # known-slow service.
+    load_timeout: float = 600.0
+
+    # --- Config settings this plugin needs ---
+    # Each entry is a tuple:
+    # (title, variable_name, description, default, type_info)
+    # Same format as SETTINGS_DATA in config_data.py.
+    config_settings: list = []
+    dependencies_files: list[str] = []
+    dependencies_pip: list[str] = []
+
+    def __init_subclass__(cls, **kwargs):
+        """Internal helper to handle init subclass."""
+        super().__init_subclass__(**kwargs)
+        for attr in ("config_settings", "dependencies_files", "dependencies_pip"):
+            value = getattr(cls, attr)
+            if isinstance(value, (dict, list)):
+                setattr(cls, attr, value.copy())
+
+    # --- Agent system-prompt contribution ---
+    # Static guidance injected into the agent's system prompt when this service
+    # is loaded. Override agent_prompt_for() instead for dynamic text.
+    agent_prompt: str = ""
+
+    def agent_prompt_for(self, ctx) -> str:
+        """Guidance for the agent system prompt, or '' to contribute nothing.
+
+        ``ctx`` is a PromptContext (db/services/orchestrator/config/scope/...).
+        Default returns the static ``agent_prompt``; override for dynamic text."""
+        return self.agent_prompt
+
+    def __init__(self):
+        """Initialize the base service."""
+        self._loaded = False
+        self.services = {}
+
+    @property
+    def loaded(self) -> bool:
+        """Handle loaded."""
+        return self._loaded
+
+    @loaded.setter
+    def loaded(self, value: bool):
+        """Handle loaded."""
+        self._loaded = value
+
+    def load(self) -> bool:
+        """Wraps _load() with automatic timing and a wall-clock timeout.
+
+        Subclasses override _load(). A hung _load() is abandoned after
+        ``load_timeout`` seconds (the daemon worker can't be killed, but it
+        stops blocking whatever serialized loader called us) and reported as a
+        failed load. ``load_timeout = 0`` runs inline with no timeout."""
+        name = self.model_name or self.__class__.__name__
+        logger.info(f"Loading service: {name}...")
+        t0 = time.time()
+        if not self.load_timeout or self.load_timeout <= 0:
+            return self._load_timed(name, t0)
+
+        box: dict = {}
+        def _run():
+            try:
+                box["result"] = self._load_timed(name, t0)
+            except Exception as e:
+                box["error"] = e
+        worker = threading.Thread(target=_run, daemon=True, name=f"load-{name}")
+        worker.start()
+        worker.join(self.load_timeout)
+        if worker.is_alive():
+            logger.error(f"Service load timed out after {self.load_timeout:.0f}s and was abandoned: {name}")
+            return False
+        if "error" in box:
+            raise box["error"]
+        return box.get("result", False)
+
+    def _load_timed(self, name: str, t0: float) -> bool:
+        """Run _load() with timing + logging. Exceptions propagate to load()."""
+        try:
+            result = self._load()
+            elapsed = time.time() - t0
+            if result:
+                logger.info(f"Service loaded: {name} ({elapsed:.2f}s)")
+            else:
+                logger.warning(f"Service failed to load: {name} ({elapsed:.2f}s)")
+            return result
+        except Exception as e:
+            logger.error(f"Service crashed during load: {name} ({time.time() - t0:.2f}s): {e}")
+            raise
+
+    def _load(self) -> bool:
+        """Initialize the service. Return True on success, False on failure."""
+        self.loaded = True
+        return True
+
+    def unload(self):
+        """Release all resources. Must be safe to call even if not loaded."""
+        self.loaded = False
+
+    def get_client(self):
+        """
+        Return a fresh client instance for thread-safe per-call usage.
+
+        This only makes sense for services where shared = False. Shared services
+        should be accessed directly (e.g. service.encode(), service.invoke()).
+
+        Raises NotImplementedError when a shared service is used incorrectly,
+        or when a per-call service forgets to implement get_client().
+        """
+        if self.shared:
+            raise NotImplementedError(
+                f"Service '{self.model_name}' is shared — access it directly, "
+                f"don't call get_client()."
+            )
+        raise NotImplementedError(
+            f"Service '{self.model_name}' is per-call (shared=False) but "
+            f"doesn't implement get_client()."
+        )
+
+    def set_peer_services(self, services: dict):
+        """Receive the live runtime service registry."""
+        self.services = services
+
+
+def service_lifecycle(svc) -> str:
+    """Return a service lifecycle, defaulting to managed."""
+    return getattr(svc, "lifecycle", MANAGED) or MANAGED
+
+
+def is_extension_service(svc) -> bool:
+    """Whether a service is an installed runtime extension."""
+    return service_lifecycle(svc) == EXTENSION
+
+
+def is_user_managed_service(svc) -> bool:
+    """Whether /services should offer load/unload controls."""
+    return service_lifecycle(svc) == MANAGED
+
+
+def should_autoload_service(name: str, svc, config: dict) -> bool:
+    """Whether startup should load a service."""
+    return is_extension_service(svc) or name in (config.get("autoload_services") or [])

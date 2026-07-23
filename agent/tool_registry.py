@@ -1,0 +1,187 @@
+"""
+Tool registry.
+
+Owns tool registration, dispatch, and schema export. Separated from
+BaseTool.py so the base contract stays lightweight and the tool template
+can focus on authoring guidance instead of runtime plumbing.
+"""
+
+import logging
+import threading
+import time
+
+from runtime.context import build_context
+from runtime.supervisor import run_supervised
+from plugins.BaseTool import BaseTool, ToolResult
+from plugins.helpers.plugin_paths import is_builtin_path
+from events.event_bus import bus
+from events.event_channels import TOOLS_CHANGED
+
+logger = logging.getLogger("Tool")
+
+# Thread-local flag so reentrant tool calls (tool -> context.call_tool -> tool)
+# skip the timeout wrapper. Only top-level calls get wrapped, otherwise nested
+# calls would consume extra executor threads and could deadlock.
+_exec_state = threading.local()
+
+
+class ToolRegistry:
+    """
+    Registry and execution entry point for tools.
+
+    Responsibilities:
+        1. Store tool instances by name
+        2. Dispatch tool calls, including tool-to-tool composition
+        3. Export LLM-visible schemas for agent use
+    """
+
+    def __init__(self, db, config: dict, services: dict = None):
+        """Initialize the tool registry."""
+        self.db = db
+        self.config = config
+        self.services = services or {}
+        self.tools: dict[str, BaseTool] = {}
+        self.visible_tool_names: set[str] | None = None
+        self._lock = threading.Lock()
+        self.orchestrator = None        # set after construction in main.pyw
+        self.runtime = None             # ConversationRuntime, set by frontend bootstrap
+
+    def register(self, tool: BaseTool):
+        """Register a tool. Overwrites if name already exists."""
+        with self._lock:
+            self.tools[tool.name] = tool
+        logger.info(f"Registered tool: {tool.name}")
+        bus.emit(TOOLS_CHANGED, {"name": tool.name, "action": "registered"})
+
+    def unregister(self, name: str):
+        """Remove a tool from the registry during plugin unload/delete."""
+        with self._lock:
+            removed = self.tools.pop(name, None)
+        if removed:
+            logger.info(f"Unregistered tool: {name}")
+            bus.emit(TOOLS_CHANGED, {"name": name, "action": "unregistered"})
+
+    def call(self, tool_name: str, **kwargs) -> ToolResult:
+        """
+        Execute a tool by name.
+
+        Used by:
+            - External callers such as the REPL, API, or agent
+            - Other tools via context.call_tool
+        """
+        session_key = kwargs.pop("_session_key", None)
+        user_initiated = bool(kwargs.pop("_user_initiated", False))
+        with self._lock:
+            tool = self.tools.get(tool_name)
+        if tool is None:
+            return ToolResult.failed(f"Unknown tool: {tool_name}")
+
+        # Background-safety gate: tools marked background_safe=False are
+        # interactive (they need a human watching). When such a call comes
+        # from an unattended session, the question goes through the
+        # vet_permission doorway (stage "unattended_call") so policy gates
+        # can allow it or replace the refusal reason; the kernel's default
+        # when every gate abstains is to refuse.
+        if (not getattr(tool, "background_safe", True)
+                and session_key is not None
+                and self.runtime is not None
+                and not self.runtime.is_attended(session_key)):
+            verdict = None
+            hooks = getattr(self.runtime, "hooks", None)
+            session = (getattr(self.runtime, "sessions", {}) or {}).get(session_key)
+            if hooks is not None and session is not None:
+                verdict = hooks.vet_permission(session, tool_name, "",
+                                               runtime=self.runtime, stage="unattended_call")
+            if verdict is None or not verdict.allow:
+                reason = (verdict.reason or "").strip() if verdict is not None else ""
+                return ToolResult.failed(reason or (
+                    f"Tool '{tool_name}' is interactive and this session is unattended "
+                    "(no human is present to respond). Do not retry or wait for a reply — "
+                    "finish the turn with your best grounded result, noting anything that "
+                    "needs the user's attention."
+                ))
+
+        # Gate on required services before building a runtime context.
+        if tool.requires_services:
+            not_ready = []
+            for svc_name in tool.requires_services:
+                svc = self.services.get(svc_name)
+                if svc is None or not svc.loaded:
+                    not_ready.append(svc_name)
+            if not_ready:
+                return ToolResult.failed(f"Required services not available: {not_ready}")
+        
+        # Build a fresh runtime context for this invocation. call_tool points
+        # back to the registry, and approvals go through the owning session.
+        context = build_context(self.db, self.config, self.services,
+                                call_tool=self.call,
+                                tool_registry=self,
+                                orchestrator=self.orchestrator,
+                                runtime=self.runtime,
+                                session_key=session_key,
+                                user_initiated=user_initiated,
+                                current_tool_name=tool_name)
+
+        t0 = time.time()
+
+        # Reentrant calls (tool -> call_tool -> tool) run inline — the outer
+        # call already owns a timeout budget, and a nested submit would double
+        # the thread count without adding safety.
+        if getattr(_exec_state, "in_tool", False):
+            try:
+                result = tool.run(context, **kwargs)
+                logger.debug(f"Tool '{tool_name}' completed in {time.time() - t0:.3f}s")
+                return result
+            except Exception as e:
+                logger.error(f"Tool '{tool_name}' failed after {time.time() - t0:.3f}s: {e}")
+                return ToolResult.failed(str(e))
+
+        timeout = int(self.config.get("tool_timeout", 600))
+
+        def _run_with_flag():
+            """Internal helper to run with flag (sets the reentrancy flag in the
+            supervised worker thread so nested call_tool runs inline)."""
+            _exec_state.in_tool = True
+            try:
+                return tool.run(context, **kwargs)
+            finally:
+                _exec_state.in_tool = False
+
+        source = getattr(tool, "_source_path", "")
+        res = run_supervised(
+            _run_with_flag, timeout=timeout, plugin_key=source,
+            kind="tool", name=tool_name, eligible=not is_builtin_path(source))
+        if res.ok:
+            logger.debug(f"Tool '{tool_name}' completed in {time.time() - t0:.3f}s")
+            return res.value
+        if res.timed_out:
+            logger.error(f"Tool '{tool_name}' timed out after {timeout}s — abandoning thread")
+        else:
+            logger.error(f"Tool '{tool_name}' failed after {time.time() - t0:.3f}s: {res.error}")
+        return ToolResult.failed(res.error)
+
+    @property
+    def max_tool_calls(self) -> int:
+        """Return the agent's total tool-call budget for one message."""
+        return sum(t.max_calls for t in self._visible_tools())
+
+    def get_all_schemas(self) -> list[dict]:
+        """Export schemas for every agent-visible tool."""
+        return [tool.to_schema() for tool in self._visible_tools()]
+
+    def get_schema(self, name: str) -> dict | None:
+        """Get schema."""
+        if self.visible_tool_names is not None and name not in self.visible_tool_names:
+            return None
+        tool = self.tools.get(name)
+        return tool.to_schema() if tool else None
+
+    def list_tools(self) -> list[str]:
+        """List tools."""
+        return list(self.tools.keys())
+
+    def _visible_tools(self):
+        """Internal helper to handle visible tools."""
+        if self.visible_tool_names is None:
+            return self.tools.values()
+        return [tool for name, tool in self.tools.items() if name in self.visible_tool_names]
