@@ -74,6 +74,23 @@ def join_root(root: str, rel: str) -> str:
     return root.replace("\\", "/").rstrip("/") + "/" + rel.replace("\\", "/").lstrip("/")
 
 
+# ── lines / text ─────────────────────────────────────────────────────────
+
+
+def truncate_chars(text: str, cap: int) -> tuple[str, bool]:
+    """Clip *text* to ``cap`` characters on a newline boundary. Returns
+    ``(text, truncated)``.
+
+    Backs off to the last newline before ``cap`` so a line is never cut
+    mid-way; with no newline in range it hard-cuts at ``cap``. The caller
+    decides how to word the "truncated" note, so this composes with per-tool
+    paging hints. ``cap <= 0`` or short text returns the text unchanged."""
+    if cap <= 0 or len(text) <= cap:
+        return text, False
+    nl = text.rfind("\n", 0, cap)
+    return (text[:nl] if nl != -1 else text[:cap]), True
+
+
 # ── validate ─────────────────────────────────────────────────────────────
 
 
@@ -89,11 +106,25 @@ def clamp(value: Any, lo: int, hi: int, default: int | None = None) -> int:
 
 
 # ── format ───────────────────────────────────────────────────────────────
-# Tool output is markdown on the wire (CLAUDE.md). More builders (md_table,
-# detail_card, quote_block — ports of plugins/frontends/helpers/formatters.py,
-# unreachable in-sandbox) land here as tools that need them are ported.
+# Tool output is markdown on the wire (CLAUDE.md). These mirror
+# plugins/frontends/helpers/formatters.py (unreachable in-sandbox) so tool
+# output renders identically to command output on every frontend.
 
 
 def bullet_list(items: Iterable[Any]) -> str:
     """Render *items* as a ``- ``-prefixed markdown list, one per line."""
     return "\n".join("- " + str(i) for i in items)
+
+
+def md_table(headers: list, rows: list) -> str:
+    """Build a GitHub-style markdown table from headers and row tuples.
+
+    Newlines in cells become spaces and ``|`` is escaped, so a cell can never
+    break the table. Start it in its own block (blank line before) or GFM
+    parsers fold it into the preceding paragraph."""
+    def cell(value) -> str:
+        return str("" if value is None else value).replace("\n", " ").replace("|", "\\|")
+    lines = ["| " + " | ".join(cell(h) for h in headers) + " |",
+             "|" + "|".join(" --- " for _ in headers) + "|"]
+    lines += ["| " + " | ".join(cell(v) for v in row) + " |" for row in rows]
+    return "\n".join(lines)

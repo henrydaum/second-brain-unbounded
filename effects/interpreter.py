@@ -444,9 +444,17 @@ class Interpreter:
     # ── helpers ──────────────────────────────────────────────────────────
 
     def _check_path(self, raw: str, *, write: bool) -> Path:
-        """Resolve ``raw`` and enforce the read/write root policy."""
-        path = Path(raw).expanduser().resolve()
+        """Resolve ``raw`` and enforce the read/write root policy.
+
+        A relative path resolves against the first allowed root (the project
+        root by convention), matching how ``fs_search`` resolves ListDir/Stat/
+        ReadFiles — so "relative to the project root" means the same thing across
+        every filesystem request."""
         roots = self.ctx.write_roots if write else self.ctx.read_roots
+        p = Path(raw).expanduser()
+        if not p.is_absolute() and roots:
+            p = Path(roots[0]).expanduser().resolve() / p
+        path = p.resolve()
         if roots is None:
             return path
         for root in roots:

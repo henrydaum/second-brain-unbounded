@@ -101,6 +101,40 @@ def test_clamp_string_number_coerced():
     assert kit.clamp("42", 1, 500, 100) == 42
 
 
+# ── truncate_chars ───────────────────────────────────────────────────────
+
+def test_truncate_under_cap_unchanged():
+    assert kit.truncate_chars("short", 100) == ("short", False)
+
+
+def test_truncate_backs_off_to_newline():
+    text = "line one\nline two\nline three"
+    out, cut = kit.truncate_chars(text, 12)
+    assert cut is True and out == "line one"  # backed off to the newline at 8
+
+
+def test_truncate_hard_cut_without_newline():
+    out, cut = kit.truncate_chars("abcdefghij", 4)
+    assert cut is True and out == "abcd"
+
+
+def test_truncate_zero_cap_unchanged():
+    assert kit.truncate_chars("anything", 0) == ("anything", False)
+
+
+# ── md_table ─────────────────────────────────────────────────────────────
+
+def test_md_table_shape():
+    out = kit.md_table(["A", "B"], [(1, 2), (3, 4)])
+    assert out.splitlines() == ["| A | B |", "| --- | --- |", "| 1 | 2 |", "| 3 | 4 |"]
+
+
+def test_md_table_escapes_pipes_and_newlines():
+    out = kit.md_table(["H"], [("a|b\nc",)])
+    assert "a\\|b c" in out  # pipe escaped, newline flattened
+    assert out.count("\n") == 2  # header, separator, one row — no embedded newline
+
+
 # ── bullet_list ──────────────────────────────────────────────────────────
 
 def test_bullet_list():

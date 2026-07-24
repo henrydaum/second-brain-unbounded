@@ -165,14 +165,16 @@ class SandboxToolAdapter(BaseTool):
     # ── effect-context wiring ────────────────────────────────────────────
 
     def _read_roots(self, context):
-        """Roots the tool may read under. Defaults to repo root + DATA_DIR."""
+        """Roots the tool may read under. Defaults to repo root + DATA_DIR, with
+        the project root first so a relative path resolves against it."""
         from paths import DATA_DIR
         roots = context.config.get("sandbox_read_roots")
         if roots:
             return [Path(r) for r in roots]
-        base = [DATA_DIR]
+        base = []
         if context.root_dir:
             base.append(Path(context.root_dir))
+        base.append(DATA_DIR)
         return base
 
     def _write_roots(self, context):
