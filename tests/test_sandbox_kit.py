@@ -147,3 +147,50 @@ def test_bullet_list_stringifies():
 
 def test_bullet_list_empty():
     assert kit.bullet_list([]) == ""
+
+
+# ── search / retrieval helpers ─────────────────────────────────────────────
+
+def test_fts_query_tokenizes_plain_text():
+    assert kit.fts_query("the cat's toys!") == "the cat s toys"
+
+
+def test_fts_query_passes_operators_through():
+    assert kit.fts_query('"exact phrase" OR cat') == '"exact phrase" OR cat'
+    assert kit.fts_query("prefix*") == "prefix*"
+
+
+def test_fts_query_empty_when_no_tokens():
+    assert kit.fts_query("!!!") == ""
+
+
+def test_sql_str_escapes_quotes():
+    assert kit.sql_str("o'brien") == "'o''brien'"
+
+
+def test_decode_f32_roundtrip():
+    import array
+    blob = array.array("f", [1.0, 2.5, -3.0]).tobytes()
+    assert kit.decode_f32(blob) == [1.0, 2.5, -3.0]
+    assert kit.decode_f32(b"") == []
+
+
+def test_cosine_top_k_ranks_by_dot_product():
+    q = [1.0, 0.0]
+    rows = [("a", [1.0, 0.0]), ("b", [0.0, 1.0]), ("c", [0.7, 0.7])]
+    top = kit.cosine_top_k(q, rows, 2)
+    assert [p for p, _ in top] == ["a", "c"]
+
+
+def test_cosine_top_k_skips_dim_mismatch():
+    q = [1.0, 0.0]
+    rows = [("ok", [1.0, 0.0]), ("bad", [1.0, 0.0, 0.0])]
+    top = kit.cosine_top_k(q, rows, 5)
+    assert [p for p, _ in top] == ["ok"]
+
+
+def test_search_summary_shapes():
+    assert "No results" in kit.search_summary("x", [])
+    res = [{"path": "a.md", "score": 1.5, "content": "hello world"}]
+    out = kit.search_summary("x", res)
+    assert "a.md" in out and "1.50" in out

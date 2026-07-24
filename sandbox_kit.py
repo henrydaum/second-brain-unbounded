@@ -24,8 +24,9 @@ speculatively.
 
 from __future__ import annotations
 
+import array
 import re
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 # ── glob / paths ─────────────────────────────────────────────────────────
 # Filesystem tools receive a flat listing from a ``ListDir`` request and do the
@@ -103,6 +104,73 @@ def clamp(value: Any, lo: int, hi: int, default: int | None = None) -> int:
     except (TypeError, ValueError):
         n = default if default is not None else lo
     return max(lo, min(hi, n))
+
+
+# ── search / retrieval ─────────────────────────────────────────────────────
+# Retrieval tools yield QueryDb / Embed and do the ranking here. Since a
+# sandboxed tool can't import a sibling helper, this is where lexical, semantic,
+# and hybrid share their arithmetic — the tools stay thin request-yielding shells.
+
+
+def fts_query(text: str) -> str:
+    """Prepare free text for an FTS5 ``MATCH``.
+
+    If the text already uses FTS5 operators (quotes, ``AND``/``OR``/``NOT``,
+    ``*``) it is passed through unchanged. Otherwise it is reduced to lowercased
+    ``\\w+`` tokens joined by spaces (FTS5 implicitly ANDs them) — which also
+    strips punctuation that would otherwise be a syntax error. Returns ``""`` if
+    no searchable token survives. This is the sanitizer that makes it safe to
+    inline the query into SQL text (``QueryDb`` binds no params)."""
+    if any(op in text for op in ('"', " AND ", " OR ", " NOT ", "*")):
+        return text.strip()
+    tokens = re.findall(r"\w+", text.lower())
+    return " ".join(tokens)
+
+
+def sql_str(value: str) -> str:
+    """Single-quote and escape a string literal for inlining into SQL, since
+    ``QueryDb`` takes no bound parameters. ``o'brien`` → ``'o''brien'``."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def decode_f32(blob: bytes) -> list[float]:
+    """Decode a float32 embedding blob (as written by numpy ``tobytes``) into a
+    plain list of floats — the stdlib stand-in for ``np.frombuffer(dtype=f32)``
+    so semantic search needs no numpy inside the sandbox. Native byte order."""
+    return list(array.array("f", blob)) if blob else []
+
+
+def cosine_top_k(query_vec: Sequence[float], rows: Iterable[tuple], k: int) -> list[tuple]:
+    """Rank ``(payload, vec)`` rows against ``query_vec`` and return the top ``k``
+    as ``(payload, score)``, best first.
+
+    Score is the dot product — embeddings are stored L2-normalized, so dot ==
+    cosine. Rows whose vector length doesn't match ``query_vec`` (stale
+    embeddings from a different model) are skipped. Pure; no numpy."""
+    dim = len(query_vec)
+    scored = []
+    for payload, vec in rows:
+        if len(vec) != dim:
+            continue
+        scored.append((payload, sum(a * b for a, b in zip(query_vec, vec))))
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return scored[: max(0, k)]
+
+
+def search_summary(query: str, results: Sequence[dict], limit: int = 5) -> str:
+    """Standard LLM-facing summary for a list of search-result dicts (each with
+    ``path``, ``score``, and optional ``content``). Shows up to ``limit`` lines
+    with a 120-char snippet, then a ``[+N more]`` tail. Shared by every search
+    tool so their output reads identically."""
+    if not results:
+        return f'No results found for "{query}".'
+    lines = [f'Found {len(results)} result(s) for "{query}":']
+    for r in results[:limit]:
+        snippet = (r.get("content") or "").replace("\n", " ")[:120]
+        lines.append(f'- {r["path"]} (score {float(r.get("score", 0)):.2f}): "{snippet}..."')
+    if len(results) > limit:
+        lines.append(f"[+{len(results) - limit} more]")
+    return "\n".join(lines)
 
 
 # ── format ───────────────────────────────────────────────────────────────
