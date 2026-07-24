@@ -22,6 +22,7 @@ from effects import (
     ReadContext,
     RunProcess,
     TurnJournal,
+    WriteFile,
     derive_tier,
     from_wire,
 )
@@ -86,6 +87,69 @@ def test_delete_outside_write_roots_denied(tmp_path: Path):
     result = interp.fulfill(DeleteFile(path=str(victim)))
     assert not result.ok and "outside" in result.error
     assert victim.exists()  # untouched
+
+
+# ── write-approval policy (free_write_roots) ─────────────────────────────
+
+def test_write_inside_free_root_is_silent(tmp_path: Path):
+    free = tmp_path / "scratch"
+    free.mkdir()
+    calls = []
+    interp = Interpreter(
+        EffectContext(write_roots=[tmp_path], free_write_roots=[free],
+                      egress_gate=lambda r: (calls.append(r), (True, ""))[1], tool_name="w"),
+        declared=["write_file"], journal=TurnJournal())
+    r = interp.fulfill(WriteFile(path=str(free / "note.txt"), content="hi"))
+    assert r.ok and (free / "note.txt").read_text() == "hi"
+    assert calls == []  # no approval sought inside a free root
+
+
+def test_write_outside_free_root_is_gated(tmp_path: Path):
+    free = tmp_path / "scratch"
+    free.mkdir()
+    seen = []
+    interp = Interpreter(
+        EffectContext(write_roots=[tmp_path], free_write_roots=[free],
+                      egress_gate=lambda r: (seen.append(r.type), (True, ""))[1], tool_name="w"),
+        declared=["write_file"], journal=TurnJournal())
+    target = tmp_path / "src" / "app.py"
+    r = interp.fulfill(WriteFile(path=str(target), content="code"))
+    assert r.ok and target.read_text() == "code"
+    assert seen == ["write_file"]  # approval was sought
+
+
+def test_write_outside_free_root_denied_blocks_write(tmp_path: Path):
+    free = tmp_path / "scratch"
+    free.mkdir()
+    interp = Interpreter(
+        EffectContext(write_roots=[tmp_path], free_write_roots=[free],
+                      egress_gate=lambda r: (False, "not allowed"), tool_name="w"),
+        declared=["write_file"], journal=TurnJournal())
+    target = tmp_path / "app.py"
+    r = interp.fulfill(WriteFile(path=str(target), content="code"))
+    assert not r.ok and r.denied and not target.exists()
+
+
+def test_delete_outside_free_root_is_gated(tmp_path: Path):
+    free = tmp_path / "scratch"
+    free.mkdir()
+    victim = tmp_path / "keep.py"
+    victim.write_text("x", encoding="utf-8")
+    interp = Interpreter(
+        EffectContext(write_roots=[tmp_path], free_write_roots=[free],
+                      egress_gate=lambda r: (False, "no"), tool_name="w"),
+        declared=["delete_file"], journal=TurnJournal())
+    r = interp.fulfill(DeleteFile(path=str(victim)))
+    assert not r.ok and r.denied and victim.exists()  # refused, file kept
+
+
+def test_no_free_roots_means_no_gating(tmp_path: Path):
+    # free_write_roots=None preserves the prior silent-write behavior.
+    interp = Interpreter(
+        EffectContext(write_roots=[tmp_path], egress_gate=lambda r: (False, "would deny"), tool_name="w"),
+        declared=["write_file"], journal=TurnJournal())
+    r = interp.fulfill(WriteFile(path=str(tmp_path / "f.txt"), content="hi"))
+    assert r.ok  # gate never consulted
 
 
 # ── ExecSql (gated egress) ───────────────────────────────────────────────

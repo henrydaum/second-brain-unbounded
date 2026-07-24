@@ -188,6 +188,12 @@ class EffectContext:
     # otherwise a path must resolve under one of the listed roots.
     read_roots: list[Path] | None = None
     write_roots: list[Path] | None = None
+    # The subset of write_roots a tool may write to WITHOUT approval (scratch,
+    # sandbox plugins, memory, plus any the user configures). A write inside
+    # write_roots but outside these is gated through ``egress_gate`` first.
+    # ``None`` means "no write-approval policy" — every allowed write is silent
+    # (trusted/test use, and the prior behavior).
+    free_write_roots: list[Path] | None = None
     # Non-secret resolved locations a tool may ask for via ReadContext("paths")
     # (root, data, scratch, memory_root, …). Never config values or keys.
     paths: dict | None = None
@@ -286,6 +292,9 @@ class Interpreter:
         """Handle write-tier requests, pushing an undo entry onto the journal."""
         if isinstance(request, WriteFile):
             path = self._check_path(request.path, write=True)
+            denial = self._gate_write(request, path)
+            if denial is not None:
+                return denial
             existed = path.exists()
             prior = path.read_bytes() if existed else None
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -323,6 +332,9 @@ class Interpreter:
 
         if isinstance(request, DeleteFile):
             path = self._check_path(request.path, write=True)
+            denial = self._gate_write(request, path)
+            if denial is not None:
+                return denial
             existed = path.exists() and path.is_file()
             prior = path.read_bytes() if existed else None
             if existed:
@@ -465,6 +477,29 @@ class Interpreter:
                 continue
         verb = "write" if write else "read"
         raise PermissionError(f"path {path} is outside the allowed {verb} roots")
+
+    def _gate_write(self, request: Request, path: Path) -> "EffectResult | None":
+        """Approve a filesystem write that lands outside the free write roots.
+
+        Sandbox/scratch (and any user-configured free root) are frictionless —
+        low-consequence drafting space. A write anywhere else in the allowed
+        roots (source files, config) is reversible but consequential, so it is
+        routed through the approval gate first, exactly like an egress request.
+        Returns a denial ``EffectResult`` if refused, else ``None`` to proceed."""
+        free = self.ctx.free_write_roots
+        if free is None:
+            return None  # no policy wired: every allowed write is silent
+        for root in free:
+            try:
+                path.relative_to(Path(root).expanduser().resolve())
+                return None  # inside a free root — no approval needed
+            except ValueError:
+                continue
+        allowed, reason = self.ctx.egress_gate(request)
+        if not allowed:
+            return EffectResult(ok=False, denied=True,
+                                error=reason or "write denied by user", tier=TIER_WRITE)
+        return None
 
     def _journal_row(self, request: Request) -> None:
         """Write a durable audit row to ``effect_journal`` (best-effort)."""

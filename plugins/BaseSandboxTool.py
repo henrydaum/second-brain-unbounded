@@ -137,6 +137,7 @@ class SandboxToolAdapter(BaseTool):
             embedder=(context.services or {}).get("text_embedder"),
             read_roots=self._read_roots(context),
             write_roots=self._write_roots(context),
+            free_write_roots=self._free_write_roots(context),
             paths=self._paths(context),
             context_provider=self._context_provider(context),
             egress_gate=self._egress_gate(context),
@@ -178,14 +179,34 @@ class SandboxToolAdapter(BaseTool):
         return base
 
     def _write_roots(self, context):
-        """Roots the tool may write under. Defaults to a scratch dir in DATA_DIR."""
+        """Outer confinement: where a write is permitted at all (outside → hard
+        reject). Defaults to the project root + DATA_DIR; whether a given write
+        needs approval is a separate question — see ``_free_write_roots``."""
         from paths import DATA_DIR
         roots = context.config.get("sandbox_write_roots")
         if roots:
             return [Path(r) for r in roots]
-        scratch = DATA_DIR / "sandbox_scratch"
-        scratch.mkdir(parents=True, exist_ok=True)
-        return [scratch]
+        base = []
+        if context.root_dir:
+            base.append(Path(context.root_dir))
+        base.append(DATA_DIR)
+        return base
+
+    def _free_write_roots(self, context):
+        """The subset of write roots that need NO approval — frictionless drafting
+        space. Scratch, the sandbox-plugin tree, and the user's memory folder are
+        always free; more can be added via the ``sandbox_free_write_roots`` config
+        list (e.g. a synced directory the user trusts)."""
+        from paths import SANDBOX_PLUGINS, SCRATCH_DIR
+        free = [SCRATCH_DIR, SANDBOX_PLUGINS]
+        try:
+            from plugins.helpers.memory_paths import memory_root
+            free.append(memory_root(context.user_id))
+        except Exception:  # noqa: BLE001 — memory package may be absent
+            pass
+        for extra in (context.config.get("sandbox_free_write_roots") or []):
+            free.append(Path(extra))
+        return free
 
     def _paths(self, context):
         """Non-secret resolved locations a tool may read via ReadContext("paths").
@@ -254,6 +275,9 @@ def _egress_target(request) -> str:
         return getattr(request, "sql", "")
     if request.type == "run_process":
         return " ".join(getattr(request, "argv", []) or [])
+    if request.type in ("write_file", "delete_file"):
+        verb = "delete" if request.type == "delete_file" else "write"
+        return f"{verb} {getattr(request, 'path', '')}"
     return request.type
 
 

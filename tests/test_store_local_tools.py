@@ -34,7 +34,7 @@ def _store_source(rel: str) -> str | None:
 @pytest.fixture(scope="module")
 def sources():
     out = {name: _store_source(f"tools/tool_{name}.py")
-           for name in ("read_file", "render_files", "sql_query")}
+           for name in ("read_file", "render_files", "sql_query", "edit_file", "memory")}
     if any(v is None for v in out.values()):
         pytest.skip("ported local tools not present on a local store ref")
     return out
@@ -133,3 +133,103 @@ def test_sql_query_bad_table_gets_schema_hint(sources, tree):
     assert out.success is False
     # The raw error is in .error; the schema hint rides in the model-facing summary.
     assert "Available tables" in out.summary and "widgets" in out.summary
+
+
+# ── edit_file (write policy: free vs gated) ──────────────────────────────
+
+_EDIT_DECL = ["read_file", "write_file", "delete_file", "stat"]
+
+
+def _edit_ctx(tree, free, gate):
+    return EffectContext(tool_name="edit_file", read_roots=[tree], write_roots=[tree],
+                         free_write_roots=[free], egress_gate=gate)
+
+
+def test_edit_create_in_free_root_is_silent(sources, tree):
+    free = tree / "scratch"
+    free.mkdir()
+    seen = []
+    ctx = _edit_ctx(tree, free, lambda r: (seen.append(r.type), (True, ""))[1])
+    out = R.run_sandbox_tool(source=sources["edit_file"], declared=_EDIT_DECL, effect_ctx=ctx, timeout=30,
+                             params={"operation": "create", "path": "scratch/d.txt", "content": "hi", "justification": "draft"})
+    assert out.success and (free / "d.txt").read_text() == "hi"
+    assert seen == []  # frictionless inside the free root
+
+
+def test_edit_outside_free_root_is_gated(sources, tree):
+    free = tree / "scratch"
+    free.mkdir()
+    (tree / "src").mkdir()
+    seen = []
+    ctx = _edit_ctx(tree, free, lambda r: (seen.append(r.type), (True, ""))[1])
+    out = R.run_sandbox_tool(source=sources["edit_file"], declared=_EDIT_DECL, effect_ctx=ctx, timeout=30,
+                             params={"operation": "create", "path": "src/app.py", "content": "x=1", "justification": "add"})
+    assert out.success and seen == ["write_file"]  # approval sought
+
+
+def test_edit_replace_and_denial(sources, tree):
+    free = tree / "scratch"
+    free.mkdir()
+    (tree / "app.py").write_text("x=1", encoding="utf-8")
+    allow = _edit_ctx(tree, free, lambda r: (True, ""))
+    out = R.run_sandbox_tool(source=sources["edit_file"], declared=_EDIT_DECL, effect_ctx=allow, timeout=30,
+                             params={"operation": "replace", "path": "app.py", "old_text": "x=1", "new_text": "x=2", "justification": "bump"})
+    assert out.success and (tree / "app.py").read_text() == "x=2"
+
+    deny = _edit_ctx(tree, free, lambda r: (False, "declined"))
+    out = R.run_sandbox_tool(source=sources["edit_file"], declared=_EDIT_DECL, effect_ctx=deny, timeout=30,
+                             params={"operation": "overwrite", "path": "app.py", "content": "wiped", "justification": "x"})
+    assert out.success is False and "STOP" in out.summary
+    assert (tree / "app.py").read_text() == "x=2"  # denial kept the file
+
+
+def test_edit_replace_no_match_gives_hint(sources, tree):
+    free = tree / "scratch"
+    free.mkdir()
+    (tree / "app.py").write_text("alpha\nbeta\ngamma", encoding="utf-8")
+    ctx = _edit_ctx(tree, free, lambda r: (True, ""))
+    out = R.run_sandbox_tool(source=sources["edit_file"], declared=_EDIT_DECL, effect_ctx=ctx, timeout=30,
+                             params={"operation": "replace", "path": "app.py", "old_text": "bettaa", "new_text": "x", "justification": "y"})
+    assert out.success is False and "not found" in out.summary
+
+
+# ── memory (free-root writes, index upkeep) ──────────────────────────────
+
+_MEM_DECL = ["read_file", "write_file", "delete_file", "list_dir"]
+
+
+def _mem_run(source, params, data_dir, mem):
+    # A deny-gate proves memory writes are silent (memory root is a free root).
+    ctx = EffectContext(tool_name="memory", read_roots=[data_dir], write_roots=[data_dir],
+                        free_write_roots=[mem], paths={"memory_root": str(mem)},
+                        egress_gate=lambda r: (False, "should not be asked"))
+    return R.run_sandbox_tool(source=source, params=params, declared=_MEM_DECL, effect_ctx=ctx, timeout=30)
+
+
+def test_memory_save_read_append_forget(sources, tmp_path):
+    mem = tmp_path / "memory"
+    mem.mkdir()
+    src = sources["memory"]
+    assert _mem_run(src, {"action": "save", "topic": "alpha", "content": "Uses SQLite.", "description": "the alpha project"}, tmp_path, mem).success
+    assert "the alpha project" in (mem / "MEMORY.md").read_text()
+    _mem_run(src, {"action": "append", "topic": "alpha", "content": "Local-first."}, tmp_path, mem)
+    read = _mem_run(src, {"action": "read", "topic": "alpha"}, tmp_path, mem)
+    assert "SQLite" in read.summary and "Local-first" in read.summary
+    forget = _mem_run(src, {"action": "forget", "topic": "alpha"}, tmp_path, mem)
+    assert forget.success and not (mem / "alpha.md").exists()
+    assert (mem / "MEMORY.md").read_text().strip() == ""
+
+
+def test_memory_invalid_topic_rejected(sources, tmp_path):
+    mem = tmp_path / "memory"
+    mem.mkdir()
+    out = _mem_run(sources["memory"], {"action": "save", "topic": "../evil", "content": "x"}, tmp_path, mem)
+    assert out.success is False and "invalid" in out.error.lower()
+
+
+def test_memory_read_miss_lists_topics(sources, tmp_path):
+    mem = tmp_path / "memory"
+    mem.mkdir()
+    (mem / "known.md").write_text("hi", encoding="utf-8")
+    out = _mem_run(sources["memory"], {"action": "read", "topic": "ghost"}, tmp_path, mem)
+    assert out.success is False and "known" in out.summary
