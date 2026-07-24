@@ -18,10 +18,13 @@ from effects import (
     EffectContext,
     HttpRequest,
     Interpreter,
+    ListDir,
     QueryDb,
     ReadContext,
     ReadFile,
+    ReadFiles,
     Respond,
+    Stat,
     TurnJournal,
     UndeclaredRequestError,
     WriteDb,
@@ -38,6 +41,9 @@ from pipeline.database import Database
 @pytest.mark.parametrize("request_obj", [
     ReadFile(path="/tmp/x.txt"),
     QueryDb(sql="SELECT 1", max_rows=5),
+    ListDir(root="/tmp", recursive=False),
+    ReadFiles(paths=["/tmp/a.py", "/tmp/b.py"]),
+    Stat(path="/tmp/x.txt"),
     ReadContext(view="last_k", k=3),
     WriteFile(path="/tmp/y.txt", content="hi"),
     WriteDb(table="t", schema_sql="CREATE TABLE t (a INTEGER)", rows=[{"a": 1}]),
@@ -137,6 +143,73 @@ def test_read_context_uses_provider():
     result = interp.fulfill(ReadContext(view="last_k", k=2))
     assert result.value == "sliced context"
     assert seen == {"view": "last_k", "k": 2}
+
+
+# ── filesystem primitives (list_dir / read_files / stat) ─────────────────
+
+def _tree(tmp_path: Path):
+    """A small file tree for filesystem-primitive tests."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "a.py").write_text("import os\nTODO fix this\n", encoding="utf-8")
+    (tmp_path / "pkg" / "b.py").write_text("x = 1\n# TODO later\n", encoding="utf-8")
+    (tmp_path / "pkg" / "c.txt").write_text("nothing here\n", encoding="utf-8")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "junk.py").write_text("TODO ignored\n", encoding="utf-8")
+
+
+def test_list_dir_enumerates_with_metadata_and_prunes_junk(tmp_path: Path):
+    """ListDir returns rel path + size + mtime per file and prunes junk dirs."""
+    _tree(tmp_path)
+    interp = Interpreter(EffectContext(read_roots=[tmp_path], tool_name="lister"), declared=["list_dir"])
+    result = interp.fulfill(ListDir(root=str(tmp_path)))
+    entries = {e["path"]: e for e in result.value["entries"]}
+    assert set(entries) == {"a.py", "pkg/b.py", "pkg/c.txt"}  # .git pruned
+    assert entries["a.py"]["size"] > 0 and entries["a.py"]["mtime"] > 0
+
+
+def test_list_dir_non_recursive_stays_top_level(tmp_path: Path):
+    """recursive=False only lists the root's own files."""
+    _tree(tmp_path)
+    interp = Interpreter(EffectContext(read_roots=[tmp_path], tool_name="lister"), declared=["list_dir"])
+    result = interp.fulfill(ListDir(root=str(tmp_path), recursive=False))
+    assert {e["path"] for e in result.value["entries"]} == {"a.py"}
+
+
+def test_list_dir_outside_roots_denied(tmp_path: Path):
+    """A root outside the allowed read roots fails."""
+    interp = Interpreter(
+        EffectContext(read_roots=[tmp_path / "allowed"], tool_name="lister"), declared=["list_dir"])
+    result = interp.fulfill(ListDir(root=str(tmp_path)))
+    assert not result.ok and "read roots" in result.error
+
+
+def test_read_files_batches_with_per_file_outcomes(tmp_path: Path):
+    """ReadFiles returns text per readable file and errors per bad one,
+    without failing the batch."""
+    _tree(tmp_path)
+    (tmp_path / "bin.dat").write_bytes(b"\x00\x01\x02")
+    interp = Interpreter(EffectContext(read_roots=[tmp_path], tool_name="reader"), declared=["read_files"])
+    result = interp.fulfill(ReadFiles(paths=[
+        str(tmp_path / "a.py"),
+        str(tmp_path / "bin.dat"),
+        str(tmp_path / "missing.txt"),
+        str(tmp_path.parent / "outside.txt"),
+    ]))
+    by_path = {Path(f["path"]).name: f for f in result.value["files"]}
+    assert "TODO fix this" in by_path["a.py"]["text"]
+    assert by_path["bin.dat"]["error"] == "binary file"
+    assert "error" in by_path["missing.txt"]
+    assert "read roots" in by_path["outside.txt"]["error"]
+
+
+def test_stat_reports_metadata_and_absence(tmp_path: Path):
+    """Stat returns kind/size/mtime for a real path, exists=False otherwise."""
+    _tree(tmp_path)
+    interp = Interpreter(EffectContext(read_roots=[tmp_path], tool_name="stat"), declared=["stat"])
+    hit = interp.fulfill(Stat(path=str(tmp_path / "a.py")))
+    assert hit.value["exists"] and not hit.value["is_dir"] and hit.value["size"] > 0
+    miss = interp.fulfill(Stat(path=str(tmp_path / "nope.txt")))
+    assert miss.value == {"path": str(tmp_path / "nope.txt"), "exists": False}
 
 
 # ── writes + journal rollback ────────────────────────────────────────────

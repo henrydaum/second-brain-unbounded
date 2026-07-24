@@ -73,6 +73,47 @@ class QueryDb(Request):
 
 
 @dataclass(frozen=True)
+class ListDir(Request):
+    """Enumerate files under a root — the filesystem's ``getdents``.
+
+    General-purpose by design: this is a *resource* access (what files exist),
+    not an algorithm. Glob matching, filtering, and ranking are pure code that
+    belongs in tools. The kernel walk is confined to the allowed read roots,
+    prunes well-known junk directories, never follows links, and returns
+    relative paths with size/mtime so tools can filter and sort without
+    further requests."""
+
+    type: ClassVar[str] = "list_dir"
+    tier: ClassVar[str] = TIER_READ
+    root: str = ""
+    recursive: bool = True
+
+
+@dataclass(frozen=True)
+class ReadFiles(Request):
+    """Read many files in one round trip — the batched ``read``.
+
+    Exists so content-scanning tools (grep and its unbounded successors) pay
+    O(1) round trips, not one per file. Each path is confined to the allowed
+    read roots; binary and oversized files come back as per-file errors, not
+    failures of the batch."""
+
+    type: ClassVar[str] = "read_files"
+    tier: ClassVar[str] = TIER_READ
+    paths: list[str]
+    max_bytes_per_file: int = 2_000_000
+
+
+@dataclass(frozen=True)
+class Stat(Request):
+    """Metadata for one path: existence, kind, size, mtime."""
+
+    type: ClassVar[str] = "stat"
+    tier: ClassVar[str] = TIER_READ
+    path: str
+
+
+@dataclass(frozen=True)
 class ReadContext(Request):
     """Read the tool's declared slice of the conversation.
 
@@ -166,7 +207,7 @@ class Complete(Request):
 REQUEST_TYPES: dict[str, type[Request]] = {
     cls.type: cls
     for cls in (
-        ReadFile, QueryDb, ReadContext,
+        ReadFile, ReadFiles, ListDir, Stat, QueryDb, ReadContext,
         WriteFile, WriteDb, Respond,
         HttpRequest, Complete,
     )

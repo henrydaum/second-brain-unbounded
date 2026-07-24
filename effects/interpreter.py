@@ -35,17 +35,21 @@ from pathlib import Path
 from typing import Any, Callable
 
 from effects.declarations import validate_declared
+from effects import fs_search
 from effects.vocabulary import (
     TIER_EGRESS,
     TIER_READ,
     TIER_WRITE,
     Complete,
     HttpRequest,
+    ListDir,
     QueryDb,
     ReadContext,
     ReadFile,
+    ReadFiles,
     Request,
     Respond,
+    Stat,
     WriteDb,
     WriteFile,
 )
@@ -212,6 +216,19 @@ class Interpreter:
                 return EffectResult(ok=False, error="no database available", tier=TIER_READ)
             out = self.ctx.db.query(request.sql, max_rows=request.max_rows)
             return EffectResult(value=out, tier=TIER_READ)
+        if isinstance(request, ListDir):
+            out = fs_search.list_dir(request.root, self.ctx.read_roots, recursive=request.recursive)
+            ok = "error" not in out
+            return EffectResult(ok=ok, value=out, error=out.get("error", ""), tier=TIER_READ)
+        if isinstance(request, ReadFiles):
+            out = fs_search.read_files(
+                request.paths, self.ctx.read_roots,
+                max_bytes_per_file=request.max_bytes_per_file)
+            return EffectResult(value=out, tier=TIER_READ)
+        if isinstance(request, Stat):
+            out = fs_search.stat_path(request.path, self.ctx.read_roots)
+            ok = "error" not in out
+            return EffectResult(ok=ok, value=out, error=out.get("error", ""), tier=TIER_READ)
         if isinstance(request, ReadContext):
             text = ""
             if self.ctx.context_provider is not None:

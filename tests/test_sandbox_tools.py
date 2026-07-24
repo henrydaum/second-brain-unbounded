@@ -222,6 +222,100 @@ def test_timeout_kills_a_runaway_tool():
     assert outcome.error_type == "Timeout"
 
 
+_PATIENT_TOOL = textwrap.dedent("""
+    from plugins.BaseSandboxTool import BaseSandboxTool
+    from effects.vocabulary import HttpRequest, Respond
+    class Patient(BaseSandboxTool):
+        name = "patient"
+        declared_requests = ["http_request"]
+        def run(self, params):
+            res = yield HttpRequest(method="GET", url=params["url"])
+            return Respond(summary="approved and answered", data=res.denied)
+""")
+
+
+_HOG_TOOL = textwrap.dedent("""
+    from plugins.BaseSandboxTool import BaseSandboxTool
+    from effects.vocabulary import Respond
+    import time
+    class Hog(BaseSandboxTool):
+        name = "hog"
+        declared_requests = []
+        def run(self, params):
+            chunks = []
+            for _ in range(400):
+                chunks.append(bytearray(1024 * 1024))  # 1 MB each, ~400 MB total
+            time.sleep(0.3)  # hold the memory resident so the watchdog samples it
+            return Respond(summary="survived", data=len(chunks))
+""")
+
+
+def test_memory_cap_kills_a_hog():
+    """A tool that blows past its RAM cap is killed by the parent watchdog
+    (the portable enforcement — POSIX rlimits don't cover Windows/macOS)."""
+    pytest.importorskip("psutil")
+    ectx = EffectContext(tool_name="hog")
+    outcome = run_sandbox_tool(
+        source=_HOG_TOOL, params={}, declared=[], effect_ctx=ectx,
+        timeout=30, memory_mb=96,
+    )
+    assert not outcome.success
+    assert outcome.error_type == "MemoryCap"
+    assert "96 MB" in outcome.error
+
+
+_BURST_TOOL = textwrap.dedent("""
+    from plugins.BaseSandboxTool import BaseSandboxTool
+    from effects.vocabulary import Respond
+    class Burst(BaseSandboxTool):
+        name = "burst"
+        declared_requests = []
+        def run(self, params):
+            big = bytearray(400 * 1024 * 1024)  # one 400 MB shot, no loop to sample
+            return Respond(summary="survived", data=len(big))
+""")
+
+
+@pytest.mark.skipif(
+    __import__("platform").system() not in ("Windows", "Linux"),
+    reason="hard in-process cap needs a Job Object (Windows) or RLIMIT_AS (Linux)")
+def test_kernel_memory_cap_stops_a_burst_without_the_watchdog(monkeypatch):
+    """The kernel cap (Windows Job Object / Linux RLIMIT_AS) must stop an
+    instantaneous allocation that polling could never catch. Disable the psutil
+    watchdog so ONLY the in-process kernel cap can save us."""
+    import sandbox.runner as runner
+    monkeypatch.setattr(runner, "psutil", None)
+    ectx = EffectContext(tool_name="burst")
+    outcome = runner.run_sandbox_tool(
+        source=_BURST_TOOL, params={}, declared=[], effect_ctx=ectx,
+        timeout=30, memory_mb=96,
+    )
+    assert not outcome.success
+    assert outcome.error_type == "MemoryCap"
+    assert "96 MB" in outcome.error
+
+
+def test_slow_fulfillment_does_not_count_against_the_tool():
+    """The deadline meters the CHILD's compute, not the kernel's. A gate that
+    blocks (a human deliberating over an approval dialog) must not get the
+    tool killed for asking permission."""
+    import time as _time
+
+    def slow_gate(request):
+        _time.sleep(2.5)  # human thinks it over, longer than the whole timeout
+        return False, "took my time, still no"
+
+    ectx = EffectContext(egress_gate=slow_gate, tool_name="patient")
+    outcome = run_sandbox_tool(
+        source=_PATIENT_TOOL, params={"url": "https://example.com"},
+        declared=["http_request"], effect_ctx=ectx, timeout=2,
+    )
+    # The tool itself ran for milliseconds; it must complete, not time out.
+    assert outcome.success, outcome.error
+    assert outcome.summary == "approved and answered"
+    assert outcome.data is True  # the denial reached the tool
+
+
 # ── the adapter / discovery path ─────────────────────────────────────────
 
 def test_sandbox_adapter_presents_as_a_normal_tool(tmp_path):

@@ -29,6 +29,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+try:
+    import psutil
+except ImportError:  # POSIX rlimits remain the only memory enforcement
+    psutil = None
+
 from effects.declarations import UndeclaredRequestError
 from effects.interpreter import EffectContext, Interpreter, TurnJournal
 from effects.vocabulary import from_wire
@@ -41,6 +46,8 @@ _ENTRY = Path(__file__).with_name("entry.py")
 _ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TIMEOUT_S = 30.0
 DEFAULT_MEMORY_MB = 512
+DEFAULT_CPU_SECONDS = 30
+_POLL_INTERVAL = 0.03  # memory-watchdog sampling period (seconds)
 
 
 class SandboxRunError(RuntimeError):
@@ -73,6 +80,7 @@ def run_sandbox_tool(
     effect_ctx: EffectContext,
     timeout: float = DEFAULT_TIMEOUT_S,
     memory_mb: int = DEFAULT_MEMORY_MB,
+    cpu_seconds: int = DEFAULT_CPU_SECONDS,
     journal: TurnJournal | None = None,
     cancel_event: threading.Event | None = None,
 ) -> SandboxOutcome:
@@ -90,7 +98,8 @@ def run_sandbox_tool(
     interp = Interpreter(effect_ctx, declared, journal=journal)
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
-        json.dump({"code": source, "params": dict(params or {}), "memory_mb": int(memory_mb)}, f)
+        json.dump({"code": source, "params": dict(params or {}),
+                   "memory_mb": int(memory_mb), "cpu_seconds": int(cpu_seconds)}, f)
         job_path = f.name
 
     env = os.environ.copy()
@@ -113,10 +122,26 @@ def run_sandbox_tool(
     reader = threading.Thread(target=_reader, name="sandbox-reader", daemon=True)
     reader.start()
 
+    # Parent-side memory watchdog: the portable enforcement of ``memory_mb``
+    # (POSIX rlimits only cover Linux; Windows/macOS get nothing from the
+    # child). Polls RSS of the child + descendants and kills on breach.
+    mem_state = {"killed": False, "peak": 0}
+    watchdog_stop = threading.Event()
+    if psutil is not None:
+        watchdog = threading.Thread(
+            target=_memory_watchdog,
+            args=(proc, int(memory_mb) * 1024 * 1024, watchdog_stop, mem_state),
+            name="sandbox-mem-watchdog", daemon=True)
+        watchdog.start()
+    else:
+        watchdog = None
+
     deadline = time.monotonic() + float(timeout)
     outcome: SandboxOutcome | None = None
     try:
         while True:
+            if mem_state["killed"]:
+                break  # outcome built below, where peak is final
             if cancel_event is not None and cancel_event.is_set():
                 outcome = SandboxOutcome.failed("run cancelled", "Cancelled")
                 break
@@ -135,21 +160,74 @@ def run_sandbox_tool(
                 message = json.loads(line)
             except json.JSONDecodeError:
                 continue  # stray non-protocol output (a stray print)
+            # Stop the clock while the request sits on the kernel's side of
+            # the pipe: fulfilment time (disk walks, and above all egress
+            # gates blocked on a human approval) is not the tool's runtime.
+            # The deadline only meters time the CHILD is actually computing.
+            fulfil_started = time.monotonic()
             kind, outcome, done = _handle_message(message, interp, proc)
+            deadline += time.monotonic() - fulfil_started
             if done:
                 break
     finally:
+        watchdog_stop.set()
         _terminate(proc)
         reader.join(timeout=1.0)
+        if watchdog is not None:
+            watchdog.join(timeout=1.0)
         try:
             os.unlink(job_path)
         except OSError:
             pass
 
+    if mem_state["killed"]:
+        peak_mb = mem_state["peak"] / (1024 * 1024)
+        outcome = SandboxOutcome.failed(
+            f"tool exceeded {memory_mb} MB memory cap (peak ~{peak_mb:.0f} MB)", "MemoryCap")
     if outcome is None:
         stderr = (proc.stderr.read() if proc.stderr else "") or ""
         outcome = SandboxOutcome.failed(stderr.strip()[-500:] or "unknown sandbox failure", "SandboxFailure")
     return outcome
+
+
+def _memory_watchdog(proc, cap_bytes: int, stop: threading.Event, state: dict) -> None:
+    """Poll the child's RSS (including descendants); kill on cap breach.
+
+    Ported from Art's technique runner. Best-effort: an unreadable process
+    (already exited) just ends the watch.
+
+    The loop samples BEFORE it waits, and waits only briefly: a tool that
+    allocates and exits can live for well under a coarse poll interval, so a
+    ``wait``-first loop would never sample it. Polling is still sampling — a
+    burst that allocates and frees inside one interval can slip through — but at
+    ``_POLL_INTERVAL`` a sustained or even momentary over-cap is caught reliably
+    (the child's own spawn/import time keeps it alive across several samples).
+    """
+    try:
+        p = psutil.Process(proc.pid)
+    except Exception:  # noqa: BLE001
+        return
+    while True:
+        try:
+            rss = p.memory_info().rss
+            for child in p.children(recursive=True):
+                try:
+                    rss += child.memory_info().rss
+                except psutil.Error:
+                    pass
+        except psutil.Error:
+            return  # child gone
+        if rss > state["peak"]:
+            state["peak"] = rss
+        if rss > cap_bytes:
+            state["killed"] = True
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            return
+        if stop.wait(_POLL_INTERVAL):
+            return
 
 
 def _handle_message(message: dict, interp: Interpreter, proc) -> tuple[str, SandboxOutcome | None, bool]:

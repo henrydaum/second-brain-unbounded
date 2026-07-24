@@ -59,9 +59,15 @@ class BaseSandboxTool:
     dependencies_files: list[str] = []
     dependencies_pip: list[str] = []
 
-    # --- Sandbox resource limits ---
+    # --- Sandbox resource limits (per tool; enforced by the runner) ---
+    # timeout_s meters the CHILD's own compute wall-clock (the clock stops
+    # while a request sits kernel-side, e.g. on an approval dialog).
+    # memory_mb is enforced by the parent's psutil watchdog everywhere, plus
+    # RLIMIT_AS belt-and-braces on Linux. cpu_seconds sets RLIMIT_CPU on
+    # POSIX; on Windows the metered wall-clock timeout is the practical bound.
     timeout_s: float = 30.0
     memory_mb: int = 512
+    cpu_seconds: int = 30
 
     def __init_subclass__(cls, **kwargs):
         """Validate declarations at definition time and copy mutable defaults."""
@@ -144,6 +150,7 @@ class SandboxToolAdapter(BaseTool):
             effect_ctx=ectx,
             timeout=float(context.config.get("tool_timeout", self._sandbox.timeout_s)),
             memory_mb=self._sandbox.memory_mb,
+            cpu_seconds=self._sandbox.cpu_seconds,
         )
         return ToolResult(
             success=outcome.success,
