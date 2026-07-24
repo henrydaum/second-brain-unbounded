@@ -24,7 +24,9 @@ ROOT = Path(__file__).resolve().parents[1]
 # plugin implementations.
 CORE_DIRS = ("agent", "attachments", "config", "effects", "events", "pipeline",
              "runtime", "sandbox", "state_machine")
-CORE_FILES = ("main.py", "main.pyw", "paths.py")
+# ``sandbox_kit`` is pure tool-writing helpers imported inside the sandbox child;
+# it must stay plugin-free like the rest of the rim.
+CORE_FILES = ("main.py", "main.pyw", "paths.py", "sandbox_kit.py")
 
 # The plugin *substrate*: infrastructure the plugin system itself is made of.
 # Growing this set is sometimes right (a new base class, a new shared helper);

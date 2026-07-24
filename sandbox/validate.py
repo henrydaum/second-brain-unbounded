@@ -19,13 +19,15 @@ from __future__ import annotations
 
 import ast
 
-# Literal imports admitted exactly (no submodule fallback). The two kernel
-# modules are pure: BaseSandboxTool is the contract, effects.vocabulary is the
-# request dataclasses. urllib.parse is admitted (string munging, no sockets)
-# while bare ``urllib`` is not — that would reach urllib.request.
+# Literal imports admitted exactly (no submodule fallback). The kernel modules
+# are pure: BaseSandboxTool is the contract, effects.vocabulary is the request
+# dataclasses, sandbox_kit is the pure tool-writing helpers (no I/O, no handles).
+# urllib.parse is admitted (string munging, no sockets) while bare ``urllib`` is
+# not — that would reach urllib.request.
 _LITERAL_ALLOWED = {
     "plugins.BaseSandboxTool",
     "effects.vocabulary",
+    "sandbox_kit",
     "urllib.parse",
 }
 
