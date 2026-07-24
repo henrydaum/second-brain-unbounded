@@ -157,6 +157,18 @@ class WriteDb(Request):
 
 
 @dataclass(frozen=True)
+class DeleteFile(Request):
+    """Delete a local file. Journalled: undo restores the prior bytes — a delete
+    is reversible only because the kernel snapshots the file first. Root-confined
+    to the write roots, exactly like ``WriteFile``; deleting a missing file is a
+    successful no-op (``existed=False``)."""
+
+    type: ClassVar[str] = "delete_file"
+    tier: ClassVar[str] = TIER_WRITE
+    path: str
+
+
+@dataclass(frozen=True)
 class Respond(Request):
     """The terminal request: the tool's final result. A well-formed tool run
     ends with exactly one ``Respond``. Carries the model-facing summary plus
@@ -202,14 +214,57 @@ class Complete(Request):
     system: str = ""
 
 
+@dataclass(frozen=True)
+class Embed(Request):
+    """Embed text into vectors with the kernel's embedding model — the retrieval
+    twin of ``Complete``. Egress: the text reaches a model the tool does not
+    control (a hosted embedder, or a local model served kernel-side), so it is
+    exfiltration-capable like any completion. Stored corpus vectors are ordinary
+    db rows read via ``QueryDb``; only query-time embedding needs this."""
+
+    type: ClassVar[str] = "embed"
+    tier: ClassVar[str] = TIER_EGRESS
+    inputs: list[str]
+    model: str = ""
+
+
+@dataclass(frozen=True)
+class ExecSql(Request):
+    """Execute a mutating SQL statement (UPDATE/DELETE/DDL/INSERT). Egress, not
+    write: arbitrary DML is **not journalable**, and an effect the kernel cannot
+    reverse is gated like any irreversible action (PRIMITIVES.md: irreversibility
+    is the property, not the network). Read-only statements are refused — use
+    ``QueryDb``. Gated through the approval surface."""
+
+    type: ClassVar[str] = "exec_sql"
+    tier: ClassVar[str] = TIER_EGRESS
+    sql: str
+
+
+@dataclass(frozen=True)
+class RunProcess(Request):
+    """Run a subprocess: the shell exposed as one mediated, gated verb. Egress
+    and always gated — spawning a process is irreversible and boundary-crossing,
+    and raw ``fork``/``exec`` is never handed to a tool (only this single verb,
+    with the kernel owning the handle — the same exception that admits email and
+    MCP transports). ``argv`` is a list, never a shell string (no shell parsing);
+    ``cwd`` is confined to the allowed roots; output is captured and capped."""
+
+    type: ClassVar[str] = "run_process"
+    tier: ClassVar[str] = TIER_EGRESS
+    argv: list[str]
+    cwd: str = ""
+    timeout: float = 60.0
+
+
 # ── registry + wire helpers ──────────────────────────────────────────────
 
 REQUEST_TYPES: dict[str, type[Request]] = {
     cls.type: cls
     for cls in (
         ReadFile, ReadFiles, ListDir, Stat, QueryDb, ReadContext,
-        WriteFile, WriteDb, Respond,
-        HttpRequest, Complete,
+        WriteFile, WriteDb, DeleteFile, Respond,
+        HttpRequest, Complete, Embed, ExecSql, RunProcess,
     )
 }
 

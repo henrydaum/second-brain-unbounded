@@ -134,8 +134,10 @@ class SandboxToolAdapter(BaseTool):
         ectx = EffectContext(
             db=context.db,
             llm=(context.services or {}).get("llm"),
+            embedder=(context.services or {}).get("text_embedder"),
             read_roots=self._read_roots(context),
             write_roots=self._write_roots(context),
+            paths=self._paths(context),
             context_provider=self._context_provider(context),
             egress_gate=self._egress_gate(context),
             tool_name=self.name,
@@ -183,6 +185,23 @@ class SandboxToolAdapter(BaseTool):
         scratch.mkdir(parents=True, exist_ok=True)
         return [scratch]
 
+    def _paths(self, context):
+        """Non-secret resolved locations a tool may read via ReadContext("paths").
+
+        Only *where things are* — never config values or keys. Tools that write
+        to per-user data (memory) or read a curated corpus (skills) resolve their
+        root here instead of guessing paths."""
+        from paths import DATA_DIR
+        out = {"data": str(DATA_DIR), "scratch": str(DATA_DIR / "sandbox_scratch")}
+        if context.root_dir:
+            out["root"] = str(Path(context.root_dir))
+        try:
+            from plugins.helpers.memory_paths import memory_root
+            out["memory_root"] = str(memory_root(context.user_id))
+        except Exception:  # noqa: BLE001 — memory package may be absent; omit the key
+            pass
+        return out
+
     def _conversation_id(self, context):
         """The current conversation id, via the live session if present."""
         session = self._session(context)
@@ -210,18 +229,30 @@ class SandboxToolAdapter(BaseTool):
         return provider
 
     def _egress_gate(self, context):
-        """Allow LLM completions; route raw HTTP through the approval surface."""
+        """Kernel-served model calls (complete, embed) pass; boundary-crossing
+        actions (HTTP, SQL mutation, subprocess) route through the approval
+        surface, each with a legible target."""
         def gate(request):
-            if request.type == "complete":
+            if request.type in ("complete", "embed"):
                 return True, ""
             approve = context.approve_command
             if approve is None:
                 return False, "no approval surface available for egress"
-            target = f"{getattr(request, 'method', '')} {getattr(request, 'url', '')}".strip()
-            ok = approve(target, f"sandboxed tool '{self.name}' network egress")
+            ok = approve(_egress_target(request), f"sandboxed tool '{self.name}' {request.type}")
             return ok, "" if ok else (context.approval_denial_reason or "egress denied by user")
 
         return gate
+
+
+def _egress_target(request) -> str:
+    """A one-line, human-legible description of an egress request for approval."""
+    if request.type == "http_request":
+        return f"{getattr(request, 'method', '')} {getattr(request, 'url', '')}".strip()
+    if request.type == "exec_sql":
+        return getattr(request, "sql", "")
+    if request.type == "run_process":
+        return " ".join(getattr(request, "argv", []) or [])
+    return request.type
 
 
 def build_sandbox_adapters(module, module_name: str, source_path: str) -> list[SandboxToolAdapter]:

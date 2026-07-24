@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import subprocess
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -41,6 +42,9 @@ from effects.vocabulary import (
     TIER_READ,
     TIER_WRITE,
     Complete,
+    DeleteFile,
+    Embed,
+    ExecSql,
     HttpRequest,
     ListDir,
     QueryDb,
@@ -49,6 +53,7 @@ from effects.vocabulary import (
     ReadFiles,
     Request,
     Respond,
+    RunProcess,
     Stat,
     WriteDb,
     WriteFile,
@@ -58,6 +63,27 @@ logger = logging.getLogger("Effects")
 
 _VALID_TABLE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _MAX_EGRESS_BYTES = 200_000
+
+# Leading keywords that mean "read only" — an ExecSql starting with one of these
+# is refused (it belongs on QueryDb, which is ungated read tier). Comments and
+# whitespace are stripped first.
+_READ_ONLY_SQL = ("select", "pragma", "explain", "with")
+_SQL_COMMENT = re.compile(r"^\s*(--[^\n]*\n|/\*.*?\*/)", re.DOTALL)
+
+
+def _is_read_only_sql(sql: str) -> bool:
+    """True if ``sql``'s first keyword is read-only (SELECT/PRAGMA/EXPLAIN/WITH).
+
+    Conservative by design: a mutating statement never starts with these, so a
+    false negative is impossible; the point is only to send reads to QueryDb."""
+    text = (sql or "").strip()
+    while True:
+        stripped = _SQL_COMMENT.sub("", text, count=1)
+        if stripped == text:
+            break
+        text = stripped.strip()
+    first = text.split(None, 1)[0].lower() if text else ""
+    return first in _READ_ONLY_SQL
 
 
 class EgressDenied(RuntimeError):
@@ -138,16 +164,17 @@ class TurnJournal:
 
 
 def default_egress_gate(request: Request) -> tuple[bool, str]:
-    """Conservative default: allow LLM completions, deny outbound HTTP.
+    """Conservative default: allow kernel-served model calls, deny the rest.
 
-    ``Complete`` is the kernel's own LLM (keys stay kernel-side), so it is
-    allowed by default; a raw ``HttpRequest`` is refused unless a real gate
-    (the runtime's approval surface) overrides this. Returns ``(allowed,
-    reason)``.
+    ``Complete`` and ``Embed`` are the kernel's own models (keys stay
+    kernel-side), so they are allowed by default; boundary-crossing actions
+    (raw ``HttpRequest``, ``ExecSql`` mutation, ``RunProcess``) are refused
+    unless a real gate (the runtime's approval surface) overrides this. Returns
+    ``(allowed, reason)``.
     """
-    if isinstance(request, Complete):
+    if isinstance(request, (Complete, Embed)):
         return True, ""
-    return False, "outbound HTTP is denied by default; no approval gate is wired"
+    return False, "this egress is denied by default; no approval gate is wired"
 
 
 @dataclass
@@ -156,10 +183,14 @@ class EffectContext:
 
     db: Any = None
     llm: Any = None
+    embedder: Any = None
     # Path policy. ``None`` roots mean "allow anywhere" (tests / trusted use);
     # otherwise a path must resolve under one of the listed roots.
     read_roots: list[Path] | None = None
     write_roots: list[Path] | None = None
+    # Non-secret resolved locations a tool may ask for via ReadContext("paths")
+    # (root, data, scratch, memory_root, …). Never config values or keys.
+    paths: dict | None = None
     # Resolves a ReadContext(view, k) request to conversation text.
     context_provider: Callable[[str, int | None], str] | None = None
     # Gate for egress requests: (request) -> (allowed, reason).
@@ -230,9 +261,19 @@ class Interpreter:
             ok = "error" not in out
             return EffectResult(ok=ok, value=out, error=out.get("error", ""), tier=TIER_READ)
         if isinstance(request, ReadContext):
+            # Ambient, non-secret session facts resolve straight off the context
+            # (no conversation text — a params_only tool may still learn where it
+            # is and whose data it holds). Everything else is conversation text.
+            view = request.view
+            if view == "conversation_id":
+                return EffectResult(value=self.ctx.conversation_id, tier=TIER_READ)
+            if view == "user_id":
+                return EffectResult(value=self.ctx.user_id, tier=TIER_READ)
+            if view == "paths":
+                return EffectResult(value=dict(self.ctx.paths or {}), tier=TIER_READ)
             text = ""
             if self.ctx.context_provider is not None:
-                text = self.ctx.context_provider(request.view, request.k)
+                text = self.ctx.context_provider(view, request.k)
             return EffectResult(value=text, tier=TIER_READ)
         if isinstance(request, Respond):
             # Terminal; the runner handles it, but fulfilling is harmless.
@@ -280,6 +321,22 @@ class Interpreter:
             self._journal_row(request)
             return EffectResult(value={"table": table, "inserted": len(request.rows)}, tier=TIER_WRITE)
 
+        if isinstance(request, DeleteFile):
+            path = self._check_path(request.path, write=True)
+            existed = path.exists() and path.is_file()
+            prior = path.read_bytes() if existed else None
+            if existed:
+                path.unlink()
+
+            def _undo() -> None:
+                if prior is not None:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(prior)
+
+            self.journal.record(request.type, _undo, f"delete {path}")
+            self._journal_row(request)
+            return EffectResult(value={"path": str(path), "existed": existed}, tier=TIER_WRITE)
+
         return EffectResult(ok=False, error=f"unhandled write request {request.type!r}", tier=TIER_WRITE)
 
     # ── egress (gated) ───────────────────────────────────────────────────
@@ -324,7 +381,65 @@ class Interpreter:
                 return EffectResult(ok=False, error=getattr(resp, "error", "llm error"), tier=TIER_EGRESS)
             return EffectResult(value=content, tier=TIER_EGRESS)
 
+        if isinstance(request, Embed):
+            embedder = self.ctx.embedder
+            if embedder is None:
+                return EffectResult(ok=False, error="no embedder available", tier=TIER_EGRESS)
+            vecs = embedder.encode(list(request.inputs))
+            out = [[float(x) for x in vec] for vec in vecs]
+            model = getattr(embedder, "model_name", "") or request.model
+            return EffectResult(value={"vectors": out, "model": model}, tier=TIER_EGRESS)
+
+        if isinstance(request, ExecSql):
+            db = self.ctx.db
+            if db is None:
+                return EffectResult(ok=False, error="no database available", tier=TIER_EGRESS)
+            if _is_read_only_sql(request.sql):
+                return EffectResult(
+                    ok=False, tier=TIER_EGRESS,
+                    error="ExecSql is for mutations; use QueryDb for SELECT/PRAGMA/EXPLAIN")
+            result = db.execute_write(request.sql)
+            rowcount = result if isinstance(result, int) else getattr(result, "rowcount", None)
+            return EffectResult(value={"rowcount": rowcount}, tier=TIER_EGRESS)
+
+        if isinstance(request, RunProcess):
+            return self._run_process(request)
+
         return EffectResult(ok=False, error=f"unhandled egress request {request.type!r}", tier=TIER_EGRESS)
+
+    def _run_process(self, request: RunProcess) -> EffectResult:
+        """Spawn a subprocess (argv only, no shell), cwd-confined and capped.
+
+        Every failure — bad argv, cwd outside the roots, timeout, spawn error —
+        is a tool-visible EffectResult, never a raised exception."""
+        argv = list(request.argv or [])
+        if not argv or not all(isinstance(a, str) for a in argv):
+            return EffectResult(ok=False, error="argv must be a non-empty list of strings", tier=TIER_EGRESS)
+        cwd = None
+        if request.cwd:
+            try:
+                cwd = str(self._check_path(request.cwd, write=False))
+            except PermissionError as e:
+                return EffectResult(ok=False, error=str(e), tier=TIER_EGRESS)
+        elif self.ctx.read_roots:
+            cwd = str(Path(self.ctx.read_roots[0]).expanduser().resolve())
+        started = time.perf_counter()
+        try:
+            proc = subprocess.run(
+                argv, cwd=cwd, capture_output=True, text=True, shell=False,
+                timeout=max(1.0, float(request.timeout)),
+            )
+        except subprocess.TimeoutExpired:
+            return EffectResult(ok=False, error=f"process timed out after {request.timeout}s", tier=TIER_EGRESS)
+        except (OSError, ValueError) as e:
+            return EffectResult(ok=False, error=f"could not run process: {e}", tier=TIER_EGRESS)
+        out = (proc.stdout or "")[:_MAX_EGRESS_BYTES]
+        err = (proc.stderr or "")[:_MAX_EGRESS_BYTES]
+        truncated = len(proc.stdout or "") > _MAX_EGRESS_BYTES or len(proc.stderr or "") > _MAX_EGRESS_BYTES
+        return EffectResult(value={
+            "exit_code": proc.returncode, "stdout": out, "stderr": err,
+            "truncated": truncated, "duration": round(time.perf_counter() - started, 3),
+        }, tier=TIER_EGRESS)
 
     # ── helpers ──────────────────────────────────────────────────────────
 

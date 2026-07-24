@@ -66,19 +66,36 @@ Apply, in order:
 5. **Batching is not semantics.** A batched variant (`ReadFiles`) exists for
    round-trip economy and inherits its element's tier.
 
-## The domain inventory (v1)
+## The domain inventory
 
 | Domain | Primitives | Tier |
 |---|---|---|
 | Conversation | `ReadContext(view)` · `Respond` (terminal) | read (implicit — never declared) |
 | Filesystem | `ListDir` · `Stat` · `ReadFile` · `ReadFiles` | read |
-| | `WriteFile` (journaled, root-confined) | write |
+| | `WriteFile` · `DeleteFile` (journaled — the kernel snapshots prior bytes; root-confined) | write |
 | Database | `QueryDb` (SELECT/PRAGMA-guarded) | read |
 | | `WriteDb` (own output tables, journaled) | write |
-| Network / services | `HttpRequest` · `Complete` (LLM served kernel-side; keys never enter the sandbox) | egress |
-| Compute | none — CPU/memory/time are sandbox budgets, not requests; process-spawning is not offered | — |
-| Kernel state | none in v1 — config holds API keys; a read there composes with egress into key theft | — |
+| | `ExecSql` (arbitrary mutation — **not** journalable, so egress-graded and gated) | egress |
+| Network / services | `HttpRequest` · `Complete` · `Embed` (LLM/embedder served kernel-side; keys never enter the sandbox) | egress |
+| Compute / process | `RunProcess` (argv only — no shell string; cwd-confined; kernel owns the handle) | egress |
+| Kernel state | none — config holds API keys; a read there composes with egress into key theft | — |
 | User | none yet — a future `AskUser` is *not* egress (the human is inside the trust domain) but gates on attendance | — |
+
+**`ReadContext` ambient views.** Beyond conversation text, `ReadContext` resolves
+a few non-secret *facts* about the run straight off `EffectContext`:
+`conversation_id`, `user_id`, `paths` (resolved locations — root, data, scratch,
+memory root — never config values or keys). These are read-tier and available to
+even a `params_only` tool: knowing *where you are* and *whose data this is* is not
+conversation content, and paths are not secrets. This is a mode on an existing
+read primitive, not a new domain.
+
+**Why process-spawning is now offered (amends the v1 "not offered" stance).** A
+subprocess is irreversible and boundary-crossing, so it is not a write — it is
+egress, and always gated. It is admitted under the same exception that admits
+email and MCP transports (generality-bar #2): raw `fork`/`exec` is never handed
+to a tool, only the single mediated `RunProcess` verb, with the kernel owning the
+handle, confining the cwd, capping output, and routing every call through the
+approval surface. CPU/memory/time remain sandbox *budgets*, not requests.
 
 ## Standing rules
 
