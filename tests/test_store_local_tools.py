@@ -34,7 +34,7 @@ def _store_source(rel: str) -> str | None:
 @pytest.fixture(scope="module")
 def sources():
     out = {name: _store_source(f"tools/tool_{name}.py")
-           for name in ("read_file", "render_files", "sql_query", "edit_file", "memory")}
+           for name in ("read_file", "render_files", "sql_query", "edit_file", "memory", "run_command")}
     if any(v is None for v in out.values()):
         pytest.skip("ported local tools not present on a local store ref")
     return out
@@ -233,3 +233,39 @@ def test_memory_read_miss_lists_topics(sources, tmp_path):
     (mem / "known.md").write_text("hi", encoding="utf-8")
     out = _mem_run(sources["memory"], {"action": "read", "topic": "ghost"}, tmp_path, mem)
     assert out.success is False and "known" in out.summary
+
+
+# ── run_command (RunProcess, always gated) ───────────────────────────────
+
+def _cmd_run(source, params, tree, gate):
+    ctx = EffectContext(tool_name="run_command", read_roots=[tree], egress_gate=gate)
+    return R.run_sandbox_tool(source=source, params=params, declared=["run_process"], effect_ctx=ctx, timeout=30)
+
+
+def test_run_command_captures_output(sources, tree):
+    import sys
+    out = _cmd_run(sources["run_command"],
+                   {"command": [sys.executable, "-c", "print(6*7)"], "justification": "math"},
+                   tree, lambda r: (True, ""))
+    assert out.success and "42" in out.summary and out.summary.startswith("$")
+
+
+def test_run_command_nonzero_exit_is_failure(sources, tree):
+    import sys
+    out = _cmd_run(sources["run_command"],
+                   {"command": [sys.executable, "-c", "import sys; sys.exit(3)"], "justification": "x"},
+                   tree, lambda r: (True, ""))
+    assert out.success is False and "exit 3" in out.summary
+
+
+def test_run_command_denied_stops(sources, tree):
+    import sys
+    out = _cmd_run(sources["run_command"],
+                   {"command": [sys.executable, "-c", "pass"], "justification": "x"},
+                   tree, lambda r: (False, "declined"))
+    assert out.success is False and "STOP" in out.summary
+
+
+def test_run_command_empty_argv_fails(sources, tree):
+    out = _cmd_run(sources["run_command"], {"command": [], "justification": "x"}, tree, lambda r: (True, ""))
+    assert out.success is False
