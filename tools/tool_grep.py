@@ -9,38 +9,12 @@ the resumable request loop is doing exactly what it was designed for.
 
 import re
 
+import sandbox_kit as kit
 from plugins.BaseSandboxTool import BaseSandboxTool
 from effects.vocabulary import ListDir, ReadFiles, Respond
 
 MAX_FILE_BYTES = 2_000_000
 BATCH = 100
-
-
-def _compile_glob(pattern):
-    """Translate a glob into a regex over '/'-separated relative paths.
-
-    ``*`` and ``?`` never cross a separator; a ``**`` segment matches any
-    number of directories.
-    """
-    segments = [s for s in pattern.replace("\\", "/").split("/") if s]
-    parts = []
-    for seg in segments:
-        if seg == "**":
-            parts.append("(?:[^/]+/)*")
-            continue
-        piece = ""
-        for ch in seg:
-            if ch == "*":
-                piece += "[^/]*"
-            elif ch == "?":
-                piece += "[^/]"
-            else:
-                piece += re.escape(ch)
-        parts.append(piece + "/")
-    body = "".join(parts)
-    if body.endswith("/"):
-        body = body[:-1]
-    return re.compile("^" + body + "$", re.IGNORECASE)
 
 
 class GrepTool(BaseSandboxTool):
@@ -77,9 +51,9 @@ class GrepTool(BaseSandboxTool):
     max_calls = 10
 
     def run(self, params):
-        limit = max(1, min(500, int(params.get("limit", 100) or 100)))
+        limit = kit.clamp(params.get("limit"), 1, 500, 100)
         mode = params.get("output_mode", "files_with_matches") or "files_with_matches"
-        context = max(0, min(10, int(params.get("context_lines", 0) or 0)))
+        context = kit.clamp(params.get("context_lines"), 0, 10, 0)
         multiline = bool(params.get("multiline", False))
 
         flags = re.IGNORECASE if params.get("case_insensitive") else 0
@@ -97,9 +71,9 @@ class GrepTool(BaseSandboxTool):
         root = listing.value["root"].replace("\\", "/").rstrip("/")
         entries = [e for e in listing.value["entries"] if e["size"] <= MAX_FILE_BYTES]
         if params.get("glob"):
-            grx = _compile_glob(params["glob"])
+            grx = kit.compile_glob(params["glob"])
             entries = [e for e in entries if grx.match(e["path"])]
-        entries.sort(key=lambda e: e["mtime"], reverse=True)
+        entries = kit.newest_first(entries)
         truncated = listing.value.get("truncated", False)
 
         files_out = []
@@ -115,7 +89,7 @@ class GrepTool(BaseSandboxTool):
                 truncated = True
                 break
             batch = entries[start:start + BATCH]
-            reads = yield ReadFiles(paths=[root + "/" + e["path"] for e in batch])
+            reads = yield ReadFiles(paths=[kit.join_root(root, e["path"]) for e in batch])
             for e, f in zip(batch, reads.value["files"]):
                 if full():
                     truncated = True
@@ -187,9 +161,9 @@ def _summarize(data):
         counts = data.get("counts", [])
         if not counts:
             return "No matches."
-        rows = "\n".join("- " + c["file"] + ": " + str(c["count"]) for c in counts)
+        rows = kit.bullet_list(c["file"] + ": " + str(c["count"]) for c in counts)
         return "Match counts:\n" + rows + trailer
     files = data.get("files", [])
     if not files:
         return "No matches."
-    return str(len(files)) + " file(s) with matches:\n" + "\n".join("- " + f for f in files) + trailer
+    return str(len(files)) + " file(s) with matches:\n" + kit.bullet_list(files) + trailer
