@@ -34,7 +34,7 @@ def _store_source(rel: str) -> str | None:
 @pytest.fixture(scope="module")
 def sources():
     out = {name: _store_source(f"tools/tool_{name}.py")
-           for name in ("read_file", "render_files", "sql_query", "edit_file", "memory", "run_command")}
+           for name in ("read_file", "render_files", "sql_query", "edit_file", "memory", "run_command", "use_skill")}
     if any(v is None for v in out.values()):
         pytest.skip("ported local tools not present on a local store ref")
     return out
@@ -268,4 +268,55 @@ def test_run_command_denied_stops(sources, tree):
 
 def test_run_command_empty_argv_fails(sources, tree):
     out = _cmd_run(sources["run_command"], {"command": [], "justification": "x"}, tree, lambda r: (True, ""))
+    assert out.success is False
+
+
+# ── use_skill (discover + read SKILL.md across skills roots) ──────────────
+
+def _skill_run(source, params, root, skills_roots):
+    ctx = EffectContext(tool_name="use_skill", read_roots=[root],
+                        paths={"skills_roots": [str(r) for r in skills_roots]},
+                        egress_gate=lambda r: (True, ""))
+    return R.run_sandbox_tool(source=source, params=params, declared=["read_file", "list_dir"],
+                              effect_ctx=ctx, timeout=30)
+
+
+def _make_skill(base, folder, name, body, support=None):
+    d = base / folder
+    d.mkdir(parents=True)
+    fm = f"---\nname: {name}\ndescription: does {name} things\n---\n{body}"
+    (d / "SKILL.md").write_text(fm, encoding="utf-8")
+    for rel, text in (support or {}).items():
+        (d / rel).write_text(text, encoding="utf-8")
+
+
+def test_use_skill_returns_full_text_and_support(sources, tmp_path):
+    root = tmp_path
+    sk = root / "skills"
+    _make_skill(sk, "trip", "trip-planning", "Plan the trip step by step.",
+                support={"template.md": "x"})
+    out = _skill_run(sources["use_skill"], {"name": "trip-planning"}, root, [sk])
+    assert out.success and "Plan the trip step by step." in out.summary
+    assert "template.md" in out.summary  # support-file listing
+
+
+def test_use_skill_unknown_lists_installed(sources, tmp_path):
+    root = tmp_path
+    sk = root / "skills"
+    _make_skill(sk, "trip", "trip-planning", "body")
+    out = _skill_run(sources["use_skill"], {"name": "ghost"}, root, [sk])
+    assert out.success is False and "trip-planning" in out.summary
+
+
+def test_use_skill_later_root_wins(sources, tmp_path):
+    root = tmp_path
+    a, b = root / "a" / "skills", root / "b" / "skills"
+    _make_skill(a, "x", "shared", "FROM A")
+    _make_skill(b, "x", "shared", "FROM B")
+    out = _skill_run(sources["use_skill"], {"name": "shared"}, root, [a, b])
+    assert out.success and "FROM B" in out.summary and "FROM A" not in out.summary
+
+
+def test_use_skill_no_skills_installed(sources, tmp_path):
+    out = _skill_run(sources["use_skill"], {"name": "any"}, tmp_path, [])
     assert out.success is False

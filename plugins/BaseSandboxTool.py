@@ -223,6 +223,14 @@ class SandboxToolAdapter(BaseTool):
             out["memory_root"] = str(memory_root(context.user_id))
         except Exception:  # noqa: BLE001 — memory package may be absent; omit the key
             pass
+        try:
+            from plugins.helpers.plugin_paths import PLUGIN_ROOTS
+            roots = [str(r.path / "skills") for r in PLUGIN_ROOTS
+                     if (r.path / "skills").is_dir()]
+            if roots:
+                out["skills_roots"] = roots
+        except Exception:  # noqa: BLE001 — skills package may be absent; omit the key
+            pass
         return out
 
     def _conversation_id(self, context):
