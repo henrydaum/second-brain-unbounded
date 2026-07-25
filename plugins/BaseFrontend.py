@@ -254,7 +254,30 @@ class BaseFrontend:
     # ──────────────────────────────────────────────────────────────────────
     # Rendering — override these. The base owns *when* to render; subclasses
     # own *how*.
+    #
+    # This half is **sandboxable**: every render_* method is data in, side
+    # effects out through the frontend's own surface, and the inbound half is
+    # already typed (14 on_bus_* handlers in, submit(session_key, action_type,
+    # payload) out). A frontend on the effects contract has these driven through
+    # the boundary like any other body.
+    #
+    # The transport half — start/stop, bind/unbind, the socket or input loop —
+    # is **not** sandboxable and is not meant to be: it holds a live handle
+    # (capability 1) and owns a loop (capability 2), which is why frontend
+    # transports are a permanent entry on the trusted-exception list in
+    # effects/PRIMITIVES.md. The kernel owns the transport; the plugin owns the
+    # rendering. See RENDER_METHODS below for the exact line.
     # ──────────────────────────────────────────────────────────────────────
+
+    # The sandboxable surface, named so the split is checkable rather than
+    # merely described. Anything here may run on the effects contract; anything
+    # not here is transport and stays trusted.
+    RENDER_METHODS = (
+        "render_messages", "render_attachments", "render_form_field",
+        "render_approval_request", "render_buttons", "render_error",
+        "render_typing", "render_tool_status", "render_stream_delta",
+        "render_queued_ack", "render_conversation_banner",
+    )
 
     def render_messages(self, session_key: str, messages: list[str]) -> None:
         """Render messages."""
