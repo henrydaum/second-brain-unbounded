@@ -43,13 +43,37 @@ def test_validation_accepts_a_clean_tool():
     "from subprocess import run",
     "open('/etc/passwd')",
     "__import__('os')",
-    "from . import something",
     "x = (1).__class__.__bases__",
 ])
 def test_validation_rejects_dangerous_code(bad):
     """Imports off the allowlist, banned builtins, and escape attributes fail."""
     with pytest.raises(SandboxValidationError):
         assert_valid(bad)
+
+
+def test_validation_allows_a_relative_import():
+    """A relative import names a file in the plugin's *own* closure, and every
+    file in that closure is validated by this same function and shipped to the
+    same child. So it reaches code exactly as confined as the importer.
+
+    These were rejected outright until helpers were supported in the sandbox,
+    which meant a plugin using a helper could not be sandboxed at all — the
+    agent could only write safe plugins by writing them as one file."""
+    assert_valid("from . import something")           # does not raise
+    assert_valid("from .helpers.answer import VALUE")
+
+
+def test_a_relative_import_is_still_confined_at_runtime():
+    """Allowing the syntax does not allow the reach: the child resolves a
+    relative import only against the closure the parent shipped, so naming
+    anything else is an ImportError rather than an escape. Pinned in
+    tests/test_closure.py end to end; asserted here so the two halves of the
+    rule sit next to each other."""
+    from sandbox.entry import _resolve_relative
+
+    assert _resolve_relative("", 1, "helpers.answer") == "helpers.answer"
+    assert _resolve_relative("helpers.one", 1, "two") == "helpers.two"
+    assert _resolve_relative("", 2, "escape") is None, "climbing past the root is refused"
 
 
 # ── source tier (read) ───────────────────────────────────────────────────

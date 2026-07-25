@@ -83,10 +83,15 @@ class SandboxWorker:
     """
 
     def __init__(self, *, source: str, memory_mb: int = 512, cpu_seconds: int = 30,
-                 start_timeout: float = 30.0, persistent: bool = False):
-        """Validate the source, spawn the child, and wait for it to be ready."""
+                 start_timeout: float = 30.0, persistent: bool = False,
+                 modules: dict[str, str] | None = None):
+        """Validate the source and its closure, spawn the child, wait for ready."""
+        modules = dict(modules or {})
         assert_valid(source)
+        for text in modules.values():
+            assert_valid(text)          # a helper is held to the plugin's standard
         self.source = source
+        self.modules = modules
         self.memory_mb = int(memory_mb)
         self.persistent = bool(persistent)
         self.calls = 0
@@ -97,6 +102,7 @@ class SandboxWorker:
 
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
             json.dump({"code": source, "params": {}, "resident": True,
+                       "modules": modules,
                        "memory_mb": self.memory_mb, "cpu_seconds": int(cpu_seconds)}, f)
             self._job_path = f.name
 
@@ -261,18 +267,29 @@ class WorkerPool:
         self.max_workers = max_workers
 
     @staticmethod
-    def _key(source: str) -> str:
-        """Content address for a plugin source."""
-        return hashlib.sha256(source.encode("utf-8")).hexdigest()
+    def _key(source: str, modules: dict[str, str] | None = None) -> str:
+        """Content address for a plugin — its entry file *and* its closure.
+
+        Keying on the entry file alone would hand back a stale worker after a
+        helper was edited: the plugin's own bytes are unchanged, but what it
+        runs is not."""
+        digest = hashlib.sha256(source.encode("utf-8"))
+        for name in sorted(modules or {}):
+            digest.update(b"\0")
+            digest.update(name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update((modules or {})[name].encode("utf-8"))
+        return digest.hexdigest()
 
     def acquire(self, *, source: str, memory_mb: int = 512, cpu_seconds: int = 30,
-                persistent: bool = False) -> SandboxWorker:
+                persistent: bool = False,
+                modules: dict[str, str] | None = None) -> SandboxWorker:
         """Return a live worker for ``source``, spawning or recycling as needed.
 
         ``persistent=True`` marks a service worker: exempt from the call budget,
         the idle reaper, and eviction under pressure, because its state is the
         capability rather than an artifact of it."""
-        key = self._key(source)
+        key = self._key(source, modules)
         with self._lock:
             self._reap()
             worker = self._workers.get(key)
@@ -284,7 +301,8 @@ class WorkerPool:
             if len(self._workers) >= self.max_workers:
                 self._evict_one()
             worker = SandboxWorker(source=source, memory_mb=memory_mb,
-                                   cpu_seconds=cpu_seconds, persistent=persistent)
+                                   cpu_seconds=cpu_seconds, persistent=persistent,
+                                   modules=modules)
             self._workers[key] = worker
             return worker
 
@@ -318,9 +336,9 @@ class WorkerPool:
                 worker.close()
                 self._workers.pop(key, None)
 
-    def release(self, source: str) -> None:
+    def release(self, source: str, modules: dict[str, str] | None = None) -> None:
         """Close the worker for ``source`` — a service's unload path."""
-        key = self._key(source)
+        key = self._key(source, modules)
         with self._lock:
             worker = self._workers.pop(key, None)
         if worker is not None:

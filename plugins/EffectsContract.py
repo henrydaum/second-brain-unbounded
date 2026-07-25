@@ -170,11 +170,12 @@ class EffectsContract:
             return run_local_tool(
                 instance=self, params=params, declared=self.declared_requests,
                 effect_ctx=ectx, method=method)
+        modules = self._closure_modules()
         if self.persistent_sandbox:
             from sandbox.worker import POOL
             worker = POOL.acquire(
                 source=self._source_text(), memory_mb=self.memory_mb,
-                cpu_seconds=self.cpu_seconds, persistent=True)
+                cpu_seconds=self.cpu_seconds, persistent=True, modules=modules)
             return worker.call(
                 params=params, declared=self.declared_requests, effect_ctx=ectx,
                 method=method, timeout=timeout)
@@ -182,7 +183,8 @@ class EffectsContract:
         return run_sandbox_tool(
             source=self._source_text(), params=params,
             declared=self.declared_requests, effect_ctx=ectx, method=method,
-            timeout=timeout, memory_mb=self.memory_mb, cpu_seconds=self.cpu_seconds)
+            timeout=timeout, memory_mb=self.memory_mb, cpu_seconds=self.cpu_seconds,
+            modules=modules)
 
     def release_sandbox(self) -> None:
         """Close this plugin's resident worker, if it has one (a service's
@@ -193,9 +195,29 @@ class EffectsContract:
             return  # never located on disk, so it never had a worker
         try:
             from sandbox.worker import POOL
-            POOL.release(self._source_text())
+            POOL.release(self._source_text(), self._closure_modules())
         except Exception:  # noqa: BLE001 — teardown must not raise
             logger.debug("releasing sandbox worker failed", exc_info=True)
+
+    def closure(self):
+        """This plugin's own local files and its reach outside the stdlib.
+
+        Computed from the code, never from ``dependencies_files`` — a plugin that
+        under-declares must not look smaller than it is. See sandbox/TRUST.md."""
+        cached = getattr(self, "_closure_cache", None)
+        if cached is not None:
+            return cached
+        from sandbox.closure import build_closure
+
+        path = getattr(self, "_source_path", "")
+        result = build_closure(path, self._source_text()) if path else None
+        self._closure_cache = result
+        return result
+
+    def _closure_modules(self) -> dict:
+        """The closure as ``{dotted name: source}`` for shipping to the child."""
+        found = self.closure()
+        return dict(found.modules) if found is not None else {}
 
     def _source_text(self) -> str:
         """The plugin's own source, read lazily and cached. Only the untrusted

@@ -68,6 +68,7 @@ def run_sandbox_tool(
     journal: TurnJournal | None = None,
     cancel_event: threading.Event | None = None,
     method: str = "run",
+    modules: dict[str, str] | None = None,
 ) -> SandboxOutcome:
     """Run one sandboxed tool. Returns a :class:`SandboxOutcome`.
 
@@ -75,8 +76,14 @@ def run_sandbox_tool(
     any undeclared request. ``journal`` may be a turn-scoped journal shared across
     tool calls so the whole turn is rolled back as one unit.
     """
+    # Every file in the closure faces the same gate as the entry point — a
+    # helper is more of the same plugin, not a lesser one, so validating only
+    # the file with the class in it would be a hole the size of a helper.
+    modules = dict(modules or {})
     try:
         assert_valid(source)
+        for name, text in modules.items():
+            assert_valid(text)
     except SandboxValidationError as e:
         return SandboxOutcome.failed(f"validation failed: {e}", "ValidationError")
 
@@ -84,6 +91,7 @@ def run_sandbox_tool(
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
         json.dump({"code": source, "params": dict(params or {}), "method": method,
+                   "modules": modules,
                    "memory_mb": int(memory_mb), "cpu_seconds": int(cpu_seconds)}, f)
         job_path = f.name
 

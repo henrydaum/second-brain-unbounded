@@ -43,6 +43,10 @@ _TOP_ALLOWED = {
     "base64", "hashlib", "hmac", "decimal", "fractions", "uuid", "html",
     "unicodedata", "difflib", "enum", "dataclasses", "typing", "operator",
     "bisect", "heapq", "csv",
+    # A compiler directive, not a module: `from __future__ import annotations`
+    # changes how the file is compiled and binds nothing reachable. Excluding it
+    # made every plugin that used it look like it needed trust.
+    "__future__",
 }
 
 _BANNED_NAMES = {
@@ -94,7 +98,19 @@ def assert_valid(code: str) -> None:
                     raise SandboxValidationError(f"disallowed import: {alias.name}", node.lineno)
         elif isinstance(node, ast.ImportFrom):
             if node.level:
-                raise SandboxValidationError("relative imports are not allowed", node.lineno)
+                # A relative import names a file inside this plugin's own
+                # closure, and every file in that closure is validated by this
+                # same function and shipped to the child alongside the entry
+                # point. So it reaches plugin code that is exactly as confined
+                # as the plugin — there is nothing here to mediate.
+                #
+                # These used to be rejected outright, which sounded safe and was
+                # not: it meant any plugin using a helper could not be sandboxed
+                # at all, so the agent could only write safe plugins by writing
+                # them as one file. Confinement you cannot afford to use is not
+                # confinement. The child refuses any relative import that does
+                # not resolve inside the shipped closure (sandbox/closure.py).
+                continue
             if not _import_allowed(node.module or ""):
                 raise SandboxValidationError(f"disallowed import: {node.module}", node.lineno)
         # Banned builtin names --------------------------------------------

@@ -19,6 +19,7 @@ import json
 import platform
 import sys
 import traceback
+import types
 from pathlib import Path
 
 # The child's OWN imports run with normal builtins; only the exec'd tool code is
@@ -225,10 +226,89 @@ class _SafeModule:
         return f"<sandboxed module {object.__getattribute__(self, '_name')!r}>"
 
 
+# The plugin's own local files, shipped alongside the entry point:
+# dotted name (relative to the plugin's directory) -> source text. Populated
+# from the job before any tool code runs. Modules are exec'd lazily on first
+# import and cached here, so a helper imported from two places runs once.
+_CLOSURE_SOURCE: dict[str, str] = {}
+_CLOSURE_LOADED: dict[str, object] = {}
+
+
+def _closure_module(dotted: str):
+    """Load one file from this plugin's own closure, under the same gate.
+
+    A helper is not a different authority from the plugin that imports it — it
+    is more of the same plugin — so it runs in the same child, under the same
+    restricted builtins, having passed the same validation. What it is *not*
+    allowed to be is anything outside the closure: the only names resolvable
+    here are the ones the parent shipped.
+    """
+    if dotted in _CLOSURE_LOADED:
+        return _CLOSURE_LOADED[dotted]
+    source = _CLOSURE_SOURCE.get(dotted)
+    if source is None:
+        # A directory with no __init__.py is still importable as a package in
+        # ordinary Python, and helper directories usually have none. Synthesize
+        # an empty one so ``from .helpers import answer`` works; it holds nothing
+        # but the submodules attached to it below.
+        prefix = f"{dotted}." if dotted else ""
+        if not any(k.startswith(prefix) for k in _CLOSURE_SOURCE):
+            raise ImportError(f"no such module in this plugin: {dotted}")
+        package = types.ModuleType(dotted)
+        package.__dict__["__path__"] = []       # marks it a package
+        _CLOSURE_LOADED[dotted] = package
+        return package
+
+    assert_valid(source)
+    module = types.ModuleType(dotted)
+    module.__dict__["__builtins__"] = _restricted_builtins()
+    module.__dict__["__name__"] = dotted
+    # Cached before exec so a cycle between two helpers resolves to the
+    # partially-initialised module rather than recursing forever.
+    _CLOSURE_LOADED[dotted] = module
+    try:
+        exec(compile(source, f"<plugin:{dotted}>", "exec"), module.__dict__)  # noqa: S102 — gated
+    except BaseException:
+        _CLOSURE_LOADED.pop(dotted, None)
+        raise
+    return module
+
+
+def _resolve_relative(current: str, level: int, module: str) -> str | None:
+    """Resolve a relative import against the closure. Mirrors sandbox/closure.py."""
+    parts = current.split(".") if current else []
+    if parts:
+        parts = parts[:-1]
+    for _ in range(level - 1):
+        if not parts:
+            return None
+        parts.pop()
+    if module:
+        parts.extend(module.split("."))
+    return ".".join(parts)
+
+
 def _gated_import(name, globals=None, locals=None, fromlist=(), level=0):
     """The import gate applied to tool code (installed as its ``__import__``)."""
     if level:
-        raise ImportError(f"relative import not allowed: {name}")
+        current = (globals or {}).get("__name__", "") or ""
+        if current == "sandbox_tool":
+            current = ""            # the entry file sits at the closure root
+        target = _resolve_relative(current, level, name or "")
+        if target is None:
+            raise ImportError(
+                f"relative import climbs above the plugin's own directory: "
+                f"{'.' * level}{name or ''}")
+        # ``from .helpers import thing`` may name a module or an attribute of
+        # one; prefer the submodule, exactly as Python does.
+        package = _closure_module(target)
+        for item in fromlist or ():
+            candidate = f"{target}.{item}" if target else item
+            if candidate in _CLOSURE_SOURCE and not hasattr(package, item):
+                # Attach the submodule to its package, the way the real import
+                # system does, so ``from .helpers import answer`` finds it.
+                setattr(package, item, _closure_module(candidate))
+        return package
     if not _import_allowed(name):
         raise ImportError(f"import not allowed: {name}")
     module = importlib.import_module(name)
@@ -339,6 +419,9 @@ def main() -> int:
         _limits(memory_mb, int(job.get("cpu_seconds", 30)))
         code = job.get("code") or ""
         params = job.get("params") or {}
+        # The plugin's own local files, traced by the parent. Installed before
+        # any tool code runs so a relative import at module scope resolves.
+        _CLOSURE_SOURCE.update(job.get("modules") or {})
 
         assert_valid(code)
         namespace: dict = {"__builtins__": _restricted_builtins(), "__name__": "sandbox_tool"}
