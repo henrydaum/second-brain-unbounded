@@ -121,25 +121,57 @@ def _services(context) -> list[dict]:
 
     services = getattr(context, "services", None) or {}
     autoload = set((getattr(context, "config", None) or {}).get("autoload_services") or [])
+    from plugins.BaseService import is_extension_service, is_user_managed_service
+
     return [{"name": name,
              "model_name": getattr(svc, "model_name", name),
              "loaded": bool(getattr(svc, "loaded", False)),
              "lifecycle": service_lifecycle(svc),
              "contract": getattr(svc, "contract", "legacy"),
              "autoload": name in autoload,
-             "shared": bool(getattr(svc, "shared", True))}
+             "shared": bool(getattr(svc, "shared", True)),
+             "extension": is_extension_service(svc),
+             "user_managed": is_user_managed_service(svc),
+             "settings": _settings(svc)}
             for name, svc in sorted(services.items())]
+
+
+def _settings(plugin) -> list[dict]:
+    """A plugin's declared settings, as metadata only.
+
+    Titles, keys, and type info — never current values. A setting's *value* may
+    be an API key, so reading one is ``ReadConfig``, which is principal-graded.
+    Its *declaration* is as public as the plugin's name."""
+    out = []
+    for entry in (getattr(plugin, "config_settings", None) or []):
+        if not isinstance(entry, (list, tuple)) or len(entry) != 5:
+            continue
+        info = entry[4] if isinstance(entry[4], dict) else {}
+        if info.get("hidden") is True:
+            continue
+        out.append({"title": entry[0], "key": entry[1], "prompt": entry[2],
+                    "default": entry[3], "type_info": info})
+    return out
 
 
 def _frontends(context) -> list[dict]:
     """Configured frontends and whether each is currently enabled."""
     config = getattr(context, "config", None) or {}
     enabled = list(config.get("enabled_frontends") or [])
+    profiles = config.get("frontend_profiles") or {}
     runtime = getattr(context, "runtime", None)
     manager = getattr(runtime, "frontend_manager", None)
-    known = sorted(set(enabled) | set(getattr(manager, "available", {}) or {}))
-    running = set(getattr(manager, "running", {}) or {})
-    return [{"name": name, "enabled": name in enabled, "running": name in running}
+    adapters = getattr(manager, "adapters", {}) or {}
+    # Union of discovered, enabled, and profiled, so an entry stays editable
+    # even after its plugin is removed.
+    known = sorted(set(enabled) | set(adapters)
+                   | set(getattr(manager, "available_frontends", ()) or ())
+                   | set(profiles))
+    return [{"name": name,
+             "enabled": name in enabled,
+             "running": name in adapters,
+             "profile": profiles.get(name) or {},
+             "settings": _settings(adapters.get(name))}
             for name in known]
 
 

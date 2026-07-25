@@ -370,6 +370,33 @@ class PackageOp(Request):
 
 
 @dataclass(frozen=True)
+class ReadConfig(Request):
+    """Read one config value — the domain PRIMITIVES.md had to leave empty.
+
+    The original objection stands and is not weakened: config holds API keys, and
+    a read there composes with any egress into key theft. What changed is that
+    "who is asking" is now expressible. The hazard was always specifically *an
+    agent* reading config; a human running ``/config`` to see their own settings
+    is not a threat to themselves, and the command has always displayed those
+    values in plain text.
+
+    So this is graded like the administration verbs rather than like an ordinary
+    read: allowed outright for the user acting through reviewed code, gated in
+    between, and **refused** for untrusted code in an agent turn — the corner
+    where key theft would actually happen.
+
+    It is egress tier for the same reason: what makes a config read dangerous is
+    that it composes onward, and pretending otherwise by grading it ``read``
+    would let it slip past every gate that matters.
+    """
+
+    type: ClassVar[str] = "read_config"
+    tier: ClassVar[str] = TIER_EGRESS
+    key: str = ""
+    scope: str = "global"
+
+
+@dataclass(frozen=True)
 class SessionAction(Request):
     """Act on the live conversation *session*: cancel, go back, skip a field.
 
@@ -444,8 +471,8 @@ REQUEST_TYPES: dict[str, type[Request]] = {
         ReadFile, ReadFiles, ListDir, Stat, QueryDb, ReadContext, AskUser,
         WriteFile, WriteDb, DeleteFile, Respond,
         HttpRequest, Complete, Embed, ExecSql, RunProcess, ReloadPlugin,
-        WriteConfig, ServiceControl, PackageOp, ConversationOp, SessionAction,
-        CallTool,
+        WriteConfig, ReadConfig, ServiceControl, PackageOp, ConversationOp,
+        SessionAction, CallTool,
     )
 }
 

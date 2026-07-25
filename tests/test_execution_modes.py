@@ -247,6 +247,23 @@ def _drive_command(cls, source_path, tmp_path, *, trusted: bool, **overrides):
     return command.perform({}, _command_ctx(tmp_path, trust_all=trusted, **overrides))
 
 
+def _managed_services():
+    """One managed service, so /services renders a real row."""
+    from types import SimpleNamespace
+
+    return {"embedder": SimpleNamespace(
+        loaded=True, lifecycle="managed", model_name="M", shared=True,
+        contract="legacy", config_settings=[])}
+
+
+def _frontend_runtime():
+    """A runtime whose frontend manager reports one running frontend."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(frontend_manager=SimpleNamespace(
+        available_frontends={"repl"}, adapters={"repl": object()}))
+
+
 def _cancel_runtime():
     """A runtime whose state machine reports one handled action."""
     from types import SimpleNamespace
@@ -280,6 +297,10 @@ def _fake_command_registry():
      ["**Project root**", "app.log"], {}),
     ("command_cancel", "plugins.commands.command_cancel", "CancelCommand",
      ["handled cancel"], {"runtime": _cancel_runtime}),
+    ("command_services", "plugins.commands.command_services", "ServicesCommand",
+     ["Services:", "| Service |"], {"services": _managed_services}),
+    ("command_frontends", "plugins.commands.command_frontends", "FrontendsCommand",
+     ["Frontends:", "| Frontend |"], {"runtime": _frontend_runtime}),
 ])
 def test_a_converted_kernel_command_agrees_across_modes(
         stem, module, class_name, expected, overrides, tmp_path):
@@ -318,7 +339,10 @@ def test_the_converted_commands_are_actually_on_the_contract():
     from plugins.commands.command_locations import LocationsCommand
     from plugins.commands.command_update import UpdateCommand
 
+    from plugins.commands.command_frontends import FrontendsCommand
+    from plugins.commands.command_services import ServicesCommand
+
     for cls in (CancelCommand, ClearCommand, CommandsCommand, DebugCommand,
-                LocationsCommand, UpdateCommand):
+                FrontendsCommand, LocationsCommand, ServicesCommand, UpdateCommand):
         assert cls.contract == "effects", f"{cls.__name__} is no longer on the contract"
         assert cls.declared_requests, f"{cls.__name__} declares no requests"

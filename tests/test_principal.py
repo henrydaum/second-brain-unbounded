@@ -187,12 +187,36 @@ def test_admin_verbs_are_egress_tier():
         assert req.tier == "egress", f"{req.type} should be egress tier"
 
 
-def test_there_is_no_config_read_verb():
-    """Deliberately absent: config holds API keys, and a read there composes
-    with any egress into key theft (PRIMITIVES.md, Kernel state)."""
-    from effects.vocabulary import REQUEST_TYPES
+def test_reading_config_is_graded_by_principal_not_left_ungated():
+    """Config reads exist, but only because "who is asking" became expressible.
 
-    assert "read_config" not in REQUEST_TYPES
+    PRIMITIVES.md originally left the kernel-state domain empty: config holds API
+    keys, so a read there composes with any egress into key theft. That reasoning
+    was never about *all* readers -- a human running /config to see their own
+    settings is not a threat to themselves, and that command has always shown
+    those values in plain text. The hazard was specifically an agent.
+
+    So the verb is admitted on the principal axis, which means two things must
+    hold: it is graded like an administration verb, and it is egress tier. If it
+    were ever regraded ``read`` it would slip past every gate that matters."""
+    from effects.vocabulary import REQUEST_TYPES, ReadConfig
+
+    assert "read_config" in REQUEST_TYPES
+    assert ReadConfig.tier == "egress", "a config read composes onward; read tier would be a lie"
+    assert "read_config" in ADMIN_REQUESTS
+    assert admin_disposition(PRINCIPAL_AGENT, False) == REFUSE
+
+
+def test_an_agent_authored_plugin_cannot_read_config():
+    """The corner where key theft would actually happen."""
+    from effects.vocabulary import ReadConfig
+
+    ctx = _ctx(principal=PRINCIPAL_AGENT, plugin_trusted=False)
+
+    result = _interp(ctx, declared=["read_config"]).fulfill(ReadConfig(key="llm_api_key"))
+
+    assert not result.ok and result.denied
+    assert ctx.seen == [], "the read must never reach the config store"
 
 
 # ── the bridge ───────────────────────────────────────────────────────────

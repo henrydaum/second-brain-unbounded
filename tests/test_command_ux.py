@@ -10,7 +10,7 @@ from events.event_bus import bus
 from events.event_channels import SESSION_CONVERSATION_CHANGED
 from pipeline.database import Database
 from plugins.BaseFrontend import BaseFrontend, FrontendCapabilities
-from plugins.commands.command_services import ServicesCommand, _actions_for
+from plugins.commands.command_services import ServicesCommand
 from plugins.commands.helpers.setting_links import quicklink_run, quicklink_value_steps, quicklinks
 from runtime.conversation_runtime import ConversationRuntime
 
@@ -76,51 +76,91 @@ class _ManagedService:
         self.loaded = False
 
 
-def test_services_actions_are_toggles_with_quicklinks():
+# /services runs on the effects contract, so these drive ``perform`` -- the
+# kernel entry point -- rather than reaching into module helpers. The command no
+# longer holds the service object: it names an action and the kernel's
+# administration surface carries it out.
+
+def _services_context(services, config, saved=None):
+    """A context wired the way the command registry wires one."""
+    from plugins.helpers.administration import build_administer
+
+    context = SimpleNamespace(
+        db=None, services=services, runtime=None, session_key="s1", user_id=1,
+        root_dir=".", orchestrator=None, tool_registry=None, command_registry=None,
+        approve_command=lambda *_a: True, approval_denial_reason="",
+        request_user_input=None, principal="user",
+        config={"sandbox_trust_all": True, **config})
+    context.administer = build_administer(None, context.config, services, None, "s1")
+    return context
+
+
+def _run_services(context, **params):
+    """Drive /services through its kernel entry point."""
+    command = ServicesCommand()
+    command._source_path = "plugins/commands/command_services.py"
+    return command.perform(params, context)
+
+
+def test_services_form_offers_toggles_labelled_by_current_state():
     svc = _ManagedService()
-    context = SimpleNamespace(config={"autoload_services": []})
+    context = _services_context({"embedder": svc}, {"autoload_services": []})
 
-    actions, labels = _actions_for(context, "embedder", svc)
+    command = ServicesCommand()
+    command._source_path = "plugins/commands/command_services.py"
+    steps = command.form_steps({"service_name": "embedder"}, context)
 
-    assert actions[:2] == ["toggle_loaded", "toggle_autoload"]
-    assert labels[:2] == ["Load it", "Autoload on startup"]
-    assert actions[2] == "edit_setting:embed_model_name"
-    assert labels[2] == "Edit Embed Model"
+    action = next(s for s in steps if s.name == "action")
+    assert action.enum[:2] == ["toggle_loaded", "toggle_autoload"]
+    assert action.enum_labels[:2] == ["Load it", "Autoload on startup"]
 
     svc.loaded = True
     context.config["autoload_services"] = ["embedder"]
-    _, labels = _actions_for(context, "embedder", svc)
-    assert labels[:2] == ["Unload it", "Don't autoload on startup"]
+    steps = command.form_steps({"service_name": "embedder"}, context)
+    action = next(s for s in steps if s.name == "action")
+    assert action.enum_labels[:2] == ["Unload it", "Don't autoload on startup"]
 
 
 def test_toggle_loaded_flips_service_state():
     svc = _ManagedService()
-    context = SimpleNamespace(services={"embedder": svc}, config={"autoload_services": []},
-                              orchestrator=None)
+    context = _services_context({"embedder": svc}, {"autoload_services": []})
 
-    out = ServicesCommand().run({"service_name": "embedder", "action": "toggle_loaded"}, context)
+    out = _run_services(context, service_name="embedder", action="toggle_loaded")
     assert out == "Loaded service: embedder" and svc.loaded
 
-    out = ServicesCommand().run({"service_name": "embedder", "action": "toggle_loaded"}, context)
+    out = _run_services(context, service_name="embedder", action="toggle_loaded")
     assert out == "Unloaded service: embedder" and not svc.loaded
 
 
 def test_toggle_autoload_updates_config(monkeypatch):
-    import plugins.commands.command_services as mod
     saved = {}
     monkeypatch.setattr("config.config_manager.save", lambda cfg: saved.update(cfg))
-    svc = _ManagedService()
-    context = SimpleNamespace(services={"embedder": svc}, config={"autoload_services": ["llm"]},
-                              orchestrator=None, runtime=None)
+    monkeypatch.setattr("config.config_manager.load", lambda: {"autoload_services": ["llm"]})
+    context = _services_context({"embedder": _ManagedService()},
+                                {"autoload_services": ["llm"]})
 
-    out = mod.ServicesCommand().run({"service_name": "embedder", "action": "toggle_autoload"}, context)
-
+    out = _run_services(context, service_name="embedder", action="toggle_autoload")
     assert "now" in out
     assert saved["autoload_services"] == ["embedder", "llm"]
 
-    out = mod.ServicesCommand().run({"service_name": "embedder", "action": "toggle_autoload"}, context)
+    context.config["autoload_services"] = ["embedder", "llm"]
+    out = _run_services(context, service_name="embedder", action="toggle_autoload")
     assert "no longer" in out
     assert saved["autoload_services"] == ["llm"]
+
+
+def test_an_agent_cannot_toggle_a_service():
+    """The same command body, reached with the agent principal, is gated rather
+    than allowed outright -- the whole point of the principal axis."""
+    svc = _ManagedService()
+    context = _services_context({"embedder": svc}, {"autoload_services": []})
+    context.principal = "agent"
+    context.approve_command = lambda *_a: False   # the human says no
+
+    out = _run_services(context, service_name="embedder", action="toggle_loaded")
+
+    assert not svc.loaded, "a denied approval must not load the service"
+    assert "Could not" in out
 
 
 # ── Quicklinks ───────────────────────────────────────────────────────

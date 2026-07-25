@@ -39,11 +39,18 @@ def test_extension_services_autoload_without_config_entry():
 def test_services_command_does_not_offer_load_unload_for_extensions():
     extension = ExtensionService()
     extension.load()
-    context = SimpleNamespace(services={"extension": extension})
+    context = SimpleNamespace(
+        services={"extension": extension}, config={"sandbox_trust_all": True},
+        db=None, runtime=None, session_key="s1", user_id=1, root_dir=".",
+        orchestrator=None, tool_registry=None, command_registry=None,
+        approve_command=None, approval_denial_reason="", request_user_input=None,
+        administer=None, principal="user")
 
-    steps = ServicesCommand().form({"service_name": "extension"}, context)
-    result = ServicesCommand().run({"service_name": "extension"}, context)
-    blocked = ServicesCommand().run({"service_name": "extension", "action": "unload"}, context)
+    command = ServicesCommand()
+    command._source_path = "plugins/commands/command_services.py"
+    steps = command.form_steps({"service_name": "extension"}, context)
+    result = command.perform({"service_name": "extension"}, context)
+    blocked = command.perform({"service_name": "extension", "action": "unload"}, context)
 
     assert [step.name for step in steps] == ["service_name"]
     assert "| Status | Extension |" in result

@@ -68,6 +68,19 @@ def build_administer(db, config: dict, services: dict, runtime, session_key: str
                         runtime.refresh_session_specs()
             return {"key": request.key, "scope": request.scope}
 
+        if rtype == "read_config":
+            # No masking here on purpose. The protection is the principal
+            # policy, not obfuscation: a human running /config to see their own
+            # settings is not a threat to themselves, and that command has always
+            # shown these values in plain text. The corner that matters --
+            # untrusted code in an agent turn -- never reaches this function.
+            if request.scope == "user":
+                if db is None:
+                    raise RuntimeError("user-scoped config needs a database")
+                uid = runtime.session_user_id(session_key) if (runtime and session_key) else DEFAULT_USER_ID
+                return db.get_user_config(uid).get(request.key)
+            return (config or {}).get(request.key)
+
         if rtype == "service_control":
             service = (services or {}).get(request.name)
             if service is None:

@@ -55,6 +55,7 @@ from effects.vocabulary import (
     ListDir,
     PackageOp,
     QueryDb,
+    ReadConfig,
     ReadContext,
     ReadFile,
     ReadFiles,
@@ -683,7 +684,8 @@ class Interpreter:
             return EffectResult(value=act(request.action, dict(request.payload or {})),
                                 tier=TIER_EGRESS)
 
-        if isinstance(request, (WriteConfig, ServiceControl, PackageOp, ConversationOp)):
+        if isinstance(request, (WriteConfig, ReadConfig, ServiceControl, PackageOp,
+                                ConversationOp)):
             administer = self.ctx.administer
             if administer is None:
                 return EffectResult(ok=False, tier=TIER_EGRESS,

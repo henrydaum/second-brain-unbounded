@@ -159,9 +159,17 @@ def test_frontends_form_uses_runtime_cache_without_discovery(monkeypatch):
     monkeypatch.setattr("plugins.plugin_discovery.discover_frontends", boom)
     manager = SimpleNamespace(available_frontends={"repl", "telegram"}, adapters={"repl": object()})
     runtime = SimpleNamespace(frontend_manager=manager)
-    context = SimpleNamespace(config={"enabled_frontends": ["repl"], "frontend_profiles": {}}, runtime=runtime)
+    context = SimpleNamespace(
+        config={"enabled_frontends": ["repl"], "frontend_profiles": {},
+                "sandbox_trust_all": True},
+        runtime=runtime, db=None, services={}, session_key="s1", user_id=1,
+        root_dir=".", orchestrator=None, tool_registry=None, command_registry=None,
+        approve_command=None, approval_denial_reason="", request_user_input=None,
+        administer=None, principal="user")
 
-    steps = FrontendsCommand().form({}, context)
+    command = FrontendsCommand()
+    command._source_path = "plugins/commands/command_frontends.py"
+    steps = command.form_steps({}, context)
 
     assert steps[0].enum == ["repl", "telegram"]
 
