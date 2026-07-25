@@ -285,6 +285,100 @@ class Attack(BaseSandboxTool):
     assert outcome.error_type == "ValidationError", f"{label} was not refused"
 
 
+# ── reaching a module through another module ─────────────────────────────
+#
+# An import allowlist alone is not enough: importing a module also hands over
+# every object that module holds. Before the ``_SafeModule`` view, these were
+# live escapes — ``from plugins.BaseTool import Path`` yielded the real
+# ``pathlib.Path``, giving arbitrary reads and writes with the roots bypassed
+# entirely, from a tool that declared nothing at all.
+
+@pytest.mark.parametrize("attack,label", [
+    ("from plugins.BaseTool import Path as P\nX = P", "pathlib.Path via a kernel module"),
+    ("from plugins.BaseTool import logging as L\nX = L.os", "logging.os via a kernel module"),
+    ("from plugins.BaseSandboxTool import BaseTool as B\nX = B", "an unexported kernel name"),
+    ("import uuid\nX = uuid.os", "uuid.os"),
+    ("import json\nX = json.codecs", "json.codecs"),
+    ("import statistics\nX = statistics.sys", "statistics.sys"),
+    ("import re\nX = re.functools", "re.functools"),
+    ("import io\nX = io.open", "io (dropped from the allowlist)"),
+])
+def test_module_chaining_cannot_reach_the_interpreter(tmp_path, attack, label):
+    """Neither submodules nor a kernel module's incidental imports are reachable."""
+    source = f'''
+from plugins.BaseSandboxTool import BaseSandboxTool
+from effects.vocabulary import Respond
+{attack}
+
+
+class Chain(BaseSandboxTool):
+    name = "chain"
+    description = "{label}"
+
+    def run(self, params):
+        return Respond(summary="REACHED " + str(X))
+        yield
+'''
+    outcome = _run(source, tmp_path)
+
+    assert not outcome.success, f"{label} is reachable"
+    assert "REACHED" not in (outcome.summary or "")
+
+
+def test_the_filesystem_is_unreachable_without_a_request(tmp_path):
+    """The end-to-end statement of the above: a tool declaring nothing cannot
+    read a file outside its roots, no matter which module it goes through."""
+    secret = tmp_path.parent / "unreachable_secret.txt"
+    secret.write_text("CONFIDENTIAL", encoding="utf-8")
+    source = f'''
+from plugins.BaseSandboxTool import BaseSandboxTool
+from effects.vocabulary import Respond
+from plugins.BaseTool import Path as P
+
+
+class Exfil(BaseSandboxTool):
+    name = "exfil"
+    description = "read without asking"
+    declared_requests = []
+
+    def run(self, params):
+        return Respond(summary=P(r"{secret}").read_text())
+        yield
+'''
+    outcome = _run(source, tmp_path)
+
+    assert not outcome.success
+    assert "CONFIDENTIAL" not in str(outcome.summary)
+    assert "CONFIDENTIAL" not in str(outcome.data)
+
+
+def test_legitimate_module_use_still_works(tmp_path):
+    """The view must not break ordinary tools: normal functions and classes on
+    allowed modules stay reachable, and the contract's own exports resolve."""
+    source = '''
+import json
+import re
+import sandbox_kit as kit
+from plugins.BaseSandboxTool import BaseSandboxTool
+from effects.vocabulary import Respond
+
+
+class Normal(BaseSandboxTool):
+    name = "normal"
+    description = "uses stdlib the ordinary way"
+
+    def run(self, params):
+        payload = json.dumps({"n": len(re.findall(r"\\d+", "a1 b22 c333"))})
+        return Respond(summary=payload, data=kit.clamp(99, 1, 10, 5))
+        yield
+'''
+    outcome = _run(source, tmp_path)
+
+    assert outcome.success, outcome.error
+    assert outcome.summary == '{"n": 3}'
+    assert outcome.data == 10
+
+
 def test_escaping_via_introspection_is_refused(tmp_path):
     """The classic sandbox escape — walk ``__class__.__subclasses__()`` to reach
     an unrestricted builtin — is refused by the banned-attribute list."""

@@ -25,7 +25,8 @@ import ast
 # urllib.parse is admitted (string munging, no sockets) while bare ``urllib`` is
 # not — that would reach urllib.request.
 _LITERAL_ALLOWED = {
-    "plugins.BaseTool",          # the contract (a tool sets contract = "effects")
+    "plugins.BaseTool",          # the contract (a plugin sets contract = "effects")
+    "plugins.BaseCommand",
     "plugins.BaseSandboxTool",   # deprecated shim; kept until the store is converted
     "effects.vocabulary",
     "sandbox_kit",
@@ -38,7 +39,7 @@ _TOP_ALLOWED = {
     "string", "textwrap", "re", "json", "datetime", "time", "calendar",
     "base64", "hashlib", "hmac", "decimal", "fractions", "uuid", "html",
     "unicodedata", "difflib", "enum", "dataclasses", "typing", "operator",
-    "bisect", "heapq", "csv", "io",
+    "bisect", "heapq", "csv",
 }
 
 _BANNED_NAMES = {

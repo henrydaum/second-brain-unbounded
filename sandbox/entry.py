@@ -142,6 +142,89 @@ def _win_job_memory_limit(memory_bytes: int) -> None:
         return
 
 
+# What each kernel module is allowed to hand the tool. An import allowlist alone
+# is not enough: importing a module also hands over every object it holds, so
+# ``from plugins.BaseTool import Path`` used to yield the real ``pathlib.Path``
+# — arbitrary filesystem access, with the roots bypassed entirely. Kernel modules
+# therefore export exactly their contract and nothing else.
+_MODULE_EXPORTS: dict[str, set] = {
+    "plugins.BaseTool": {"BaseTool", "ToolResult"},
+    "plugins.BaseCommand": {"BaseCommand"},
+    "plugins.BaseSandboxTool": {"BaseSandboxTool"},
+}
+
+# Names never reachable through any module, even when the module is allowed and
+# the attribute is not itself a module (``io.open`` *is* ``builtins.open``).
+_DENIED_MEMBERS = {
+    "open", "FileIO", "system", "popen", "fdopen", "remove", "unlink",
+    "rmdir", "removedirs", "execv", "spawnv", "fork", "kill",
+}
+
+
+class _SafeModule:
+    """A view of a module exposing only what tool code may legitimately touch.
+
+    Two rules, both aimed at the same hole — *reaching a module through another
+    module*:
+
+    1. Attributes that are themselves modules are refused. This closes the
+       chaining escapes (``uuid.os``, ``json.codecs``, ``statistics.sys``), which
+       otherwise hand out the whole interpreter from an innocuous import.
+    2. Kernel modules additionally expose only an explicit export set, because
+       their incidental imports (``Path``, ``logging``) are just as dangerous as
+       a submodule and are not modules, so rule 1 would miss them.
+
+    This is defence in depth rather than the boundary: even a leak here yields no
+    db, socket, or interpreter handle, and every effect still has to pass the
+    kernel-side interpreter. But the child *is* an ordinary process with real
+    filesystem access, so keeping ``os`` and ``open`` out of reach is what makes
+    the root confinement mean anything.
+    """
+
+    __slots__ = ("_mod", "_name", "_exports")
+
+    def __init__(self, module, name: str):
+        """Wrap ``module`` under its import ``name``."""
+        object.__setattr__(self, "_mod", module)
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_exports", _MODULE_EXPORTS.get(name))
+
+    def __getattr__(self, attr: str):
+        """Resolve an attribute under the two rules above."""
+        exports = object.__getattribute__(self, "_exports")
+        name = object.__getattribute__(self, "_name")
+        if attr.startswith("__") and attr.endswith("__"):
+            raise AttributeError(f"{name}.{attr} is not accessible from the sandbox")
+        if exports is not None and attr not in exports:
+            raise AttributeError(f"{name} does not export {attr!r} to the sandbox")
+        if attr in _DENIED_MEMBERS:
+            raise AttributeError(f"{name}.{attr} is not accessible from the sandbox")
+        value = getattr(object.__getattribute__(self, "_mod"), attr)
+        if isinstance(value, type(importlib)):
+            raise AttributeError(
+                f"{name}.{attr} is a module; reaching a module through another "
+                f"module is not allowed from the sandbox")
+        return value
+
+    def __setattr__(self, attr, value):
+        """Tool code may not mutate kernel modules."""
+        raise AttributeError(f"cannot set attributes on sandboxed module {self._name}")
+
+    def __dir__(self):
+        """Only what this view actually exposes."""
+        exports = object.__getattribute__(self, "_exports")
+        if exports is not None:
+            return sorted(exports)
+        mod = object.__getattribute__(self, "_mod")
+        return [n for n in dir(mod)
+                if not isinstance(getattr(mod, n, None), type(importlib))
+                and n not in _DENIED_MEMBERS]
+
+    def __repr__(self):
+        """Identify the view, not the underlying module."""
+        return f"<sandboxed module {object.__getattribute__(self, '_name')!r}>"
+
+
 def _gated_import(name, globals=None, locals=None, fromlist=(), level=0):
     """The import gate applied to tool code (installed as its ``__import__``)."""
     if level:
@@ -156,7 +239,7 @@ def _gated_import(name, globals=None, locals=None, fromlist=(), level=0):
                 importlib.import_module(full)
             except ImportError:
                 pass  # a name, not a submodule
-    return module
+    return _SafeModule(module, name)
 
 
 def _restricted_builtins() -> dict:
@@ -175,15 +258,15 @@ def _find_tool_class(namespace: dict):
     covers both the current form (subclass ``BaseTool`` directly) and the
     deprecated ``BaseSandboxTool`` shim, since the shim is itself such a subclass.
     """
-    from plugins.BaseTool import BaseTool
+    from plugins.EffectsContract import EffectsContract
 
+    bases = {"BaseTool", "BaseCommand", "BaseTask", "BaseSandboxTool"}
     for value in namespace.values():
-        if (isinstance(value, type) and issubclass(value, BaseTool)
-                and value is not BaseTool
+        if (isinstance(value, type) and issubclass(value, EffectsContract)
                 and getattr(value, "contract", "") == "effects"
-                and value.__name__ != "BaseSandboxTool"):
+                and value.__name__ not in bases):
             return value
-    raise ValueError("no effects-contract tool class found in tool file")
+    raise ValueError("no effects-contract plugin class found in file")
 
 
 def _diagnostic(exc: BaseException) -> dict:
@@ -230,7 +313,7 @@ def main() -> int:
         tool_cls = _find_tool_class(namespace)
         instance = tool_cls()
 
-        final = drive(instance, params, _pipe_fulfil(out, inp))
+        final = drive(instance, params, _pipe_fulfil(out, inp), job.get("method", "run"))
         write_message(out, {"final": final})
         return 0
     except MemoryError:

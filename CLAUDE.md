@@ -80,9 +80,10 @@ Core code (`pipeline/`, `runtime/`, `state_machine/`, `agent/`, `events/`,
 `effects/` (typed-request vocabulary + interpreter) and `sandbox/` (the
 pure-tool subprocess rim) are core: pure Python with no plugin-implementation
 imports. The one plugin edge they carry is `sandbox/entry.py` →
-`plugins.BaseSandboxTool`, which is plugin *substrate* (a base class, like
-`BaseTool`), not an implementation — the child process needs the base to locate
-the tool class it execs.
+`plugins.EffectsContract` (and the `plugins.Base*` classes it admits through the
+import gate), which is plugin *substrate* — base classes and their shared mixin,
+not implementations. The child process needs them to locate the plugin class it
+execs, whatever family that class belongs to.
 
 This rule is executable: `tests/test_kernel_boundary.py` AST-walks every core
 module and pins the complete set of `plugins.*` import edges (the plugin

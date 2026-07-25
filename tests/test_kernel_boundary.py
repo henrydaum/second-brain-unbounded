@@ -37,6 +37,10 @@ SUBSTRATE = frozenset({
     "plugins.BaseSandboxTool",
     "plugins.BaseTask",
     "plugins.BaseTool",
+    # The effects contract mixin — substrate in the same sense as the base
+    # classes above (it *is* their shared half). The sandbox child imports it to
+    # locate the plugin class it execs, whatever family that class belongs to.
+    "plugins.EffectsContract",
     "plugins.plugin_discovery",
     "plugins.helpers.plugin_paths",
     "plugins.helpers.memory_paths",
