@@ -110,6 +110,16 @@ class EffectsContract:
             return True
         return is_trusted(getattr(self, "_source_path", ""))
 
+    # Periodic work, without a thread of the plugin's own. A service declaring
+    # tick_interval_s > 0 has its ``tick`` body called by the kernel's single
+    # clock thread (runtime/service_ticker.py). ``tick`` returns the events it
+    # wants fired -- it never touches the bus -- and the kernel fires only
+    # channels listed in ``declared_channels``. That is the authority check:
+    # declaring a channel is to the bus what declaring a request type is to the
+    # interpreter.
+    tick_interval_s: float = 0.0
+    declared_channels: list[str] = []
+
     # Whether this plugin's sandbox should stay open between calls. False for
     # tools/commands/tasks — each call is complete in itself, and a fresh child
     # is the stronger isolation. Services override it to True: their state,

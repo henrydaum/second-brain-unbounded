@@ -75,7 +75,7 @@ class BaseService(EffectsContract, ABC):
         """Internal helper to handle init subclass."""
         super().__init_subclass__(**kwargs)
         for attr in ("config_settings", "dependencies_files", "dependencies_pip",
-                     "declared_requests"):
+                     "declared_requests", "declared_channels"):
             value = getattr(cls, attr)
             if isinstance(value, (dict, list)):
                 setattr(cls, attr, value.copy())
