@@ -17,116 +17,162 @@ from state_machine.conversation import ConversationState, Participant
 
 
 # ── /llm ─────────────────────────────────────────────────────────────
+#
+# /llm runs on the effects contract, so these drive it through ``perform`` /
+# ``form_steps``. It no longer calls the live router: writing llm_profiles is
+# what resyncs it, kernel-side, the same way writing the sync directories
+# rescans the watcher. So the fixtures patch the config store rather than
+# stubbing an ``add_llm``/``remove_llm`` pair.
+
+def _llm_context(config, monkeypatch, saved):
+    """A context wired the way the command registry wires one."""
+    from plugins.helpers.administration import build_administer
+
+    monkeypatch.setattr("config.config_manager.save", lambda cfg: None)
+    monkeypatch.setattr("config.config_manager.load", lambda: dict(config))
+    monkeypatch.setattr("config.config_manager.load_plugin_config", lambda: {"kept": True})
+    monkeypatch.setattr("config.config_manager.save_plugin_config",
+                        lambda values: saved.update(values))
+    # service_llm declares both keys, so in production they persist to
+    # plugin_config.json as well as config.json. Discovery finds no plugins in a
+    # bare test process, so say so explicitly rather than let the assertions
+    # quietly check the wrong file.
+    monkeypatch.setattr(
+        "plugins.plugin_discovery.get_plugin_settings",
+        lambda: [("LLM Profiles", "llm_profiles", "", {}, {"type": "json_dict"}),
+                 ("Default LLM Profile", "default_llm_profile", "", "", {"type": "text"})])
+
+    runtime = SimpleNamespace(config=dict(config), refresh_session_specs=lambda: None)
+    context = SimpleNamespace(
+        db=None, services={}, runtime=runtime, session_key="s1", user_id=1,
+        root_dir=".", orchestrator=None, tool_registry=None, command_registry=None,
+        approve_command=lambda *_a: True, approval_denial_reason="",
+        request_user_input=None, principal="user",
+        config={"sandbox_trust_all": True, **config})
+    context.administer = build_administer(None, context.config, {}, runtime, "s1",
+                                          context=context)
+    return context
+
+
+def _llm(context, **params):
+    """Drive /llm through its kernel entry point."""
+    command = LlmCommand()
+    command._source_path = "plugins/commands/command_llm.py"
+    return command.perform(params, context)
+
+
+def _llm_form(context, **params):
+    """The form steps /llm offers."""
+    command = LlmCommand()
+    command._source_path = "plugins/commands/command_llm.py"
+    return command.form_steps(params, context)
+
 
 def test_llm_command_can_set_default(monkeypatch):
-    saved = []
-    monkeypatch.setattr("plugins.commands.command_llm._save", lambda context: saved.append(dict(context.config)))
-    context = SimpleNamespace(config={"llm_profiles": {"a": {}, "b": {}}, "default_llm_profile": "a"}, services={})
+    saved = {}
+    context = _llm_context({"llm_profiles": {"a": {}, "b": {}},
+                            "default_llm_profile": "a"}, monkeypatch, saved)
 
-    steps = LlmCommand().form({"model_name": "b"}, context)
-    result = LlmCommand().run({"model_name": "b", "action": "set_default"}, context)
+    steps = _llm_form(context, model_name="b")
+    result = _llm(context, model_name="b", action="set_default")
 
-    assert steps[0].prompt == "Select an LLM profile, or add a new one.\nDefault: a"
+    assert steps[0].prompt.splitlines() == ["Select an LLM profile, or add a new one.",
+                                            "Default: a"]
     assert steps[1].enum == ["edit", "set_default", "remove"]
     assert steps[1].enum_labels == ["Edit", "Set default", "Remove"]
     assert result == "Default LLM profile set to: b"
-    assert context.config["default_llm_profile"] == "b"
-    assert saved[-1]["default_llm_profile"] == "b"
+    assert saved["default_llm_profile"] == "b"
 
 
 def test_llm_command_set_default_writes_through_to_runtime_config(monkeypatch):
-    saved = []
-    monkeypatch.setattr("plugins.commands.command_llm.config_manager.load_plugin_config", lambda: {"kept": True})
-    monkeypatch.setattr("plugins.commands.command_llm.config_manager.save_plugin_config", lambda values: saved.append(dict(values)))
-    runtime = SimpleNamespace(config={"llm_profiles": {"a": {}, "b": {}}, "default_llm_profile": ""})
-    context = SimpleNamespace(config={"llm_profiles": {"a": {}, "b": {}}, "default_llm_profile": ""}, services={}, runtime=runtime)
+    """The write-through the plugin used to perform by hand is now the kernel's."""
+    saved = {}
+    context = _llm_context({"llm_profiles": {"a": {}, "b": {}},
+                            "default_llm_profile": ""}, monkeypatch, saved)
 
-    result = LlmCommand().run({"model_name": "b", "action": "set_default"}, context)
+    result = _llm(context, model_name="b", action="set_default")
 
     assert result == "Default LLM profile set to: b"
-    assert saved[-1]["kept"] is True
-    assert saved[-1]["default_llm_profile"] == "b"
-    assert runtime.config["default_llm_profile"] == "b"
+    assert saved["kept"] is True          # unrelated plugin config preserved
+    assert saved["default_llm_profile"] == "b"
+    assert context.runtime.config["default_llm_profile"] == "b"
 
 
 def test_llm_command_add_stores_declared_capabilities(monkeypatch):
-    saved = []
-    monkeypatch.setattr("plugins.commands.command_llm._save", lambda context: saved.append(dict(context.config)))
-    context = SimpleNamespace(config={"llm_profiles": {}, "default_llm_profile": ""}, services={})
+    saved = {}
+    context = _llm_context({"llm_profiles": {}, "default_llm_profile": ""},
+                           monkeypatch, saved)
 
-    steps = LlmCommand().form({"model_name": "add"}, context)
-    result = LlmCommand().run({
-        "model_name": "add",
-        "new_model_name": "openai/gpt-4o",
-        "llm_service_class": "LiteLLMService",
-        "llm_endpoint": "",
-        "llm_api_key": "OPENAI_API_KEY",
-        "llm_context_size": 0,
-        "llm_capability_image": True,
-        "llm_capability_audio": False,
-    }, context)
+    steps = _llm_form(context, model_name="add")
+    result = _llm(context, model_name="add", new_model_name="openai/gpt-4o",
+                  llm_service_class="LiteLLMService", llm_endpoint="",
+                  llm_api_key="OPENAI_API_KEY", llm_context_size=0,
+                  llm_capability_image=True, llm_capability_audio=False)
 
-    profile = context.config["llm_profiles"]["openai/gpt-4o"]
-    assert [s.name for s in steps][-3:] == ["llm_capability_image", "llm_capability_audio", "llm_capability_video"]
+    profile = saved["llm_profiles"]["openai/gpt-4o"]
+    assert [s.name for s in steps][-3:] == ["llm_capability_image",
+                                            "llm_capability_audio",
+                                            "llm_capability_video"]
     assert result == "Added LLM profile: openai/gpt-4o"
-    assert context.config["default_llm_profile"] == "openai/gpt-4o"
+    assert saved["default_llm_profile"] == "openai/gpt-4o"   # first profile wins
     assert profile["llm_capabilities"] == {"image": True, "audio": False}
     assert not any(k.startswith("llm_capability_") for k in profile)
-    assert saved[-1]["llm_profiles"]["openai/gpt-4o"] == profile
-    assert saved[-1]["default_llm_profile"] == "openai/gpt-4o"
+
 
 def test_llm_command_can_rename_profile(monkeypatch):
-    saved, removed, added = [], [], []
-    monkeypatch.setattr("plugins.commands.command_llm._save", lambda context: saved.append(dict(context.config)))
-    router = SimpleNamespace(remove_llm=lambda name: removed.append(name), add_llm=lambda name, profile: added.append((name, profile)))
-    context = SimpleNamespace(config={"llm_profiles": {"bad": {"llm_endpoint": "https://api.atlascloud.ai/v1"}}, "default_llm_profile": "bad"}, services={"llm": router})
+    saved = {}
+    context = _llm_context(
+        {"llm_profiles": {"bad": {"llm_endpoint": "https://api.atlascloud.ai/v1"}},
+         "default_llm_profile": "bad"}, monkeypatch, saved)
 
-    steps = LlmCommand().form({"model_name": "bad", "action": "edit"}, context)
-    result = LlmCommand().run({"model_name": "bad", "action": "edit", "field": "llm_model_name", "value": "deepseek-ai/deepseek-v4-pro"}, context)
+    steps = _llm_form(context, model_name="bad", action="edit")
+    result = _llm(context, model_name="bad", action="edit",
+                  field="llm_model_name", value="deepseek-ai/deepseek-v4-pro")
 
     assert "llm_model_name" in next(s.enum for s in steps if s.name == "field")
     assert result == "Updated LLM profile: deepseek-ai/deepseek-v4-pro"
-    assert "bad" not in context.config["llm_profiles"]
-    assert context.config["default_llm_profile"] == "deepseek-ai/deepseek-v4-pro"
-    assert removed == ["bad"]
-    assert added[-1][0] == "deepseek-ai/deepseek-v4-pro"
-    assert saved[-1]["default_llm_profile"] == "deepseek-ai/deepseek-v4-pro"
+    assert "bad" not in saved["llm_profiles"]
+    assert "deepseek-ai/deepseek-v4-pro" in saved["llm_profiles"]
+    # renaming the default carries the default with it
+    assert saved["default_llm_profile"] == "deepseek-ai/deepseek-v4-pro"
 
 
 def test_llm_command_remove_default_selects_next_profile(monkeypatch):
-    saved = []
-    monkeypatch.setattr("plugins.commands.command_llm._save", lambda context: saved.append(dict(context.config)))
-    context = SimpleNamespace(config={"llm_profiles": {"a": {}, "b": {}, "c": {}}, "default_llm_profile": "b"}, services={})
+    saved = {}
+    context = _llm_context({"llm_profiles": {"a": {}, "b": {}, "c": {}},
+                            "default_llm_profile": "b"}, monkeypatch, saved)
 
-    result = LlmCommand().run({"model_name": "b", "action": "remove"}, context)
+    result = _llm(context, model_name="b", action="remove")
 
     assert result == "Removed LLM profile: b"
-    assert context.config["default_llm_profile"] == "c"
-    assert saved[-1]["default_llm_profile"] == "c"
+    assert saved["default_llm_profile"] == "c"
 
 
 def test_llm_command_add_does_not_replace_existing_default(monkeypatch):
-    saved = []
-    monkeypatch.setattr("plugins.commands.command_llm._save", lambda context: saved.append(dict(context.config)))
-    context = SimpleNamespace(config={"llm_profiles": {"a": {}}, "default_llm_profile": "a"}, services={})
+    saved = {}
+    context = _llm_context({"llm_profiles": {"a": {}}, "default_llm_profile": "a"},
+                           monkeypatch, saved)
 
-    result = LlmCommand().run({"model_name": "add", "new_model_name": "b"}, context)
+    result = _llm(context, model_name="add", new_model_name="b")
 
     assert result == "Added LLM profile: b"
+    assert "b" in saved["llm_profiles"]
+    # The default is left strictly alone -- not rewritten to its current value.
+    # The old shape resaved every key on every edit, so "unchanged" and "not
+    # written" were indistinguishable; now only what actually changed is written.
+    assert "default_llm_profile" not in saved
     assert context.config["default_llm_profile"] == "a"
-    assert saved[-1]["default_llm_profile"] == "a"
 
 
 def test_llm_command_remove_last_default_blanks_default(monkeypatch):
-    saved = []
-    monkeypatch.setattr("plugins.commands.command_llm._save", lambda context: saved.append(dict(context.config)))
-    context = SimpleNamespace(config={"llm_profiles": {"a": {}}, "default_llm_profile": "a"}, services={})
+    saved = {}
+    context = _llm_context({"llm_profiles": {"a": {}}, "default_llm_profile": "a"},
+                           monkeypatch, saved)
 
-    result = LlmCommand().run({"model_name": "a", "action": "remove"}, context)
+    result = _llm(context, model_name="a", action="remove")
 
     assert result == "Removed LLM profile: a"
-    assert context.config["default_llm_profile"] == ""
-    assert saved[-1]["default_llm_profile"] == ""
+    assert saved["default_llm_profile"] == ""
 
 
 # ── /agent ───────────────────────────────────────────────────────────

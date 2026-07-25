@@ -21,7 +21,11 @@ This module is deliberately mechanical.
 
 from __future__ import annotations
 
+import logging
+
 from pipeline.database import DEFAULT_USER_ID
+
+logger = logging.getLogger("Administration")
 
 
 # Global settings the filesystem watcher reads. Changing any of these triggers a
@@ -29,6 +33,19 @@ from pipeline.database import DEFAULT_USER_ID
 _WATCHER_KEYS = frozenset({
     "sync_directories", "ignored_extensions", "ignored_folders", "skip_hidden_folders",
 })
+
+
+# Config keys the live LLM router derives its per-profile services from.
+_LLM_KEYS = frozenset({"llm_profiles", "default_llm_profile"})
+
+
+def _refresh_llm(services, config) -> None:
+    """Resync the LLM router after its profiles change. Best-effort."""
+    try:
+        from plugins.services.service_llm import refresh_llm_profile_services
+        refresh_llm_profile_services(services, config)
+    except Exception:  # noqa: BLE001 — a config write must not fail on resync
+        logger.debug("could not refresh llm profile services", exc_info=True)
 
 
 def _is_plugin_setting(key: str) -> bool:
@@ -128,6 +145,13 @@ def build_administer(db, config: dict, services: dict, runtime, session_key: str
             # a fresh scan so syncing starts without a restart.
             if request.key in _WATCHER_KEYS:
                 _rescan_watcher(context)
+            # The live LLM router holds per-profile service objects derived from
+            # these two keys, so it has to be resynced when they change. Kernel
+            # work for the same reason the watcher rescan is: the kernel owns the
+            # derived state, and a plugin that had to remember to refresh it
+            # would eventually forget.
+            if request.key in _LLM_KEYS:
+                _refresh_llm(services, config)
             return {"key": request.key, "scope": request.scope,
                     "restart_required": _needs_restart(request.key)}
 

@@ -52,6 +52,8 @@ def build_inventory(context):
                 return _pipeline(context)
             if view == "settings":
                 return _settings_catalog()
+            if view == "llm_backends":
+                return _llm_backends()
         except Exception:  # noqa: BLE001 — introspection must not break a turn
             logger.exception("inventory view %r failed", view)
             return []
@@ -309,6 +311,16 @@ def _settings_catalog() -> list[dict]:
                          else "plugin" if key in plugin_keys else "kernel"),
         })
     return out
+
+
+def _llm_backends() -> list[str]:
+    """Which LLM backend classes are installed.
+
+    A name list, not the classes: /llm offers these as an enum, and the plugin
+    only ever needs to know what to call them."""
+    from plugins.services.service_llm import llm_backend_names
+
+    return _safe(llm_backend_names, []) or []
 
 
 def _frontend_of(context):
