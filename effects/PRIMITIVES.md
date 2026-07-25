@@ -43,6 +43,19 @@ don't control)? The 2×2 collapses to three because crossing dominates:
 These labels are **structural, not judgment calls** — no per-plugin reasoning
 appears anywhere. That is the entire Rice dodge.
 
+**And the dodge only works because we never ask the semantic question.** Whether
+a given string leaving the machine is benign or hostile is undecidable in
+practice — Rice's theorem wearing a natural-language costume — so the system
+never tries. What *is* decidable, cheaply and totally, is the shape of the
+operation: does it change state, and can the change be undone? Every control in
+this document reduces to those two questions. Anything that would require
+reading meaning out of content is out of scope by construction, not by omission.
+
+The corollary is worth stating because it bounds what the compositional check
+below can claim: tracking that a run *read local data before transmitting* is
+structural and therefore fair game, but it says nothing about whether what left
+was sensitive. It is a fact about operations, offered to a human, not a verdict.
+
 ## The generality bar (the admission test)
 
 A primitive earns its place by being the shared floor many tools stand on.
@@ -202,20 +215,50 @@ unless its SHA-256 is recorded as reviewed. Trust binds to *reviewed bytes*, so
 any edit silently drops a plugin back to untrusted, and "it came from the
 registry" is never evidence of anything.
 
-**The TCB (permanently trusted, imperative, exempt from the contract).** These
-cannot express themselves as generators over this vocabulary, and saying so
-plainly is better than pretending otherwise:
+## What requires the always-trusted exception
 
-| Component | Why it cannot cross |
+The goal is that a plugin's security level is **not** a per-plugin judgement.
+Almost everything is sandboxable, and the few exceptions should be nameable in
+one page — otherwise "is this safe?" becomes a case-by-case argument, which is
+exactly what this design exists to avoid.
+
+So the exception is defined by **capability, not by plugin**. A plugin needs the
+always-trusted exception if, and only if, it needs one of these five things.
+Everything else is sandboxable, whatever family it belongs to.
+
+| # | Capability | Why it cannot cross | Examples |
+|---|---|---|---|
+| 1 | **Hold a live handle across calls** — a socket, file descriptor, database cursor, GPU context | The handle *is* the authority. Serialising it either fails or copies the authority, and a request-per-operation would be a different program. | `service_llm` (provider sockets, API keys) |
+| 2 | **Own a thread or event loop** | Its work happens between calls, not during one; there is no body for the driver to drive. | `service_timekeeper`, frontend transports |
+| 3 | **Mutate kernel registries** — register tools, load plugins, rebuild the task graph | Its whole purpose is changing what the kernel *is*. Mediating that would mean a request per registry mutation, i.e. re-implementing the kernel behind the wire. | `service_plugin_watcher`, `package_manager` |
+| 4 | **Be called back synchronously by the kernel mid-operation** — streaming deltas, `proceed` escorts | A generator yields *outward*; it cannot also be re-entered inward from the kernel partway through. | `on_delta` streaming, `model_call` hook escorts |
+| 5 | **Hand the kernel a live callable or object it will execute** — a validator, a hook function, a parser | The kernel would be running plugin code with the kernel's own authority, so the boundary never applies. | `parser_registry` (function registry), form `validator`s |
+
+**What this costs the agent.** An agent-authored plugin cannot do any of the
+five. Concretely, the agent cannot write: an LLM backend, a frontend transport,
+a scheduler, a hot-reloader, a parser that registers a function, or anything that
+streams. It *can* write tools, commands, tasks, ordinary services, and the
+render/parse half of a frontend — which is nearly everything worth writing.
+
+That is the trade, stated plainly: **the agent gets to write anything whose work
+is expressible as "compute, then ask the kernel to act".** The five exceptions
+are all cases where the plugin *is* infrastructure rather than a user of it.
+
+**The current exception list** (every entry justified by a numbered capability
+above — an entry that cannot cite one is a bug, not an exception):
+
+| Component | Capability |
 |---|---|
-| `service_llm` | holds sockets/keys; streams through `on_delta` callbacks; escorts swap `request.llm` as a pointer; live exception classification |
-| `parser_registry` | a process-global registry of function objects; the orchestrator reads it in-process |
-| `service_plugin_watcher` | owns a watchdog Observer; its entire purpose is mutating host registries |
-| `service_timekeeper` | owns a background thread and the in-process bus |
-| frontend transports | own sockets and event loops (the render/parse half is *not* exempt) |
+| `service_llm` + LLM backends | 1, 4 |
+| `service_plugin_watcher` | 2, 3 |
+| `service_timekeeper` | 2 |
+| `parser_registry` / `service_parser` | 5 |
+| frontend transports (`start`/`stop`, sockets) | 1, 2 |
+| `package_manager` | 3 |
 
-This list is closed. Growth in it is the metric to watch — a test enumerates
-plugins still on the imperative contract and fails if it exceeds this set.
+This list is closed, and growing it requires citing one of the five. A test
+enumerates plugins still on the imperative contract and fails if it exceeds this
+set, so the exception cannot expand quietly.
 
 ---
 

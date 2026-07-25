@@ -31,7 +31,7 @@ import re
 import subprocess
 import time
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -244,6 +244,19 @@ def default_egress_gate(request: Request) -> tuple[bool, str]:
     return False, "this egress is denied by default; no approval gate is wired"
 
 
+def describe_taint(taint: list[str], limit: int = 3) -> str:
+    """A short human-readable note about what a run has already read.
+
+    Shown in the approval dialog so the decision is informed: "allow this HTTP
+    call" and "allow this HTTP call by a tool that just read your SSH key" are
+    very different questions, and only the second one is the real one."""
+    if not taint:
+        return ""
+    shown = ", ".join(taint[:limit])
+    more = f" (+{len(taint) - limit} more)" if len(taint) > limit else ""
+    return f"has already read: {shown}{more}"
+
+
 @dataclass
 class EffectContext:
     """Everything the interpreter needs to fulfil requests for one tool run."""
@@ -277,6 +290,20 @@ class EffectContext:
     ask_user: Callable[[str, str, list[str]], str | None] | None = None
     # Gate for egress requests: (request) -> (allowed, reason).
     egress_gate: Callable[[Request], tuple[bool, str]] = default_egress_gate
+    # Local data this run has already read, as short human-readable labels.
+    # Appended by the interpreter, read by the egress gate: it is what turns a
+    # per-request check into a *compositional* one. Reading is safe and
+    # transmitting is gated, but the pair is the actual exfiltration hazard, and
+    # neither request looks dangerous alone. PRIMITIVES.md calls this
+    # "taint-sink analysis done dynamically at one chokepoint"; this list is the
+    # taint. Mutable and per-run by design.
+    taint: list[str] = field(default_factory=list)
+    # When True, kernel-served model calls (Complete/Embed) are also routed
+    # through the gate once the run has read local data. Off by default: the
+    # keys stay kernel-side and read+summarise is the common, wanted case, so
+    # the default is visibility rather than friction. Turn it on to require an
+    # explicit approval before local data reaches a model endpoint.
+    gate_model_calls_after_read: bool = False
     # Identity for ledger rows.
     tool_name: str = "tool"
     session_key: str | None = None
@@ -313,8 +340,35 @@ class Interpreter:
                 result = EffectResult(ok=False, error=f"unknown tier {request.tier!r}", tier=request.tier)
         except Exception as e:  # noqa: BLE001 — handler failure is tool-visible, not fatal
             result = EffectResult(ok=False, error=str(e), tier=request.tier)
+        self._note_taint(request, result)
         self._record(request, result, started)
         return result
+
+    # ── compositional tracking ───────────────────────────────────────────
+
+    # Reads that bring *local data* into the plugin's hands. ReadContext is
+    # excluded: the conversation is the plugin's own subject matter, and the
+    # model already saw it. Respond is excluded: it is the terminal value, not
+    # an acquisition.
+    _TAINTING_READS = (ReadFile, ReadFiles, QueryDb, ListDir, Stat)
+
+    def _note_taint(self, request: Request, result: EffectResult) -> None:
+        """Record that this run has read local data.
+
+        Reading is safe. Transmitting is gated. The *pair* is exfiltration, and
+        neither request looks dangerous on its own — so the composition has to be
+        tracked somewhere, and the interpreter is the one place every request
+        passes through."""
+        if not result.ok or not isinstance(request, self._TAINTING_READS):
+            return
+        label = (getattr(request, "path", None)
+                 or getattr(request, "root", None)
+                 or getattr(request, "sql", None)
+                 or (", ".join(getattr(request, "paths", [])[:3]) or None)
+                 or request.type)
+        label = str(label)[:120]
+        if label not in self.ctx.taint:
+            self.ctx.taint.append(label)
 
     # ── reads ────────────────────────────────────────────────────────────
 
@@ -447,7 +501,16 @@ class Interpreter:
     # ── egress (gated) ───────────────────────────────────────────────────
 
     def _fulfill_egress(self, request: Request) -> EffectResult:
-        """Gate, then place an egress request."""
+        """Gate, then place an egress request.
+
+        ``Complete``/``Embed`` are normally served without a prompt because the
+        keys stay kernel-side. But once this run has read local data, that
+        reasoning stops covering the interesting case: the *prompt itself* is now
+        carrying local content to a model endpoint. Whether that needs an
+        approval is a policy call (``gate_model_calls_after_read``), off by
+        default because read-then-summarise is the common wanted case — but the
+        taint is always recorded, so the composition is visible in the ledger
+        even when it is not gated."""
         allowed, reason = self.ctx.egress_gate(request)
         if not allowed:
             return EffectResult(ok=False, denied=True, error=reason or "egress denied", tier=TIER_EGRESS)

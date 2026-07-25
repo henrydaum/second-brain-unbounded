@@ -153,7 +153,7 @@ class EffectsContract:
         from effects.interpreter import EffectContext
 
         services = getattr(context, "services", None) or {}
-        return EffectContext(
+        ectx = EffectContext(
             db=getattr(context, "db", None),
             llm=services.get("llm"),
             embedder=services.get("text_embedder"),
@@ -163,12 +163,17 @@ class EffectsContract:
             paths=self._paths(context),
             context_provider=self._context_provider(context),
             ask_user=self._ask_user(context),
-            egress_gate=self._egress_gate(context),
+            gate_model_calls_after_read=bool(
+                self._config(context).get("gate_model_calls_after_read")),
             tool_name=getattr(self, "name", "plugin"),
             session_key=getattr(context, "session_key", None),
             conversation_id=self._conversation_id(context),
             user_id=getattr(context, "user_id", None),
         )
+        # The gate closes over the context it guards, so it can see what the run
+        # has already read. Attached after construction for that reason.
+        ectx.egress_gate = self._egress_gate(context, ectx)
+        return ectx
 
     def _config(self, context) -> dict:
         """The live config dict, or an empty one."""
@@ -298,16 +303,34 @@ class EffectsContract:
 
         return ask
 
-    def _egress_gate(self, context):
+    def _egress_gate(self, context, ectx):
         """Kernel-served model calls pass; boundary-crossing actions route
-        through the approval surface with a legible target."""
+        through the approval surface with a legible target.
+
+        The approval prompt names what the run has **already read**, because
+        that is the question a human is actually being asked. "Allow this HTTP
+        call" and "allow this HTTP call from a plugin that just read your SSH
+        key" look identical to a per-request check and are not remotely the same
+        decision. The taint list is what makes the second one visible.
+
+        ``Complete``/``Embed`` still pass silently by default — the keys stay
+        kernel-side and read-then-summarise is the common wanted case — unless
+        ``gate_model_calls_after_read`` is set, in which case transmitting local
+        data to a model endpoint needs an explicit approval too.
+        """
+        from effects.interpreter import describe_taint
+
         def gate(request):
-            if request.type in ("complete", "embed"):
+            model_call = request.type in ("complete", "embed")
+            if model_call and not (ectx.gate_model_calls_after_read and ectx.taint):
                 return True, ""
             approve = getattr(context, "approve_command", None)
             if approve is None:
                 return False, "no approval surface available for egress"
+            note = describe_taint(ectx.taint)
             label = f"{getattr(self, 'name', 'plugin')!r} {request.type}"
+            if note:
+                label = f"{label} — {note}"
             ok = approve(egress_target(request), label)
             reason = getattr(context, "approval_denial_reason", "") or "egress denied by user"
             return ok, "" if ok else reason
