@@ -219,6 +219,7 @@ class EffectsContract:
             administer=getattr(context, "administer", None),
             inventory=self._inventory(context),
             call_tool=self._call_tool(context),
+            read_conversations=self._read_conversations(context),
             tools=getattr(getattr(context, "tool_registry", None), "tools", None),
             session_action=self._session_action(context),
             # Both ceilings on the administration verbs. The principal comes off
@@ -391,6 +392,17 @@ class EffectsContract:
                     "error": getattr(result, "error", "") or ""}
 
         return call
+
+    def _read_conversations(self, context):
+        """Wire ``ReadConversations`` to the caller's own conversation history.
+
+        Available to every family, unlike ``administer``: reading your own
+        conversations is read-tier and ownership-scoped inside the reader, so
+        there is no argument a plugin can vary to reach another user's."""
+        if getattr(context, "db", None) is None:
+            return None
+        from plugins.helpers.conversations import build_reader
+        return build_reader(context)
 
     def _session_action(self, context):
         """Wire ``SessionAction`` to the live session.

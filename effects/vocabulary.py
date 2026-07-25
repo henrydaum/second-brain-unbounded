@@ -130,6 +130,36 @@ class ReadContext(Request):
 
 
 @dataclass(frozen=True)
+class ReadConversations(Request):
+    """Read the caller's own conversations: list, categories, or one preview.
+
+    Split out of ``ConversationOp`` rather than added as an action on it, on the
+    same reasoning that separates ``QueryDb`` from ``ExecSql``: that verb mixes
+    creating and *deleting* history with merely looking at it, and one tier
+    cannot be right for both. Reading is read-tier; destroying is egress.
+
+    Safe at read tier because ownership is enforced **kernel-side** on every
+    row — the same argument-level authorization that confines ``ReadFile`` to the
+    read roots. A caller sees its own conversations and no one else's, so this
+    cannot become a cross-user leak the way an unfiltered ``QueryDb`` against the
+    conversations table would.
+
+    ``mode`` selects a shape, not a method:
+    ``list`` (recent rows, optionally by category) · ``categories`` (distinct
+    labels) · ``preview`` (one conversation's agent, notification mode, and last
+    couple of turns). It stays a fixed set for the reason ``ReadContext``'s views
+    do — a mode that took arbitrary arguments would be a generic dispatcher.
+    """
+
+    type: ClassVar[str] = "read_conversations"
+    tier: ClassVar[str] = TIER_READ
+    mode: str = "list"
+    conversation_id: int | None = None
+    category: str | None = None
+    limit: int = 15
+
+
+@dataclass(frozen=True)
 class AskUser(Request):
     """Ask the human a question and wait for the answer.
 
@@ -493,6 +523,7 @@ REQUEST_TYPES: dict[str, type[Request]] = {
     cls.type: cls
     for cls in (
         ReadFile, ReadFiles, ListDir, Stat, QueryDb, ReadContext, AskUser,
+        ReadConversations,
         WriteFile, WriteDb, DeleteFile, Respond,
         HttpRequest, Complete, Embed, ExecSql, RunProcess, ReloadPlugin,
         WriteConfig, ReadConfig, ServiceControl, PackageOp, ConversationOp,

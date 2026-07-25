@@ -57,6 +57,7 @@ from effects.vocabulary import (
     QueryDb,
     ReadConfig,
     ReadContext,
+    ReadConversations,
     ReadFile,
     ReadFiles,
     ReloadPlugin,
@@ -347,6 +348,9 @@ class EffectContext:
     call_chain: tuple[str, ...] = ()
     # Acts on the live session (cancel/back/skip): (action, payload) -> result.
     session_action: Callable[[str, dict], Any] | None = None
+    # Reads the caller's own conversations: (request) -> data. Ownership is
+    # enforced inside, which is what makes this safe at read tier.
+    read_conversations: Callable[[Request], Any] | None = None
     # ── who is asking ────────────────────────────────────────────────────
     # Derived from the *dispatch path*, never from the plugin's family: a slash
     # command is the user acting, a tool call in an agent turn is the agent
@@ -566,6 +570,12 @@ class Interpreter:
             if self.ctx.context_provider is not None:
                 text = self.ctx.context_provider(view, request.k)
             return EffectResult(value=text, tier=TIER_READ)
+        if isinstance(request, ReadConversations):
+            reader = self.ctx.read_conversations
+            if reader is None:
+                return EffectResult(ok=False, tier=TIER_READ,
+                                    error="no conversation store is available")
+            return EffectResult(value=reader(request), tier=TIER_READ)
         if isinstance(request, AskUser):
             asker = self.ctx.ask_user
             if asker is None:

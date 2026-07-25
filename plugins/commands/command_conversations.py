@@ -12,14 +12,7 @@ Walks a multi-step form:
 
 from __future__ import annotations
 
-import time
-
 from plugins.BaseCommand import BaseCommand
-from plugins.frontends.helpers.formatters import detail_card, quote_block
-from runtime.notifications import NOTIFICATION_MODES, notification_mode
-from state_machine.conversation import FormStep
-from state_machine.serialization import latest_state
-
 
 _LIMIT = 15
 _MAIN = "Main"
@@ -28,262 +21,196 @@ _LOAD = "Load conversation"
 _DELETE = "Delete conversation"
 _CHANGE_CATEGORY = "Change category"
 _CHANGE_NOTIF = "Change notification mode"
+_ACTIONS = [_LOAD, _DELETE, _CHANGE_CATEGORY, _CHANGE_NOTIF]
 
 
 class ConversationsCommand(BaseCommand):
-    """Slash-command handler for `/conversations`."""
+    """Slash-command handler for `/conversations`.
+
+    Uses **two** verbs over one resource, which is the point of splitting them:
+    ``ReadConversations`` is read-tier and ownership-scoped, so browsing your own
+    history costs nothing; ``ConversationOp`` is egress, so deleting one is
+    graded like the irreversible act it is. A single verb would have forced the
+    browse to carry the delete's tier, or the delete to carry the browse's.
+    """
     name = "conversations"
     description = "Browse, switch, or manage conversations"
     category = "Conversation"
 
-    def form(self, args, context):
-        """Handle form."""
-        db = getattr(context, "db", None)
-        if db is None:
-            return []
+    contract = "effects"
+    declared_requests = ["read_conversations", "conversation_op"]
 
-        uid = getattr(context, "user_id", None)
-        cats = _existing_categories(db, uid)
-        steps = [FormStep("category", "Choose a conversation category.", True, enum=cats, columns=1)]
+    def form(self, params):
+        """Walk category → conversation → action → action-specific value."""
+        from effects.vocabulary import ReadConversations
 
-        picked = args.get("category")
+        categories = yield ReadConversations(mode="categories")
+        steps = [{"name": "category", "required": True, "columns": 1,
+                  "prompt": "Choose a conversation category.",
+                  "enum": categories.value or [_MAIN]}]
+
+        picked = params.get("category")
         if not picked:
             return steps
 
-        return steps + _existing_conversation_steps(args, context, picked)
+        listing = yield ReadConversations(mode="list", category=picked, limit=_LIMIT)
+        rows = listing.value or []
+        if not rows:
+            steps.append({"name": "conversation_id", "required": True, "columns": 1,
+                          "prompt": f"No conversations found under '{picked}'.",
+                          "enum": ["(none)"], "enum_labels": ["(none)"]})
+            return steps
 
-    def run(self, args, context):
-        """Execute `/conversations` for the active session."""
-        runtime = getattr(context, "runtime", None)
-        db = getattr(context, "db", None)
-        session_key = getattr(context, "session_key", None)
-        if runtime is None or db is None or not session_key:
-            return "Conversations are not available in this context."
+        steps.append({"name": "conversation_id", "required": True, "columns": 1,
+                      "prompt": f"Choose a recent conversation under '{picked}'.",
+                      "enum": [str(row["id"]) for row in rows],
+                      "enum_labels": [_row_label(row) for row in rows]})
 
-        cid = _decode_id(args.get("conversation_id"))
+        cid = _decode_id(params.get("conversation_id"))
         if cid is None:
-            return "No conversation selected."
+            return steps
 
-        action = args.get("action") or _LOAD
-        if action == _DELETE:
-            if not runtime.delete_conversation(session_key, cid):
-                return "No such conversation."
-            return f"Deleted conversation #{cid}."
-        if action == _CHANGE_NOTIF:
-            mode = runtime.set_conversation_notification_mode(session_key, cid, args.get("mode"))
-            if mode is None:
-                return "No such conversation."
-            return f"Notifications for #{cid} → {mode}."
+        preview = yield ReadConversations(mode="preview", conversation_id=cid)
+        steps.append({"name": "action", "required": True, "columns": 1,
+                      "enum": _ACTIONS,
+                      "prompt": ("What do you want to do with this conversation?\n\n"
+                                 f"{_preview_card(preview.value or {})}").strip()})
+
+        action = params.get("action")
         if action == _CHANGE_CATEGORY:
-            category = _resolve_category(args)
-            if not runtime.set_conversation_category(session_key, cid, _lookup_value(category) or None):
-                return "No such conversation."
-            return f"Conversation #{cid} moved to '{category}'."
+            choices = list(categories.value or [])
+            if _MAIN not in choices:
+                choices.insert(0, _MAIN)
+            steps.append({"name": "target_category", "required": True, "columns": 1,
+                          "prompt": "Choose the new category.",
+                          "enum": choices + [_NEW_CAT]})
+            if params.get("target_category") == _NEW_CAT:
+                steps.append({"name": "custom_category", "required": True, "columns": 1,
+                              "prompt": "Enter a name for the new category."})
+        elif action == _CHANGE_NOTIF:
+            steps.append({"name": "mode", "required": True, "columns": 1,
+                          "enum": _notification_modes(),
+                          "prompt": ("Choose how this conversation should notify you "
+                                     "while it runs in the background.")})
+        return steps
 
-        # Default: load. load_history reads the conversation's stored
-        # state marker, so the agent profile follows the conversation
-        # automatically — no need to pass it explicitly.
-        result = runtime.load_history(session_key, cid)
-        return "\n".join(m for m in result.messages if m).strip() or f"Loaded conversation #{cid}."
+    def run(self, params):
+        """Execute `/conversations` for the active session."""
+        from effects.vocabulary import ConversationOp, Respond
+
+        cid = _decode_id(params.get("conversation_id"))
+        if cid is None:
+            return Respond(data="No conversation selected.")
+
+        action = params.get("action") or _LOAD
+
+        if action == _DELETE:
+            result = yield ConversationOp(action="delete", conversation_id=cid)
+            if not result.ok or not result.value:
+                return Respond(data="No such conversation.")
+            return Respond(data=f"Deleted conversation #{cid}.")
+
+        if action == _CHANGE_NOTIF:
+            result = yield ConversationOp(action="notification_mode", conversation_id=cid,
+                                          fields={"mode": params.get("mode")})
+            if not result.ok or result.value is None:
+                return Respond(data="No such conversation.")
+            return Respond(data=f"Notifications for #{cid} → {result.value}.")
+
+        if action == _CHANGE_CATEGORY:
+            label = _resolve_category(params)
+            result = yield ConversationOp(
+                action="categorize", conversation_id=cid,
+                fields={"category": None if label == _MAIN else label})
+            if not result.ok or not result.value:
+                return Respond(data="No such conversation.")
+            return Respond(data=f"Conversation #{cid} moved to '{label}'.")
+
+        # Default: load. The kernel reads the conversation's stored state
+        # marker, so the agent profile follows the conversation automatically.
+        result = yield ConversationOp(action="load", conversation_id=cid)
+        if not result.ok or not result.value:
+            return Respond(data="No such conversation.")
+        messages = (result.value if isinstance(result.value, list) else []) or []
+        text = "\n".join(m for m in messages if m).strip()
+        return Respond(data=text or f"Loaded conversation #{cid}.")
 
 
 class NewCommand(BaseCommand):
-    """Slash-command handler for `/conversations`."""
+    """Start a conversation with default settings."""
     name = "new"
     description = "Start a conversation with default settings"
     category = "Conversation"
 
-    def run(self, args, context):
-        """Execute `/conversations` for the active session."""
-        runtime = getattr(context, "runtime", None)
-        db = getattr(context, "db", None)
-        session_key = getattr(context, "session_key", None)
-        if runtime is None or db is None or not session_key:
-            return "Conversations are not available in this context."
-        if not ((getattr(context, "config", {}) or {}).get("llm_profiles") or {}):
-            return "No LLM is configured yet. Run /setup to add one before starting a conversation."
-        return _create_and_switch(runtime, session_key)
+    contract = "effects"
+    declared_requests = ["read_config", "conversation_op"]
+
+    def run(self, _params):
+        """Execute `/new` for the active session."""
+        from effects.vocabulary import ConversationOp, ReadConfig, Respond
+
+        profiles = yield ReadConfig(key="llm_profiles")
+        if not (profiles.value or {}):
+            return Respond(data=("No LLM is configured yet. Run /setup to add one "
+                                 "before starting a conversation."))
+
+        result = yield ConversationOp(action="create",
+                                      fields={"title": f"New conversation ({_MAIN})",
+                                              "kind": "user"})
+        if not result.ok or not result.value:
+            return Respond(data="Failed to create conversation.")
+        new_id = result.value
+
+        loaded = yield ConversationOp(action="load", conversation_id=new_id)
+        if not loaded.ok:
+            return Respond(data=f"Started new conversation #{new_id}.")
+        return Respond(data=f"Started new conversation #{new_id} under '{_MAIN}'.")
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Step builders
-# ──────────────────────────────────────────────────────────────────────
+def _notification_modes() -> list[str]:
+    """The available notification modes.
 
-def _existing_conversation_steps(args, context, category):
-    """Internal helper to handle existing conversation steps."""
-    db = getattr(context, "db", None)
-    uid = getattr(context, "user_id", None)
-    rows, _ = db.list_conversations_page(offset=0, limit=_LIMIT, category=_lookup_value(category), user_id=uid)
-    if not rows:
-        return [FormStep("conversation_id", f"No conversations found under '{category}'.", True,
-                         enum=["(none)"], enum_labels=["(none)"], columns=1)]
-
-    enum = [str(r.get("id")) for r in rows]
-    labels = [_label_for(db, r) for r in rows]
-    steps = [FormStep("conversation_id", f"Choose a recent conversation under '{category}'.",
-                      True, enum=enum, enum_labels=labels, columns=1)]
-
-    cid = _decode_id(args.get("conversation_id"))
-    if cid is None:
-        return steps
-
-    prompt = f"What do you want to do with this conversation?\n\n{_preview_for(db, cid) or ''}".strip()
-    steps.append(FormStep("action", prompt, True, enum=[_LOAD, _DELETE, _CHANGE_CATEGORY, _CHANGE_NOTIF], columns=1))
-    if args.get("action") == _CHANGE_CATEGORY:
-        steps.append(FormStep("target_category", "Choose the new category.", True, enum=_category_choices(db, uid) + [_NEW_CAT], columns=1))
-        if args.get("target_category") == _NEW_CAT:
-            steps.append(FormStep("custom_category", "Enter a name for the new category.", True, columns=1))
-    if args.get("action") == _CHANGE_NOTIF:
-        steps.append(FormStep("mode", "Choose how this conversation should notify you while it runs in the background.", True, enum=list(NOTIFICATION_MODES), columns=1))
-    return steps
+    Duplicated from ``runtime.notifications`` rather than imported: a sandboxed
+    body cannot import kernel modules, and this is a short, stable list. If it
+    grows a third state it should become an inventory view instead."""
+    return ["all", "mentions", "none"]
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Category helpers
-# ──────────────────────────────────────────────────────────────────────
-
-def _existing_categories(db, user_id=None) -> list[str]:
-    """Distinct, user-facing category labels currently in the DB.
-
-    NULL/empty categories surface as ``Main`` so the bucket has a name. Scoped to
-    the current user when ``user_id`` is given.
-    """
-    out: list[str] = []
-    for v in db.list_conversation_categories(user_id=user_id):
-        label = _MAIN if v in (None, "") else v
-        if label not in out:
-            out.append(label)
-    return out
+def _row_label(row: dict) -> str:
+    """Menu label for one conversation row."""
+    relative = row.get("relative_time") or ""
+    return f"{row['title']}  ({relative})" if relative else row["title"]
 
 
-def _category_choices(db, user_id=None) -> list[str]:
-    """Internal helper to handle category choices."""
-    cats = _existing_categories(db, user_id)
-    return cats if _MAIN in cats else [_MAIN] + cats
+def _preview_card(preview: dict) -> str:
+    """The scannable header shown once a conversation is picked."""
+    import sandbox_kit as kit
 
-
-def _lookup_value(label: str) -> str:
-    """Map a UI label back to the value stored in the DB."""
-    return "" if label == _MAIN else label
-
-
-def _resolve_category(args) -> str:
-    """Internal helper to resolve category."""
-    chosen = (args.get("target_category") or "").strip()
-    return ((args.get("custom_category") or "").strip() if chosen == _NEW_CAT else chosen) or _MAIN
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Listing + previewing
-# ──────────────────────────────────────────────────────────────────────
-
-def _label_for(db, row: dict) -> str:
-    """Internal helper to handle label for."""
-    title = (row.get("title") or "").strip() or "(untitled)"
-    rel = _relative_time(row.get("updated_at"))
-    return f"{title}  ({rel})" if rel else title
-
-
-def _relative_time(timestamp) -> str:
-    """Format an absolute timestamp as a coarse "(N units ago)" string."""
-    try:
-        ts = float(timestamp)
-    except (TypeError, ValueError):
+    if not preview:
         return ""
-    delta = max(0, time.time() - ts)
-    units = (
-        (60, "second", "seconds"),
-        (60, "minute", "minutes"),
-        (24, "hour", "hours"),
-        (7, "day", "days"),
-        (4, "week", "weeks"),
-        (12, "month", "months"),
-        (None, "year", "years"),
-    )
-    value = delta
-    for step, singular, plural in units:
-        if step is None or value < step:
-            n = int(value) if value >= 1 else 1
-            return f"just now" if singular == "second" and n < 5 else f"{n} {singular if n == 1 else plural} ago"
-        value /= step
-    return ""
+    card = kit.detail_card(preview.get("title") or "(untitled)", [
+        ("Agent", preview.get("agent") or "(unknown)"),
+        ("Notifications", preview.get("notification_mode") or "all"),
+    ])
+    snippets = preview.get("snippets") or []
+    return card + (f"\n\n{kit.quote_block(chr(10).join(snippets))}" if snippets else "")
 
 
-def _agent_for(db, conversation_id) -> str:
-    """Internal helper to handle agent for."""
-    marker = latest_state(db.get_conversation_messages(conversation_id)) or {}
-    return (marker.get("profile_override") or marker.get("active_agent_profile") or "").strip()
-
-
-def _notification_mode_for(db, conversation_id) -> str:
-    """Internal helper to handle notification mode for."""
-    return notification_mode((latest_state(db.get_conversation_messages(conversation_id)) or {}).get("notification_mode"))
-
-
-def _preview_for(db, conversation_id) -> str:
-    """A scannable header for the Load/Delete step.
-
-    Shows the agent profile and the last 1-2 chat turns, truncated. Only
-    rendered after the user picks a conversation, so the cost is paid
-    once, not for every list item.
-    """
-    msgs = db.get_conversation_messages(conversation_id) or []
-    agent = _agent_for(db, conversation_id) or "(unknown)"
-    mode = _notification_mode_for(db, conversation_id)
-    title = ""
-    row = db.get_conversation(conversation_id) if hasattr(db, "get_conversation") else None
-    if row:
-        title = (row.get("title") or "").strip()
-    snippets: list[str] = []
-    for m in reversed(msgs):
-        role = m.get("role")
-        if role not in ("user", "assistant"):
-            continue
-        content = (m.get("content") or "").strip()
-        if not content:
-            continue
-        snippets.append(f"{role}: {_truncate(content, 120)}")
-        if len(snippets) >= 2:
-            break
-    snippets.reverse()
-    card = detail_card(title or "(untitled)", [("Agent", agent), ("Notifications", mode)])
-    quoted = quote_block("\n".join(snippets))
-    return card + (f"\n\n{quoted}" if snippets else "")
-
-
-def _truncate(text: str, limit: int) -> str:
-    """Internal helper to handle truncate."""
-    text = text.replace("\n", " ").strip()
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Handlers
-# ──────────────────────────────────────────────────────────────────────
-
-def _create_and_switch(runtime, session_key) -> str:
-    """Internal helper to create and switch."""
-    new_id = runtime.create_conversation(f"New conversation ({_MAIN})", kind="user", category=None,
-                                         user_id=runtime.session_user_id(session_key))
-    if new_id is None:
-        return "Failed to create conversation."
-    existing = runtime.sessions.get(session_key)
-    if existing is not None and existing.conversation_id not in (None, new_id):
-        runtime.close_session(session_key)
-    session = runtime.load_conversation(session_key, new_id)
-    profile = session.profile_override or session.active_agent_profile or "default"
-    return f"Started new conversation #{new_id} under '{_MAIN}'.\nAgent: {profile}"
+def _resolve_category(params: dict) -> str:
+    """The category label the user chose, honouring the custom-name branch."""
+    chosen = (params.get("target_category") or "").strip()
+    if chosen == _NEW_CAT:
+        return (params.get("custom_category") or "").strip() or _MAIN
+    return chosen or _MAIN
 
 
 def _decode_id(value) -> int | None:
-    """Internal helper to handle decode ID."""
+    """Parse a conversation id from a form value or a '#123 title' string."""
     if value in (None, "", "(none)"):
         return None
     if isinstance(value, int):
         return value
-    text = str(value).strip()
-    if text.startswith("#"):
-        text = text[1:]
+    text = str(value).strip().lstrip("#")
     head = text.split(" ", 1)[0].strip()
     try:
         return int(head)

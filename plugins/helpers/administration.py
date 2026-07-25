@@ -189,7 +189,14 @@ def build_administer(db, config: dict, services: dict, runtime, session_key: str
             if action == "delete":
                 return runtime.delete_conversation(session_key, cid)
             if action == "load":
-                return runtime.load_conversation(session_key, cid) is not None
+                # load_history, not load_conversation: it reads the stored state
+                # marker, so the agent profile follows the conversation. Returns
+                # the runtime's own messages so the command can show them rather
+                # than inventing its own wording.
+                result = runtime.load_history(session_key, cid)
+                if result is None:
+                    return []
+                return [m for m in (getattr(result, "messages", None) or []) if m] or True
             if action == "clear":
                 # Kernel-side because it is four coupled steps that must not be
                 # half-done: wipe messages, mark the title, then reload the
