@@ -52,6 +52,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from plugins.EffectsContract import EffectsContract
+
 logger = logging.getLogger("BaseTask")
 
 
@@ -85,7 +87,7 @@ class TaskResult:
 		return TaskResult(success=False, error=error)
 
 
-class BaseTask:
+class BaseTask(EffectsContract):
 	"""
 	The contract every task implements.
 
@@ -179,10 +181,11 @@ class BaseTask:
 		super().__init_subclass__(**kwargs)
 		# Prevent subclasses from sharing mutable class attributes.
 		# Without .copy(), every subclass would mutate the same list object.
-		for attr in ("modalities", "reads", "writes", "requires_services", "dependencies_files", "dependencies_pip", "config_settings", "trigger_channels", "event_payload_schema", "default_jobs"):
+		for attr in ("modalities", "reads", "writes", "requires_services", "dependencies_files", "dependencies_pip", "config_settings", "trigger_channels", "event_payload_schema", "default_jobs", "declared_requests"):
 			value = getattr(cls, attr)
 			if isinstance(value, (dict, list)):
 				setattr(cls, attr, value.copy())
+		cls.validate_effects_declaration()
 
 	# --- Agent system-prompt contribution ---
 	# Static guidance injected into the agent's system prompt when this task is
@@ -222,3 +225,62 @@ class BaseTask:
 		tasks.
 		"""
 		return TaskResult.failed("Not implemented")
+
+	# ── kernel entry points ──────────────────────────────────────────────
+
+	def perform(self, paths: list[str], context) -> list[TaskResult]:
+		"""Run a path batch. The single entry point the orchestrator dispatches to.
+
+		An ``effects`` task returns rows as data; the kernel builds the
+		``TaskResult``s, so a sandboxed task never holds one. One result per input
+		path is the orchestrator's contract, so a short or malformed answer is
+		padded rather than silently dropping paths."""
+		if self.contract != "effects":
+			return self.run(paths, context)
+		outcome = self._perform_effects(context, {"paths": list(paths or [])})
+		if not outcome.success:
+			return [TaskResult.failed(outcome.error) for _ in paths]
+		results = _to_task_results(outcome.data)
+		while len(results) < len(paths):
+			results.append(TaskResult.failed("task returned no result for this path"))
+		return results[:len(paths)]
+
+	def perform_event(self, run_id: str, payload: dict, context) -> TaskResult:
+		"""Run one event-triggered task. The orchestrator's event entry point."""
+		if self.contract != "effects":
+			return self.run_event(run_id, payload, context)
+		outcome = self._perform_effects(
+			context, {"run_id": run_id, "payload": dict(payload or {})},
+			method="run_event")
+		if not outcome.success:
+			return TaskResult.failed(outcome.error)
+		results = _to_task_results(outcome.data)
+		return results[0] if results else TaskResult()
+
+
+_TASK_RESULT_FIELDS = {"success", "error", "data", "also_contains", "discovered_paths"}
+
+
+def _to_task_results(payload) -> list[TaskResult]:
+	"""Build ``TaskResult``s from a task's returned data.
+
+	Accepts one dict or a list of them. Unknown keys are dropped rather than
+	raising: the payload crosses a boundary from code the kernel does not trust,
+	so it is validated, not believed."""
+	if payload is None:
+		return []
+	entries = payload if isinstance(payload, list) else [payload]
+	out = []
+	for entry in entries:
+		if isinstance(entry, TaskResult):
+			out.append(entry)
+			continue
+		if not isinstance(entry, dict):
+			logger.warning("Skipping malformed task result: %r", entry)
+			continue
+		kwargs = {k: v for k, v in entry.items() if k in _TASK_RESULT_FIELDS}
+		try:
+			out.append(TaskResult(**kwargs))
+		except (TypeError, ValueError):
+			logger.warning("Skipping malformed task result: %r", entry)
+	return out

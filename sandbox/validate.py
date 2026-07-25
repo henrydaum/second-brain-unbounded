@@ -27,6 +27,7 @@ import ast
 _LITERAL_ALLOWED = {
     "plugins.BaseTool",          # the contract (a plugin sets contract = "effects")
     "plugins.BaseCommand",
+    "plugins.BaseTask",
     "plugins.BaseSandboxTool",   # deprecated shim; kept until the store is converted
     "effects.vocabulary",
     "sandbox_kit",

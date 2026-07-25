@@ -788,7 +788,7 @@ class Orchestrator:
 		source = getattr(task, "_source_path", "")
 		bus.emit(TASK_STARTED, {"task_name": task.name, "run_id": run_id})
 		res = run_supervised(
-			lambda: task.run_event(run_id, payload, context),
+			lambda: task.perform_event(run_id, payload, context),
 			timeout=task.timeout, plugin_key=source, kind="task",
 			name=task.name, eligible=not is_builtin_path(source))
 		if not res.ok:
@@ -880,7 +880,7 @@ class Orchestrator:
 		source = getattr(task, "_source_path", "")
 		bus.emit(TASK_STARTED, {"task_name": task.name, "paths": list(paths)})
 		res = run_supervised(
-			lambda: task.run(paths, context),
+			lambda: task.perform(paths, context),
 			timeout=task.timeout, plugin_key=source, kind="task",
 			name=task.name, eligible=not is_builtin_path(source))
 		if not res.ok:
