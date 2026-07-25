@@ -126,12 +126,6 @@ class RuntimeSession:
     # without any restart at all — prefer that when a re-drive was only ever
     # a vehicle for swapping the LLM.
     restart_turn: bool = False
-    # A tool selected via execute_tool, awaiting its parameter-fill model call:
-    # ``{"name": <tool>, "intent": <why>}``. The ConversationLoop consumes this
-    # at the next loop boundary to shape a single forced fill call (see
-    # ``_prepare_fill_call``). Ephemeral — deliberately NOT persisted in
-    # to_marker(): a half-made tool selection must not survive a restart.
-    pending_fill: dict[str, Any] | None = None
     has_compaction_checkpoint: bool = False
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
