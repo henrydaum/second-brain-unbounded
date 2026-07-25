@@ -29,8 +29,9 @@ future store) — *not* by deleting them. What remains:
   `service_parser` (text + image helper discovery), `service_timekeeper`
   (lightweight event clock — on the effects contract; owns no thread, no bus
   access, and no job state), and `service_plugin_watcher` (hot-reload = the
-  install/uninstall substrate). If another tracked service remains, treat it as
-  kernel-boundary debt unless the user explicitly keeps it.
+  install/uninstall substrate; also on the contract — an mtime diff that yields
+  `ReloadPlugin`, holding no registries). If another tracked service remains,
+  treat it as kernel-boundary debt unless the user explicitly keeps it.
 - **Tasks:** none.
 - **Tools:** none. The kernel ships no built-in tools; the agent is presented
   the full schema list of whatever is registered

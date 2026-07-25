@@ -56,6 +56,8 @@ def build_inventory(context):
                 return _llm_backends()
             if view == "scheduled_jobs":
                 return _scheduled_jobs()
+            if view == "quarantined_plugins":
+                return _quarantined_plugins()
         except Exception:  # noqa: BLE001 — introspection must not break a turn
             logger.exception("inventory view %r failed", view)
             return []
@@ -153,6 +155,17 @@ def _scheduled_jobs() -> list[dict]:
     from runtime.scheduling import get_store
 
     return _safe(get_store().snapshot, []) or []
+
+
+def _quarantined_plugins() -> list[str]:
+    """Source paths the supervisor's circuit breaker has condemned.
+
+    The plugin watcher reads this to know what to unload. Reporting condemned
+    state is ordinary ambient knowledge — the supervisor already logs it and
+    announces it on the bus."""
+    from runtime.supervisor import supervisor
+
+    return _safe(supervisor.health.quarantined, []) or []
 
 
 def _jobs_by_channel(context) -> dict:

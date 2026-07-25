@@ -300,11 +300,18 @@ def _start_ticker(scaffold, services, config, tool_registry, root_dir, ref):
         logger.exception("scheduled-job store failed to load")
 
     def tick_context(service_name: str):
-        """A call context for one ticked service."""
+        """A call context for one ticked service.
+
+        Bound to the active session so an egress a tick asks for can actually be
+        approved — the hot-reloader's ``ReloadPlugin`` is the case that needs it.
+        The session supplies the *approval surface*, not authority: nobody typed
+        this, so ``user_initiated`` stays False and the principal stays
+        ``agent``."""
         return build_context(
             scaffold.db, config, services, tool_registry=tool_registry,
             orchestrator=scaffold.orchestrator, runtime=ref.get("runtime"),
-            root_dir=root_dir, session_key=None)
+            root_dir=root_dir,
+            session_key=getattr(ref.get("runtime"), "active_session_key", None))
 
     def approve(target: str, justification: str) -> bool:
         """Route an egress-tier emit to whoever is attended, if anyone is."""

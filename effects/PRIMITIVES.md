@@ -102,7 +102,7 @@ Apply, in order:
 | | `ExecSql` (arbitrary mutation — **not** journalable, so egress-graded and gated) | egress |
 | Network / services | `HttpRequest` · `Complete` · `Embed` (LLM/embedder served kernel-side; keys never enter the sandbox) | egress |
 | Compute / process | `RunProcess` (argv only — no shell string; cwd-confined; kernel owns the handle) | egress |
-| Kernel registries | `ReloadPlugin` (load/reload/unload by path; root-confined — loading *executes code*, so the deferred-execution rule puts it here rather than in write) | egress |
+| Kernel registries | `ReloadPlugin` (load/reload/unload by path; root-confined — loading *executes code*, so the deferred-execution rule puts it here rather than in write). Its **effective** tier is borrowed from the target: the declarations of the plugin being loaded, read by parsing it, falling back to the target's provenance. | egress (borrowed) |
 | Kernel administration | `WriteConfig` · `ServiceControl` · `PackageOp` · `ConversationOp` — the kernel administers itself through slash commands, and those commands must reach config, services, packages and conversations to run as pure bodies. Irreversible or code-executing, hence egress; additionally graded by **who is asking** (below). | egress |
 | Scheduling | `ScheduleOp` (create/update/remove/enable/advance a scheduled job) — reversible (the store snapshots the rows it touches, so the turn journal can put them back), and deliberately **not** an administration verb: a job is a promise to emit on a channel, and what that costs is graded at the *emit* by `channel_danger_tier`, which is where the effect actually lands. Grading it by who scheduled instead would also charge an approval to the scheduler's own once-a-second bookkeeping. Reading the job table is the `scheduled_jobs` inventory view. | write |
 | Kernel state (reads) | none — config holds API keys; a read there composes with egress into key theft. Note `WriteConfig` must not become a read by returning the prior value. | — |
@@ -331,7 +331,6 @@ cannot is a bug, not an exception):
 | Component | Capability |
 |---|---|
 | `service_llm` + LLM backends | 1, 4 |
-| `service_plugin_watcher` | — *(retired: `ReloadPlugin` covers the mutation; still trusted only because it is built-in)* |
 | `parser_registry` / `service_parser` | 5 |
 | frontend transports (`start`/`stop`, sockets) | 1, 2 |
 | `package_manager` | 3 |
@@ -347,7 +346,37 @@ were tested, and had never been *wired* — `ServiceTicker` was not started by
 `bootstrap` at all — so the exception survived on inertia rather than on need.
 Building an exit is not walking through it.
 
-Its channels are the one wrinkle. A scheduler cannot write `declared_channels`
+`service_plugin_watcher` came off the same way, and it was the harder case
+because it cited two capabilities and quietly relied on a third. The `Observer`
+thread became a tick that diffs mtimes; the direct `load_single_plugin` /
+`unload_plugin` calls became `ReloadPlugin`, whose provider
+(`plugins/helpers/plugin_reload.py`) had also never been written — the verb was
+in the vocabulary, documented and tested, with no context wiring it to anything.
+The third was the quarantine handler: a bus subscription plus every kernel
+registry, held so the watcher could unload a condemned plugin. Neither half was
+ever the watcher's: the supervisor decides, the kernel unloads. So the supervisor
+now reports condemned paths (`quarantined_plugins`) and the watcher's tick reads
+them like any other fact.
+
+What is left of that service is a diff over mtimes. Two behaviour changes worth
+knowing: polling replaces inotify (a change lands within a tick or two rather
+than instantly — acceptable, since the `Observer` *was* capability #2), and a
+change must hold still for one tick before it loads, which is the polling
+spelling of the old one-second event debounce. An editor's save is not atomic,
+and importing a half-written file registers a plugin that never existed.
+
+It also forced `ReloadPlugin`'s tier derivation to be *implemented* rather than
+merely promised: the docstring always said the danger is derived from the
+declarations of the plugin being loaded, but `effective_tier` only handled
+`CallTool`, so every reload was a flat egress. That is fine until a hot-reloader
+issues one — then either every file save prompts, or the reload is refused
+wherever nobody is attended. `plugin_danger_tier` reads the target's
+declarations by **parsing** it, never importing it (deciding whether it is safe
+to execute a file must not require executing it), and falls back to the target's
+**provenance**: reloading reviewed bytes is the code that was already running,
+running again, not a new authority.
+
+The timekeeper's channels are the one wrinkle. A scheduler cannot write `declared_channels`
 as a literal because jobs are configured, so it names a `channels_view` the
 kernel resolves (`CHANNEL_VIEWS` in `runtime/service_ticker.py`). Data, not a
 callable — handing the kernel a callable to ask would be capability #5 — and a

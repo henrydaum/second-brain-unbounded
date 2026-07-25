@@ -123,6 +123,27 @@ class PluginHealth:
             self._strikes.pop(key, None)
             self._quarantined.discard(key)
 
+    def quarantined(self) -> list[str]:
+        """Source paths the breaker has condemned but that may still be loaded.
+
+        Read by the plugin watcher's tick (through the ``quarantined_plugins``
+        inventory view) so it can issue the ``ReloadPlugin`` unload. The bus
+        event stays — other consumers may care — but the *unloading* no longer
+        needs a subscriber holding live registries, which was one of the two
+        capabilities that kept the watcher on the always-trusted list.
+
+        Deliberately not a drain: this reports condemned state rather than
+        consuming it, so a reader that crashes mid-unload does not lose the
+        condemnation, and ``clear`` (called on every reload) is the one thing
+        that empties it."""
+        with self._lock:
+            return sorted(self._quarantined)
+
+    def is_quarantined(self, key: str) -> bool:
+        """Whether this source path stands condemned."""
+        with self._lock:
+            return key in self._quarantined
+
 
 def run_supervised(fn: Callable[[], Any], *, timeout: float, plugin_key: str,
                    kind: str, name: str = "", eligible: bool = True) -> SupervisedResult:

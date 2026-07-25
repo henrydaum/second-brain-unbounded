@@ -129,6 +129,71 @@ def tool_danger_tier(name: str, tools: dict, *, _seen: frozenset[str] = frozense
     return tier
 
 
+def plugin_danger_tier(path: str, trusted: bool = False) -> str:
+    """How dangerous is it to load the plugin at ``path``? Its own derived tier.
+
+    ``ReloadPlugin``'s docstring has always promised this: "what it actually
+    costs is graded at fulfilment, the same way a bus emit is — the interpreter
+    derives the danger from the declarations of the plugin being loaded, so
+    reloading a read-only tool need not interrupt anyone while reloading an
+    egress-tier one does." This is that promise, implemented. Without it every
+    hot-reload is a flat egress, which means the hot-reload path either prompts
+    on every file save or is denied outright wherever nobody is attended.
+
+    The declarations are read by **parsing** the file, never by importing it —
+    the same rule ``package_manager`` follows for dependency metadata, and for
+    the same reason: deciding whether it is safe to execute a file must not
+    require executing it.
+
+    Fails **closed** in every uncertain case: an unreadable file, a syntax
+    error, a plugin still on the legacy contract, or a declaration built from
+    anything other than a literal list of strings all grade egress. A legacy
+    plugin genuinely has unbounded reach — that is what being unconverted means —
+    so this is an accurate answer rather than a conservative one.
+
+    ``trusted`` is the target's **provenance** (built-in, or bytes registered in
+    ``trusted_plugins.txt``), and it is the exception to that last paragraph.
+    Reloading reviewed bytes is not the acquisition of a new authority — it is
+    the code that was already running, running again — so an undeclared trusted
+    plugin grades ``read`` rather than egress. Without this, editing any legacy
+    kernel plugin would prompt for approval on every save, which is friction
+    with nothing behind it: the file was already loaded and already trusted.
+    Note trust binds to bytes, so an *edited* untrusted plugin is not trusted and
+    is graded on its declarations as usual.
+    """
+    import ast
+
+    from effects.vocabulary import TIER_EGRESS, TIER_READ
+
+    try:
+        tree = ast.parse(open(path, encoding="utf-8").read())
+    except (OSError, SyntaxError, ValueError):
+        return TIER_READ if trusted else TIER_EGRESS
+
+    contract, declared = None, None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        if target.id == "contract" and isinstance(node.value, ast.Constant):
+            contract = node.value.value
+        elif target.id == "declared_requests" and isinstance(node.value, ast.List):
+            values = [e.value for e in node.value.elts if isinstance(e, ast.Constant)]
+            if len(values) != len(node.value.elts) or not all(isinstance(v, str) for v in values):
+                declared = None         # a computed declaration is not a declaration
+                break
+            declared = values
+
+    if contract != "effects" or declared is None:
+        return TIER_READ if trusted else TIER_EGRESS
+    try:
+        return derive_tier(declared)
+    except ValueError:
+        return TIER_EGRESS              # an unknown tag is not a smaller claim
+
+
 # ── who is asking ────────────────────────────────────────────────────────
 #
 # Tier answers "how dangerous is this operation?" and is a property of the

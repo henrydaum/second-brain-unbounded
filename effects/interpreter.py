@@ -99,6 +99,7 @@ _MAX_EGRESS_BYTES = 200_000
 INVENTORY_VIEWS: frozenset[str] = frozenset({
     "commands", "tools", "tasks", "services", "frontends", "session_state",
     "packages", "pipeline", "settings", "llm_backends", "scheduled_jobs",
+    "quarantined_plugins",
 })
 
 # Tables a sandboxed request may never touch, by identifier. ``users`` is the
@@ -334,6 +335,11 @@ class EffectContext:
     # these is testable without a live system. ``None`` means administration is
     # unavailable and such a request fails rather than silently doing nothing.
     administer: Callable[[Request], Any] | None = None
+    # Whether a *path* holds reviewed bytes: (path) -> bool. Used only to grade
+    # a ReloadPlugin, where the target's provenance — not the caller's — is what
+    # says whether loading it is a new authority. ``None`` means every target is
+    # treated as unreviewed, which is the fail-closed reading.
+    path_trusted: Callable[[str], bool] | None = None
     # Mutates the kernel's scheduled-job table: (request) -> (value, undo). The
     # undo half is not optional — ScheduleOp is graded *write*, and a write tier
     # whose handler cannot reverse itself is the tier lying about what it is.
@@ -490,6 +496,14 @@ class Interpreter:
         if isinstance(request, CallTool):
             from effects.declarations import tool_danger_tier
             return tool_danger_tier(request.name, self.ctx.tools or {})
+        if isinstance(request, ReloadPlugin):
+            # Same borrowing, one step further out: the thing being named is a
+            # file that declares its own requests, so what loading it costs is
+            # what that plugin can do. Unloading only removes reach, so it is
+            # never worse than the plugin's own tier either.
+            from effects.declarations import plugin_danger_tier
+            trusted = bool(self.ctx.path_trusted and self.ctx.path_trusted(request.path))
+            return plugin_danger_tier(request.path, trusted=trusted)
         return request.tier
 
     def _needs_gate(self, request: Request) -> bool:

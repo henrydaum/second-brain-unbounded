@@ -44,6 +44,15 @@ def egress_target(request) -> str:
     return request.type
 
 
+def _path_trusted(path: str) -> bool:
+    """Whether a path holds reviewed bytes. Grades a ``ReloadPlugin`` target."""
+    try:
+        from plugins.helpers.plugin_paths import is_trusted
+        return bool(is_trusted(path))
+    except Exception:  # noqa: BLE001 — unknowable provenance is untrusted
+        return False
+
+
 class EffectsContract:
     """Mixin: makes a plugin class runnable as a pure body over typed requests."""
 
@@ -226,6 +235,8 @@ class EffectsContract:
             administer=getattr(context, "administer", None),
             inventory=self._inventory(context),
             schedule=self._schedule(context),
+            reload_plugin=self._reload_plugin(context),
+            path_trusted=_path_trusted,
             call_tool=self._call_tool(context),
             read_conversations=self._read_conversations(context),
             tools=getattr(getattr(context, "tool_registry", None), "tools", None),
@@ -334,6 +345,14 @@ class EffectsContract:
                 out["skills_roots"] = roots
         except Exception:  # noqa: BLE001 — skills package may be absent
             pass
+        try:
+            # Where plugin files live, so a body can watch them without holding
+            # the path config. Locations, not contents — the same class of fact
+            # as ``root`` and ``data``.
+            from plugins.helpers.plugin_paths import iter_plugin_dirs
+            out["plugin_dirs"] = sorted({str(d) for _t, d in iter_plugin_dirs()})
+        except Exception:  # noqa: BLE001
+            pass
         return out
 
     def _session(self, context):
@@ -373,6 +392,16 @@ class EffectsContract:
         prompt already knows it."""
         from plugins.helpers.inventory import build_inventory
         return build_inventory(context)
+
+    def _reload_plugin(self, context):
+        """Wire ``ReloadPlugin`` to the kernel's loader.
+
+        Egress tier, so every use passes the approval gate on the way through —
+        which is what makes wiring it for every family safe rather than reckless.
+        The plugin names a path; the kernel owns the registries, infers the
+        family, refuses non-plugin files, and does the surrounding rewiring."""
+        from plugins.helpers.plugin_reload import build_reload_plugin
+        return build_reload_plugin(context)
 
     def _schedule(self, context):
         """Wire ``ScheduleOp`` to the kernel's job store.

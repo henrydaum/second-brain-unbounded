@@ -6,6 +6,7 @@ clean-run / clear resets.
 """
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -101,31 +102,55 @@ def test_clean_run_resets_the_window():
         unsub()
 
 
-def test_watcher_unloads_on_quarantine_event(monkeypatch):
-    """End-to-end: a quarantine request makes the watcher unload + notify."""
-    import plugins.services.service_plugin_watcher as watcher_mod
+def test_quarantine_is_reported_when_the_unload_lands(tmp_path, monkeypatch):
+    """Quarantine used to be a bus subscription on the watcher, which meant that
+    service held a subscription *and* every kernel registry — two of the three
+    capabilities keeping it permanently trusted. Now the supervisor condemns, the
+    watcher reads the condemned set on its next tick, and the kernel's reload
+    surface does the unload and reports it as a quarantine rather than as an
+    ordinary deregistration."""
     from events.event_channels import CHAT_MESSAGE_PUSHED, PLUGIN_QUARANTINED
+    from plugins.helpers.plugin_reload import build_reload_plugin
+    import plugins.helpers.plugin_paths as paths
 
-    calls = {}
-    monkeypatch.setattr(watcher_mod, "unload_plugin",
-                        lambda *a, **k: calls.update(args=a, kwargs=k))
+    supervisor.configure({"plugin_supervisor": True})
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    path = tools / "tool_bad.py"
+    path.write_text("x", encoding="utf-8")
+    key = str(path.resolve())
 
-    svc = watcher_mod.PluginWatcherService({})
+    config = dict(paths.PLUGIN_CONFIG)
+    root = paths.PluginRoot("test", tmp_path, "test_plugins")
+    config["tool"] = (paths.PluginDir(root, "tool", "tools", "tool_"),)
+    monkeypatch.setattr(paths, "PLUGIN_CONFIG", config)
+    monkeypatch.setattr("plugins.plugin_discovery.unload_plugin", lambda *a, **k: None)
+    monkeypatch.setattr("plugins.helpers.plugin_reload._reconcile_config", lambda _c: None)
+
+    # Trip the breaker for real, so the condemned set is set the way it is in life.
+    def boom():
+        raise RuntimeError("crash")
+    for _ in range(3):
+        run_supervised(boom, timeout=5, plugin_key=key, kind="tool",
+                       name="bad", eligible=True)
+    assert supervisor.health.is_quarantined(key)
+    assert key in supervisor.health.quarantined()
+
     notices, done = [], []
     unsub_notice = bus.subscribe(CHAT_MESSAGE_PUSHED, lambda p: notices.append(p))
     unsub_done = bus.subscribe(PLUGIN_QUARANTINED, lambda p: done.append(p))
     try:
-        svc._on_quarantine({
-            "plugin_type": "tool", "source_path": "k/bad",
-            "name": "bad", "reason": "crash x2",
-        })
-        assert calls["kwargs"]["source_path"] == "k/bad"
-        assert calls["args"][0] == "tool"
-        assert any("bad" in n["message"] for n in notices)
-        assert done and done[0]["name"] == "bad"
+        ctx = SimpleNamespace(config={}, services={}, tool_registry=None,
+                              orchestrator=None, command_registry=None, runtime=None)
+        result = build_reload_plugin(ctx)(key, "unload")
+
+        assert result["quarantined"] is True
+        assert any("Quarantined" in n["message"] for n in notices)
+        assert done and done[0]["source_path"] == key
     finally:
         unsub_notice()
         unsub_done()
+        supervisor.health.clear(key)
 
 
 def test_disabled_supervisor_does_not_quarantine():
