@@ -218,47 +218,78 @@ registry" is never evidence of anything.
 ## What requires the always-trusted exception
 
 The goal is that a plugin's security level is **not** a per-plugin judgement.
-Almost everything is sandboxable, and the few exceptions should be nameable in
-one page — otherwise "is this safe?" becomes a case-by-case argument, which is
+Almost everything is sandboxable, and the exceptions should be nameable in one
+page — otherwise "is this safe?" becomes a case-by-case argument, which is
 exactly what this design exists to avoid.
 
-So the exception is defined by **capability, not by plugin**. A plugin needs the
-always-trusted exception if, and only if, it needs one of these five things.
-Everything else is sandboxable, whatever family it belongs to.
+So the exception is defined by **capability, not by plugin**. Crucially, this is
+a list of **debt, not of laws**: only one entry is irreducible. The rest are
+things we have not yet inverted, each with a known exit. An earlier version of
+this section claimed all five were impossible; that was wrong, and the two
+already retired are the proof.
 
-| # | Capability | Why it cannot cross | Examples |
+| # | Capability | Status | Exit |
 |---|---|---|---|
-| 1 | **Hold a live handle across calls** — a socket, file descriptor, database cursor, GPU context | The handle *is* the authority. Serialising it either fails or copies the authority, and a request-per-operation would be a different program. | `service_llm` (provider sockets, API keys) |
-| 2 | **Own a thread or event loop** | Its work happens between calls, not during one; there is no body for the driver to drive. | `service_timekeeper`, frontend transports |
-| 3 | **Mutate kernel registries** — register tools, load plugins, rebuild the task graph | Its whole purpose is changing what the kernel *is*. Mediating that would mean a request per registry mutation, i.e. re-implementing the kernel behind the wire. | `service_plugin_watcher`, `package_manager` |
-| 4 | **Be called back synchronously by the kernel mid-operation** — streaming deltas, `proceed` escorts | A generator yields *outward*; it cannot also be re-entered inward from the kernel partway through. | `on_delta` streaming, `model_call` hook escorts |
-| 5 | **Hand the kernel a live callable or object it will execute** — a validator, a hook function, a parser | The kernel would be running plugin code with the kernel's own authority, so the boundary never applies. | `parser_registry` (function registry), form `validator`s |
+| 1 | **Hold a secret** — API keys, credentials | **irreducible** | none. See below. |
+| 2 | **Own a thread or event loop** | **retired** | kernel-driven `tick` + `declared_channels` (`runtime/service_ticker.py`) |
+| 3 | **Mutate kernel registries** — register tools, load plugins | open | registry-mutation verbs (`RegisterTool`, `ReloadPlugin`), graded against the bar. More mediated than today, where the watcher mutates registries with no audit trail. |
+| 4 | **Be called back mid-operation** — streaming, `proceed` escorts | open | invert to yield/resume: an escort `yield`s `Proceed()` and reads the response as the resume value; streaming yields chunks outward. |
+| 5 | **Hand the kernel a live callable** — a parser function, a validator | open | declare, don't hand over: a parser declares the extensions it handles as *data* and the kernel dispatches to it through the boundary. Blocked on parsers being helper modules rather than plugins, and on heavy parsers returning live PIL/numpy/`av` objects — which is really #1 in disguise, and whose own fix is to return a path instead of an object. |
 
-**What this costs the agent.** An agent-authored plugin cannot do any of the
-five. Concretely, the agent cannot write: an LLM backend, a frontend transport,
-a scheduler, a hot-reloader, a parser that registers a function, or anything that
-streams. It *can* write tools, commands, tasks, ordinary services, and the
-render/parse half of a frontend — which is nearly everything worth writing.
+Note what retiring #2 required, because it generalises: **the plugin stopped
+owning the loop, and stopped touching the resource.** It is ticked rather than
+looping, and it *returns* the events it wants fired rather than emitting them.
+Both halves are the same move — never hand the plugin the live thing — and it is
+the same move as a command returning a form spec instead of live `FormStep`s. #3,
+#4 and #5 are all waiting on that same inversion, applied to registries,
+callbacks and parsers.
 
-That is the trade, stated plainly: **the agent gets to write anything whose work
-is expressible as "compute, then ask the kernel to act".** The five exceptions
-are all cases where the plugin *is* infrastructure rather than a user of it.
+### Why holding a secret is the one irreducible case
 
-**The current exception list** (every entry justified by a numbered capability
-above — an entry that cannot cite one is a bug, not an exception):
+Every other capability is about *operations*, and operations are what this
+boundary mediates. A secret is different: its entire value is confidentiality,
+which is a property of **content**. And content is exactly what the design
+refuses to judge — the Rice's-theorem dodge that makes everything else work is
+also what blinds it here.
+
+Concretely, once a key is a string in a plugin's memory, every channel the plugin
+legitimately holds becomes an exfiltration path:
+
+```python
+yield Respond(summary=api_key)               # read tier, ungated
+yield Complete(prompt=f"...{api_key}")       # to the model provider
+yield WriteFile(path="notes.md", content=api_key)
+```
+
+None of those is a violation. The plugin is doing exactly what it declared. So
+the rule is **use a capability without holding it**: the plugin asks for a
+completion, the kernel attaches the key. What you never possess, you cannot leak.
+
+This is narrow. It covers credentials only — which is why `service_llm` is the
+sole permanent exception, and only its key-handling half.
+
+**What this costs the agent**, today: it cannot write an LLM backend, a
+hot-reloader, a parser that registers a function, or anything that streams. It
+*can* write tools, commands, tasks, ordinary services (including periodic ones),
+and the render half of a frontend. As #3–#5 are retired that list shrinks toward
+credentials alone.
+
+**The current exception list** (every entry cites a capability — an entry that
+cannot is a bug, not an exception):
 
 | Component | Capability |
 |---|---|
 | `service_llm` + LLM backends | 1, 4 |
-| `service_plugin_watcher` | 2, 3 |
-| `service_timekeeper` | 2 |
+| `service_plugin_watcher` | 3 |
+| `service_timekeeper` | — *(retired: kept trusted only because it is built-in, not because it must be)* |
 | `parser_registry` / `service_parser` | 5 |
 | frontend transports (`start`/`stop`, sockets) | 1, 2 |
 | `package_manager` | 3 |
 
-This list is closed, and growing it requires citing one of the five. A test
+This list is closed, and growing it requires citing a capability. A test
 enumerates plugins still on the imperative contract and fails if it exceeds this
-set, so the exception cannot expand quietly.
+set, so the exception cannot expand quietly — and the numbers above are what it
+should shrink by.
 
 ---
 
