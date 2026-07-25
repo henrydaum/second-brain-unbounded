@@ -71,6 +71,17 @@ class ToolRegistry:
         """
         session_key = kwargs.pop("_session_key", None)
         user_initiated = bool(kwargs.pop("_user_initiated", False))
+        # Who is already running above this call. Passed in by a plugin invoking
+        # a tool through CallTool; empty for a top-level call from the agent or a
+        # frontend. The effects interpreter uses it to refuse cycles, and it only
+        # works because it is threaded across the hop rather than rebuilt here.
+        call_chain = tuple(kwargs.pop("_call_chain", ()) or ())
+        if tool_name in call_chain:
+            # Belt and braces: the interpreter refuses this before the call is
+            # placed, but a legacy-contract tool reaching call_tool directly
+            # never passes through the interpreter, so the registry checks too.
+            chain = " -> ".join([*call_chain, tool_name])
+            return ToolResult.failed(f"Refusing recursive tool call: {chain}")
         with self._lock:
             tool = self.tools.get(tool_name)
         if tool is None:
@@ -120,7 +131,8 @@ class ToolRegistry:
                                 runtime=self.runtime,
                                 session_key=session_key,
                                 user_initiated=user_initiated,
-                                current_tool_name=tool_name)
+                                current_tool_name=tool_name,
+                                call_chain=call_chain)
 
         t0 = time.time()
 

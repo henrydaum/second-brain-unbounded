@@ -44,6 +44,14 @@ class Request:
 
     type: ClassVar[str] = ""
     tier: ClassVar[str] = TIER_READ
+    # True when ``tier`` above is only a floor, and the real grade is computed at
+    # fulfilment from whatever this request names (a tool's declarations, a
+    # plugin file's declarations). Declared as data rather than left to the
+    # docstring because the docstring is a promise the code has to keep, and
+    # ``ReloadPlugin`` documented a borrowed tier for months while
+    # ``effective_tier`` silently graded it at the floor. A test pins the two
+    # against each other.
+    borrows_tier: ClassVar[bool] = False
 
     def to_wire(self) -> dict[str, Any]:
         """Serialize to tagged JSON-ready dict: ``{"type": tag, <fields>}``."""
@@ -302,6 +310,7 @@ class ReloadPlugin(Request):
 
     type: ClassVar[str] = "reload_plugin"
     tier: ClassVar[str] = TIER_EGRESS
+    borrows_tier: ClassVar[bool] = True
     path: str
     action: str = "reload"      # "reload" | "unload"
 
@@ -548,6 +557,7 @@ class CallTool(Request):
 
     type: ClassVar[str] = "call_tool"
     tier: ClassVar[str] = TIER_EGRESS
+    borrows_tier: ClassVar[bool] = True
     name: str
     params: dict[str, Any] | None = None
 

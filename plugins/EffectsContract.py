@@ -246,6 +246,7 @@ class EffectsContract:
             # never inferred from what family this plugin belongs to, so a
             # command reached through a bridge keeps the caller's principal
             # rather than being promoted to "user" for being a command.
+            call_chain=self._call_chain(context),
             principal=getattr(context, "principal", None) or PRINCIPAL_AGENT,
             plugin_trusted=self.provenance_trusted(),
             gate_model_calls_after_read=bool(
@@ -393,6 +394,17 @@ class EffectsContract:
         from plugins.helpers.inventory import build_inventory
         return build_inventory(context)
 
+    def _call_chain(self, context) -> tuple:
+        """Who is running, outermost first, including this plugin.
+
+        Including *self* is what makes a direct self-call refusable. If the chain
+        only listed callers, a tool calling itself would find its own name absent
+        from an empty chain, be allowed once, and only be caught on the second
+        hop — bounded, but not what "a tool may not call itself" says."""
+        inherited = tuple(getattr(context, "call_chain", None) or ())
+        name = getattr(self, "name", "") or ""
+        return inherited + (name,) if name else inherited
+
     def _reload_plugin(self, context):
         """Wire ``ReloadPlugin`` to the kernel's loader.
 
@@ -428,13 +440,22 @@ class EffectsContract:
 
         user_initiated = getattr(context, "principal", None) == PRINCIPAL_USER
 
+        chain = self._call_chain(context)
+
         def call(name: str, params: dict):
             """Invoke one registered tool and return its result as plain data."""
             result = registry.call(
                 name, _session_key=getattr(context, "session_key", None),
-                _user_initiated=user_initiated, **(params or {}))
+                _user_initiated=user_initiated, _call_chain=chain,
+                **(params or {}))
+            # ``llm_summary`` is what a ToolResult actually calls its summary;
+            # reading ``summary`` returned "" from every CallTool ever made,
+            # silently dropping the one thing the caller most needs. ``summary``
+            # stays as a fallback for duck-typed results from test doubles.
+            summary = (getattr(result, "llm_summary", None)
+                       or getattr(result, "summary", None) or "")
             return {"success": bool(getattr(result, "success", True)),
-                    "summary": getattr(result, "summary", "") or "",
+                    "summary": summary,
                     "data": getattr(result, "data", None),
                     "error": getattr(result, "error", "") or ""}
 

@@ -71,6 +71,12 @@ class SecondBrainContext:
     # Carries out an administration request. Wired by the kernel; handed to the
     # interpreter so the effects layer never imports config/package machinery.
     administer: Any = None
+    # Plugin names already on the call stack, outermost first. Travels the same
+    # way ``principal`` does — a caller propagates it rather than minting a fresh
+    # one — because it only means anything if it survives the hop. The effects
+    # interpreter reads it to refuse a tool that would call itself through a
+    # cycle; an empty tuple means "nothing is running above me".
+    call_chain: tuple = ()
 
 
 def build_context(db, config: dict, services: dict, call_tool=None,
@@ -79,7 +85,8 @@ def build_context(db, config: dict, services: dict, call_tool=None,
                    root_dir=None, command_registry=None,
                    session_key: str | None = None,
                    user_initiated: bool = False,
-                   current_tool_name: str | None = None) -> SecondBrainContext:
+                   current_tool_name: str | None = None,
+                   call_chain: tuple = ()) -> SecondBrainContext:
     """
     Build a fully wired runtime context.
 
@@ -98,6 +105,12 @@ def build_context(db, config: dict, services: dict, call_tool=None,
         """Call tool with session."""
         if session_key and "_session_key" not in kwargs:
             kwargs["_session_key"] = session_key
+        if "_call_chain" not in kwargs:
+            # The legacy tool-to-tool path needs the same cycle protection as
+            # CallTool. Appending the caller here is what makes a self-call
+            # refusable rather than merely bounded.
+            chain = tuple(call_chain or ())
+            kwargs["_call_chain"] = chain + (current_tool_name,) if current_tool_name else chain
         return call_tool(name, **kwargs)
 
     # Resolve the effective user from the live session (frontend-bound, ephemeral).
@@ -180,5 +193,6 @@ def build_context(db, config: dict, services: dict, call_tool=None,
         user_initiated=user_initiated,
         current_tool_name=current_tool_name,
         principal=PRINCIPAL_USER if user_initiated else PRINCIPAL_AGENT,
+        call_chain=tuple(call_chain or ()),
     )
     return ctx
