@@ -38,14 +38,67 @@ MIN_INTERVAL_S = 0.5
 TICK_TIMEOUT_S = 30.0
 
 
+def channel_danger_tier(channel: str, tasks: dict, *, _seen: set | None = None) -> str:
+    """How dangerous is it to fire ``channel``? Derived from what it triggers.
+
+    Emitting is not dangerous in itself — it is dangerous exactly in proportion
+    to what listens. A channel whose only subscriber reads files is a read; a
+    channel that starts a task which posts to an API is an egress. So the tier of
+    an emit is not a judgement call about the channel's *name*, it is the maximum
+    derived tier of every task subscribed to it.
+
+    That keeps the "derive, never assert" rule intact, just applied transitively:
+    tasks already declare their requests, and their tiers already fall out of
+    those declarations. Nothing new is asserted anywhere.
+
+    Transitive by design — a triggered task may itself declare channels, so the
+    walk follows them. ``_seen`` breaks cycles (A triggers B triggers A), which
+    resolve to the highest tier found along the way rather than recursing.
+
+    Honest limit: this is only as good as the declaration chain. A task that
+    reaches further than it declared is already a hard reject at the interpreter,
+    so the chain cannot silently under-report — but a channel with *no*
+    subscribers is genuinely read tier, and becomes more dangerous the moment
+    something subscribes. It is computed per emit for that reason, never cached.
+    """
+    from effects.vocabulary import TIER_ORDER, TIER_READ
+
+    seen = _seen if _seen is not None else set()
+    if channel in seen:
+        return TIER_READ          # cycle: this arm contributes nothing further
+    seen.add(channel)
+
+    tier = TIER_READ
+    for task in (tasks or {}).values():
+        if channel not in (getattr(task, "trigger_channels", None) or []):
+            continue
+        candidate = getattr(task, "danger_tier", TIER_READ)
+        if TIER_ORDER.get(candidate, 0) > TIER_ORDER[tier]:
+            tier = candidate
+        # A task that itself emits extends the blast radius.
+        for onward in (getattr(task, "declared_channels", None) or []):
+            downstream = channel_danger_tier(onward, tasks, _seen=seen)
+            if TIER_ORDER.get(downstream, 0) > TIER_ORDER[tier]:
+                tier = downstream
+    return tier
+
+
 class ServiceTicker:
     """Calls ``tick`` on services that asked to be ticked, on one shared thread."""
 
-    def __init__(self, services: dict, context_factory, poll_interval_s: float = 0.5):
-        """Bind to the live service registry and a factory for call contexts."""
+    def __init__(self, services: dict, context_factory, poll_interval_s: float = 0.5,
+                 tasks: dict | None = None, approve=None):
+        """Bind to the live service registry and a factory for call contexts.
+
+        ``tasks`` is the orchestrator's task registry, used to derive how
+        dangerous each emit is from what subscribes to it. ``approve(target,
+        justification) -> bool`` gates the emits that turn out to be egress
+        tier; without one, an egress-tier emit is refused rather than fired."""
         self._services = services
         self._context_factory = context_factory
         self._poll_interval_s = poll_interval_s
+        self._tasks = tasks if tasks is not None else {}
+        self._approve = approve
         self._due: dict[str, float] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -130,7 +183,35 @@ class ServiceTicker:
                     "service %r tried to emit on undeclared channel %r; declared: %s",
                     name, channel, sorted(allowed) or "none")
                 continue
+            if not self._permitted(name, channel):
+                continue
             try:
                 bus.emit(channel, event.get("payload") or {})
             except Exception:  # noqa: BLE001 — a subscriber's fault, not the ticker's
                 logger.exception("emitting %r for service %r failed", channel, name)
+
+    def _permitted(self, name: str, channel: str) -> bool:
+        """Whether firing ``channel`` is allowed, given what it triggers.
+
+        Read and write tiers fire silently: a write-tier task is journalled and
+        reversible, which is the property that makes it safe to run unattended.
+        Egress is different — it is irreversible by definition — so it is gated
+        the same way a direct egress request would be. The prompt names the
+        channel and the reason it is dangerous, since "allow this scheduled job"
+        is only answerable if you know what the job will reach."""
+        from effects.vocabulary import TIER_EGRESS
+
+        tier = channel_danger_tier(channel, self._tasks)
+        if tier != TIER_EGRESS:
+            return True
+        if self._approve is None:
+            logger.warning(
+                "service %r: refusing to emit %r (egress tier) with no approval surface",
+                name, channel)
+            return False
+        triggered = sorted(
+            t.name for t in (self._tasks or {}).values()
+            if channel in (getattr(t, "trigger_channels", None) or []))
+        return bool(self._approve(
+            f"emit {channel}",
+            f"scheduled job from service {name!r} triggers: {', '.join(triggered) or 'unknown'}"))

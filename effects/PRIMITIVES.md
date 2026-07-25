@@ -76,6 +76,17 @@ Apply, in order:
    domain. A genuinely new domain should be roughly never.
 4. **Tier by structure.** Journalable? → write. Anything crossing to an
    uncontrolled party (or irreversible)? → egress. Neither? → read.
+   **Where a request's danger depends on what it triggers, derive it
+   transitively rather than guessing.** Firing a bus channel is the worked
+   example: emitting is not dangerous in itself, it is dangerous exactly in
+   proportion to what listens, so the tier of an emit is the maximum derived
+   tier of every task subscribed to it — following onward emits, and resolving
+   cycles to the highest tier found (`runtime/service_ticker.channel_danger_tier`).
+   A channel whose only subscriber reads files fires silently; one that reaches
+   an HTTP call is gated. Nothing new is asserted anywhere: tasks already
+   declare their requests, and their tiers already fall out of those
+   declarations. This is the answer whenever a verb looks like "it depends" —
+   it does depend, and the dependency is usually computable.
 5. **Batching is not semantics.** A batched variant (`ReadFiles`) exists for
    round-trip economy and inherits its element's tier.
 

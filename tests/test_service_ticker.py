@@ -24,7 +24,7 @@ import time
 from types import SimpleNamespace
 
 from events.event_bus import bus
-from runtime.service_ticker import MIN_INTERVAL_S, ServiceTicker
+from runtime.service_ticker import MIN_INTERVAL_S, ServiceTicker, channel_danger_tier
 
 
 class _Ticked:
@@ -193,3 +193,110 @@ def test_a_raising_service_does_not_stop_the_clock():
 
     assert broken.calls, "the broken service should have been tried"
     assert healthy.calls, "a raising service stopped the clock for others"
+
+
+# ── the tier of an emit is derived from what it triggers ─────────────────
+#
+# Emitting is not dangerous in itself; it is dangerous in proportion to what
+# listens. So the tier is computed from the subscribed tasks' own derived tiers
+# rather than asserted about the channel -- "derive, never assert", applied
+# transitively.
+
+def _task(name, channels, declared, emits=None):
+    from plugins.BaseTask import BaseTask
+
+    cls = type(f"_T{name}", (BaseTask,), {
+        "contract": "effects", "name": name,
+        "trigger_channels": list(channels),
+        "declared_requests": list(declared),
+        "declared_channels": list(emits or []),
+    })
+    return cls()
+
+
+def test_a_channel_with_no_subscribers_is_read_tier():
+    """Nothing listens, so nothing happens."""
+    assert channel_danger_tier("quiet", {}) == "read"
+
+
+def test_a_channel_is_as_dangerous_as_its_most_dangerous_subscriber():
+    """One read-only listener and one that writes makes the emit a write."""
+    tasks = {
+        "reader": _task("reader", ["work"], ["read_file"]),
+        "writer": _task("writer", ["work"], ["write_file"]),
+    }
+
+    assert channel_danger_tier("work", tasks) == "write"
+
+
+def test_a_channel_reaching_egress_is_egress():
+    """A task that posts to an API makes firing its channel irreversible."""
+    tasks = {"poster": _task("poster", ["work"], ["http_request"])}
+
+    assert channel_danger_tier("work", tasks) == "egress"
+
+
+def test_danger_is_traced_through_a_chain_of_emits():
+    """A task that itself emits extends the blast radius, so the walk follows
+    it: an apparently harmless channel is egress if it eventually reaches one."""
+    tasks = {
+        "first": _task("first", ["start"], ["read_file"], emits=["second"]),
+        "sender": _task("sender", ["second"], ["http_request"]),
+    }
+
+    assert channel_danger_tier("start", tasks) == "egress"
+
+
+def test_a_cycle_does_not_recurse_forever():
+    """A triggers B triggers A resolves to the highest tier found, not a hang."""
+    tasks = {
+        "a": _task("a", ["ping"], ["read_file"], emits=["pong"]),
+        "b": _task("b", ["pong"], ["write_file"], emits=["ping"]),
+    }
+
+    assert channel_danger_tier("ping", tasks) == "write"
+
+
+def test_a_dangerous_emit_is_gated():
+    """Egress-tier emits route through approval, naming what they trigger."""
+    asked = []
+    tasks = {"poster": _task("poster", ["jobs.fired"], ["http_request"])}
+    got, unsub = _capture("jobs.fired")
+    service = _Ticked()
+    ticker = ServiceTicker({"ticked": service}, lambda n: SimpleNamespace(name=n),
+                           poll_interval_s=0.01, tasks=tasks,
+                           approve=lambda t, j: asked.append((t, j)) or False)
+    ticker.start()
+    try:
+        time.sleep(MIN_INTERVAL_S * 1.6)
+    finally:
+        ticker.stop()
+        unsub()
+
+    assert asked, "an egress-tier emit was not gated"
+    assert "jobs.fired" in asked[0][0]
+    assert "poster" in asked[0][1]
+    assert got == [], "a denied emit still fired"
+
+
+def test_a_harmless_emit_is_not_gated():
+    """A channel whose subscribers only read fires silently -- the control is
+    proportional, not a blanket tax on scheduling."""
+    asked = []
+    tasks = {"reader": _task("reader", ["jobs.fired"], ["read_file"])}
+    got, unsub = _capture("jobs.fired")
+    service = _Ticked()
+    ticker = ServiceTicker({"ticked": service}, lambda n: SimpleNamespace(name=n),
+                           poll_interval_s=0.01, tasks=tasks,
+                           approve=lambda t, j: asked.append((t, j)) or True)
+    ticker.start()
+    try:
+        deadline = time.monotonic() + 3.0
+        while not got and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        ticker.stop()
+        unsub()
+
+    assert got, "a harmless emit did not fire"
+    assert asked == [], "a harmless emit was gated"
