@@ -67,6 +67,7 @@ def run_sandbox_tool(
     cpu_seconds: int = DEFAULT_CPU_SECONDS,
     journal: TurnJournal | None = None,
     cancel_event: threading.Event | None = None,
+    method: str = "run",
 ) -> SandboxOutcome:
     """Run one sandboxed tool. Returns a :class:`SandboxOutcome`.
 
@@ -82,7 +83,7 @@ def run_sandbox_tool(
     interp = Interpreter(effect_ctx, declared, journal=journal)
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
-        json.dump({"code": source, "params": dict(params or {}),
+        json.dump({"code": source, "params": dict(params or {}), "method": method,
                    "memory_mb": int(memory_mb), "cpu_seconds": int(cpu_seconds)}, f)
         job_path = f.name
 

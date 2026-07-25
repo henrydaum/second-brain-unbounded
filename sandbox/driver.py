@@ -71,7 +71,7 @@ def as_final(value) -> dict:
     return {"type": "respond", "summary": str(value), "data": value, "success": True, "error": ""}
 
 
-def drive(instance, params: dict, fulfil: Callable[[dict], dict]) -> dict:
+def drive(instance, params: dict, fulfil: Callable[[dict], dict], method: str = "run") -> dict:
     """Drive one plugin body to completion. Returns the final ``Respond`` wire.
 
     ``fulfil`` receives a request wire dict and returns an effect-result wire
@@ -79,10 +79,18 @@ def drive(instance, params: dict, fulfil: Callable[[dict], dict]) -> dict:
     supported and never calls ``fulfil`` — that is a legitimate pure plugin, not
     an error.
 
+    ``method`` names the body to drive. It is almost always ``run``, but some
+    families have a second entry point that also needs effects — a command's
+    ``form`` must be able to read the world to build its choices — and those
+    travel the same path rather than getting a privileged side channel.
+
     A ``respond`` yielded mid-stream ends the run without being fulfilled: it is
     the terminal request, not an effect.
     """
-    result = instance.run(params)
+    body = getattr(instance, method, None)
+    if body is None:
+        raise RuntimeError(f"plugin has no {method!r} method")
+    result = body(params)
     if not hasattr(result, "send"):
         return as_final(result)
 

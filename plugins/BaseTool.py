@@ -24,21 +24,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from plugins.EffectsContract import EffectsContract
+
 logger = logging.getLogger("Tool")
-
-
-def _egress_target(request) -> str:
-    """A one-line, human-legible description of an egress request for approval."""
-    if request.type == "http_request":
-        return f"{getattr(request, 'method', '')} {getattr(request, 'url', '')}".strip()
-    if request.type == "exec_sql":
-        return getattr(request, "sql", "")
-    if request.type == "run_process":
-        return " ".join(getattr(request, "argv", []) or [])
-    if request.type in ("write_file", "delete_file"):
-        verb = "delete" if request.type == "delete_file" else "write"
-        return f"{verb} {getattr(request, 'path', '')}"
-    return request.type
 
 
 @dataclass(init=False)
@@ -130,7 +118,7 @@ class ToolResult:
         return ToolResult(success=False, error=error)
 
 
-class BaseTool:
+class BaseTool(EffectsContract):
     """
     The contract every tool implements.
 
@@ -165,33 +153,10 @@ class BaseTool:
     the registry does not care which contract a tool implements.
     """
 
-    # --- Execution contract ---
-    contract: str = "legacy"
-
     # --- Identity ---
     name: str = ""
     description: str = ""
     parameters: dict = {}
-
-    # --- Capability declaration (``contract = "effects"`` only) ---
-    # The effect request types this tool may issue. Its danger tier is *derived*
-    # from these (never author-asserted), and an undeclared request at runtime is
-    # a hard reject.
-    declared_requests: list[str] = []
-
-    # How much conversation the tool may read: "full" | "last_k" | "params_only".
-    # The narrower the view, the smaller the trust surface.
-    view: str = "params_only"
-    view_k: int = 6
-
-    # --- Sandbox resource limits (untrusted mode only; enforced by the runner) ---
-    # timeout_s meters the CHILD's own compute wall-clock (the clock stops while
-    # a request sits kernel-side, e.g. on an approval dialog). memory_mb is
-    # enforced by the parent's psutil watchdog everywhere, plus RLIMIT_AS on
-    # Linux and a Job Object on Windows. cpu_seconds sets RLIMIT_CPU on POSIX.
-    timeout_s: float = 30.0
-    memory_mb: int = 512
-    cpu_seconds: int = 30
 
     # --- Service requirements ---
     requires_services: list[str] = []
@@ -226,29 +191,7 @@ class BaseTool:
             value = getattr(cls, attr)
             if isinstance(value, (dict, list)):
                 setattr(cls, attr, value.copy())
-        if cls.contract == "effects":
-            from effects.vocabulary import REQUEST_TYPES
-            unknown = [t for t in cls.declared_requests if t not in REQUEST_TYPES]
-            if unknown:
-                raise TypeError(
-                    f"{cls.__name__}: unknown declared_requests {unknown}; "
-                    f"valid types are {sorted(REQUEST_TYPES)}")
-            if cls.view not in {"full", "last_k", "params_only"}:
-                raise TypeError(
-                    f"{cls.__name__}: view must be full|last_k|params_only, got {cls.view!r}")
-        elif cls.declared_requests:
-            raise TypeError(
-                f"{cls.__name__}: declared_requests is only meaningful with "
-                f'contract = "effects"')
-
-    @property
-    def danger_tier(self) -> str:
-        """The tool's danger tier: the max tier across ``declared_requests``.
-
-        Derived, never asserted — a tool cannot claim to be safer than the
-        requests it declares."""
-        from effects.declarations import derive_tier
-        return derive_tier(self.declared_requests)
+        cls.validate_effects_declaration()
 
     # --- Agent system-prompt contribution ---
     # Static guidance injected into the agent's system prompt when this tool is
@@ -272,46 +215,13 @@ class BaseTool:
     def perform(self, context, **kwargs) -> ToolResult:
         """Run the tool. The single entry point the registry uses.
 
-        For a ``legacy`` tool this is just ``run(context, **kwargs)``. For an
-        ``effects`` tool it builds an :class:`~effects.interpreter.EffectContext`
-        from the live context and hands the body to whichever executor the tool's
-        provenance selects — both of which drive the same generator through the
-        same interpreter, so the mode changes only whether a process boundary
-        exists."""
+        A ``legacy`` tool is just ``run(context, **kwargs)``. An ``effects`` tool
+        goes through the shared boundary in ``EffectsContract``, which picks an
+        executor by provenance; the tool's only family-specific part is mapping
+        the neutral outcome onto a ``ToolResult``."""
         if self.contract != "effects":
             return self.run(context, **kwargs)
-
-        from effects.interpreter import EffectContext
-
-        ectx = EffectContext(
-            db=context.db,
-            llm=(context.services or {}).get("llm"),
-            embedder=(context.services or {}).get("text_embedder"),
-            read_roots=self._read_roots(context),
-            write_roots=self._write_roots(context),
-            free_write_roots=self._free_write_roots(context),
-            paths=self._paths(context),
-            context_provider=self._context_provider(context),
-            egress_gate=self._egress_gate(context),
-            tool_name=self.name,
-            session_key=context.session_key,
-            conversation_id=self._conversation_id(context),
-            user_id=context.user_id,
-        )
-
-        if self.trusted(context):
-            from sandbox.local import run_local_tool
-            outcome = run_local_tool(
-                instance=self, params=kwargs,
-                declared=self.declared_requests, effect_ctx=ectx)
-        else:
-            from sandbox.runner import run_sandbox_tool
-            outcome = run_sandbox_tool(
-                source=self._source_text(), params=kwargs,
-                declared=self.declared_requests, effect_ctx=ectx,
-                timeout=float(context.config.get("tool_timeout", self.timeout_s)),
-                memory_mb=self.memory_mb, cpu_seconds=self.cpu_seconds)
-
+        outcome = self._perform_effects(context, kwargs)
         return ToolResult(
             success=outcome.success,
             error=outcome.error,
@@ -319,148 +229,6 @@ class BaseTool:
             llm_summary=outcome.summary,
             attachment_paths=outcome.attachment_paths,
         )
-
-    def trusted(self, context) -> bool:
-        """Whether this tool runs in-process. Provenance only — never a config
-        flag, and never anything the tool asserts about itself.
-
-        ``sandbox_trust_all`` forces trusted mode for every plugin. It exists for
-        the migration's all-trusted equivalence check and for debugging, not as a
-        deployment mode; it is deliberately global and blunt so it cannot quietly
-        become per-plugin policy."""
-        from plugins.helpers.plugin_paths import is_trusted
-
-        if (context.config or {}).get("sandbox_trust_all"):
-            return True
-        return is_trusted(getattr(self, "_source_path", ""))
-
-    def _source_text(self) -> str:
-        """The tool's own source, read lazily and cached.
-
-        Only the untrusted path needs it (the child is fed source, not an
-        object), so a trusted tool never pays this read."""
-        cached = getattr(self, "_source_cache", None)
-        if cached is not None:
-            return cached
-        from pathlib import Path
-        try:
-            text = Path(getattr(self, "_source_path", "")).read_text(encoding="utf-8")
-        except OSError as e:
-            logger.error("Could not read source for tool %r: %s", self.name, e)
-            text = ""
-        self._source_cache = text
-        return text
-
-    # ── effect-context wiring (effects contract only) ────────────────────
-
-    def _read_roots(self, context):
-        """Roots the tool may read under. Defaults to repo root + DATA_DIR, with
-        the project root first so a relative path resolves against it."""
-        from paths import DATA_DIR
-        roots = context.config.get("sandbox_read_roots")
-        if roots:
-            return [Path(r) for r in roots]
-        base = []
-        if context.root_dir:
-            base.append(Path(context.root_dir))
-        base.append(DATA_DIR)
-        return base
-
-    def _write_roots(self, context):
-        """Outer confinement: where a write is permitted at all (outside → hard
-        reject). Whether a given write needs approval is a separate question —
-        see ``_free_write_roots``."""
-        from paths import DATA_DIR
-        roots = context.config.get("sandbox_write_roots")
-        if roots:
-            return [Path(r) for r in roots]
-        base = []
-        if context.root_dir:
-            base.append(Path(context.root_dir))
-        base.append(DATA_DIR)
-        return base
-
-    def _free_write_roots(self, context):
-        """The subset of write roots needing NO approval — frictionless drafting
-        space. Scratch and the user's memory folder are free; more can be added
-        via ``sandbox_free_write_roots``.
-
-        The sandbox-plugin tree is deliberately **not** free: it is a tree the
-        kernel *interprets*, so an unapproved write into it is a sandbox escape.
-        See the deferred-execution rule in effects/PRIMITIVES.md."""
-        from paths import SCRATCH_DIR
-        free = [SCRATCH_DIR]
-        try:
-            from plugins.helpers.memory_paths import memory_root
-            free.append(memory_root(context.user_id))
-        except Exception:  # noqa: BLE001 — memory package may be absent
-            pass
-        for extra in (context.config.get("sandbox_free_write_roots") or []):
-            free.append(Path(extra))
-        return free
-
-    def _paths(self, context):
-        """Non-secret resolved locations a tool may read via ReadContext("paths").
-
-        Only *where things are* — never config values or keys."""
-        from paths import DATA_DIR
-        out = {"data": str(DATA_DIR), "scratch": str(DATA_DIR / "sandbox_scratch")}
-        if context.root_dir:
-            out["root"] = str(Path(context.root_dir))
-        try:
-            from plugins.helpers.memory_paths import memory_root
-            out["memory_root"] = str(memory_root(context.user_id))
-        except Exception:  # noqa: BLE001 — memory package may be absent; omit the key
-            pass
-        try:
-            from plugins.helpers.plugin_paths import PLUGIN_ROOTS
-            roots = [str(r.path / "skills") for r in PLUGIN_ROOTS
-                     if (r.path / "skills").is_dir()]
-            if roots:
-                out["skills_roots"] = roots
-        except Exception:  # noqa: BLE001 — skills package may be absent; omit the key
-            pass
-        return out
-
-    def _session(self, context):
-        """The live RuntimeSession, if reachable."""
-        runtime = context.runtime
-        if runtime is None or not context.session_key:
-            return None
-        return (getattr(runtime, "sessions", {}) or {}).get(context.session_key)
-
-    def _conversation_id(self, context):
-        """The current conversation id, via the live session if present."""
-        session = self._session(context)
-        return getattr(session, "conversation_id", None) if session else None
-
-    def _context_provider(self, context):
-        """Resolve the tool's declared view against the conversation history."""
-        session = self._session(context)
-
-        def provider(view: str, k: int | None) -> str:
-            if view == "params_only":
-                return ""
-            history = list(getattr(session, "history", []) or [])
-            if view == "last_k":
-                history = history[-(k or self.view_k):]
-            return json.dumps(history, default=str)
-
-        return provider
-
-    def _egress_gate(self, context):
-        """Kernel-served model calls (complete, embed) pass; boundary-crossing
-        actions route through the approval surface with a legible target."""
-        def gate(request):
-            if request.type in ("complete", "embed"):
-                return True, ""
-            approve = context.approve_command
-            if approve is None:
-                return False, "no approval surface available for egress"
-            ok = approve(_egress_target(request), f"tool '{self.name}' {request.type}")
-            return ok, "" if ok else (context.approval_denial_reason or "egress denied by user")
-
-        return gate
 
     def to_schema(self) -> dict:
         """Export the tool as an OpenAI-compatible function schema."""

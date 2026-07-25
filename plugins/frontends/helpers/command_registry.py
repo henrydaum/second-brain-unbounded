@@ -76,7 +76,7 @@ class CommandRegistry:
         if _emit:
             call_id = _emit_started(name, args or {}, session_key)
         try:
-            out = entry.run(dict(args or {}), self.context(session_key))
+            out = entry.perform(dict(args or {}), self.context(session_key))
         except Exception as e:
             logger.exception(f"Command '/{name}' handler raised")
             if _emit:
@@ -92,7 +92,7 @@ class CommandRegistry:
         if not entry:
             return {}
         ctx = self.context(session_key)
-        return parse_command_line(raw, lambda a, c: entry.form(a, c), ctx)
+        return parse_command_line(raw, lambda a, c: entry.form_steps(a, c), ctx)
 
     def all_commands(self) -> list[BaseCommand]:
         """Handle all commands."""
@@ -117,7 +117,7 @@ class CommandRegistry:
             specs[entry.name] = CallableSpec(
                 entry.name,
                 lambda cs, _actor, args, e=entry: self.dispatch_dict(e.name, args, session_key=(cs.cache or {}).get("session_key"), _emit=False),
-                form_factory=lambda args, cs, e=entry: e.form(args, self.context((cs.cache or {}).get("session_key") if cs else None)),
+                form_factory=lambda args, cs, e=entry: e.form_steps(args, self.context((cs.cache or {}).get("session_key") if cs else None)),
                 require_approval=getattr(entry, "require_approval", False),
                 approval_actor_id=getattr(entry, "approval_actor_id", None),
             )
@@ -134,7 +134,7 @@ class CommandRegistry:
         for cat in ordered:
             rows = []
             for cmd in by_cat[cat]:
-                hint = _arg_hint_from_form(cmd.form({}, ctx))
+                hint = _arg_hint_from_form(cmd.form_steps({}, ctx))
                 rows.append(("/" + cmd.name + ((" " + hint) if hint else ""), cmd.description))
             # The blank line before the table matters: without it, markdown
             # parsers fold the table into the heading's paragraph.

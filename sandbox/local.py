@@ -56,6 +56,7 @@ def run_local_tool(
     declared: list[str],
     effect_ctx: EffectContext,
     journal: TurnJournal | None = None,
+    method: str = "run",
 ) -> SandboxOutcome:
     """Run one trusted plugin body in-process. Returns a :class:`SandboxOutcome`.
 
@@ -66,7 +67,7 @@ def run_local_tool(
     interp = Interpreter(effect_ctx, declared, journal=journal)
     started = time.perf_counter()
     try:
-        final = drive(instance, dict(params or {}), _interpreter_fulfil(interp))
+        final = drive(instance, dict(params or {}), _interpreter_fulfil(interp), method)
     except UndeclaredRequestError as e:
         # A contract violation, not a failed run — same classification the
         # subprocess runner gives it.
