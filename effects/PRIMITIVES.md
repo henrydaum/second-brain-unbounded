@@ -104,6 +104,7 @@ Apply, in order:
 | Compute / process | `RunProcess` (argv only — no shell string; cwd-confined; kernel owns the handle) | egress |
 | Kernel registries | `ReloadPlugin` (load/reload/unload by path; root-confined — loading *executes code*, so the deferred-execution rule puts it here rather than in write) | egress |
 | Kernel administration | `WriteConfig` · `ServiceControl` · `PackageOp` · `ConversationOp` — the kernel administers itself through slash commands, and those commands must reach config, services, packages and conversations to run as pure bodies. Irreversible or code-executing, hence egress; additionally graded by **who is asking** (below). | egress |
+| Scheduling | `ScheduleOp` (create/update/remove/enable/advance a scheduled job) — reversible (the store snapshots the rows it touches, so the turn journal can put them back), and deliberately **not** an administration verb: a job is a promise to emit on a channel, and what that costs is graded at the *emit* by `channel_danger_tier`, which is where the effect actually lands. Grading it by who scheduled instead would also charge an approval to the scheduler's own once-a-second bookkeeping. Reading the job table is the `scheduled_jobs` inventory view. | write |
 | Kernel state (reads) | none — config holds API keys; a read there composes with egress into key theft. Note `WriteConfig` must not become a read by returning the prior value. | — |
 | User | `AskUser` — *not* egress (the human is inside the trust domain, so requiring approval to request approval would be circular); gates on **attendance**, a liveness check, so an unattended session fails fast instead of hanging on a prompt nobody will see. The answer is untrusted text, like file contents. | read |
 
@@ -331,10 +332,26 @@ cannot is a bug, not an exception):
 |---|---|
 | `service_llm` + LLM backends | 1, 4 |
 | `service_plugin_watcher` | — *(retired: `ReloadPlugin` covers the mutation; still trusted only because it is built-in)* |
-| `service_timekeeper` | — *(retired: kept trusted only because it is built-in, not because it must be)* |
 | `parser_registry` / `service_parser` | 5 |
 | frontend transports (`start`/`stop`, sockets) | 1, 2 |
 | `package_manager` | 3 |
+
+`service_timekeeper` was on this list citing #2 and came off it by being
+converted, not by being re-argued. Its thread became a `tick` the kernel drives,
+its `bus.emit` became an event list the kernel fires (confined to declared
+channels), and its job table moved to `runtime/scheduling.py` — because cron
+arithmetic is infrastructure, and admitting `croniter` through the sandbox import
+gate so one plugin could keep doing its own scheduling math would have made the
+conversion cosmetic. The lesson worth keeping: the exits for #2 and #3 existed,
+were tested, and had never been *wired* — `ServiceTicker` was not started by
+`bootstrap` at all — so the exception survived on inertia rather than on need.
+Building an exit is not walking through it.
+
+Its channels are the one wrinkle. A scheduler cannot write `declared_channels`
+as a literal because jobs are configured, so it names a `channels_view` the
+kernel resolves (`CHANNEL_VIEWS` in `runtime/service_ticker.py`). Data, not a
+callable — handing the kernel a callable to ask would be capability #5 — and a
+closed set, for the same reason `ReadContext`'s views are.
 
 This list is closed, and growing it requires citing a capability. A test
 enumerates plugins still on the imperative contract and fails if it exceeds this

@@ -9,28 +9,26 @@ the task does and a reinstall picks up updated declarations.
 
 from types import SimpleNamespace
 
+import pytest
+
 from pipeline.orchestrator import Orchestrator
 from plugins.BaseTask import BaseTask
-from plugins.services.service_timekeeper import TimekeeperService
 from runtime.runtime_approvals import _sane_enum
+from runtime.scheduling import reset_store
 
 
-class _FakeTimekeeper:
-    def __init__(self, existing=()):
-        self.jobs = {name: {"channel": "x"} for name in existing}
-        self.created = {}
-        self.removed = []
+@pytest.fixture(autouse=True)
+def _isolated_store(monkeypatch):
+    """Keep the process-wide job store out of the user's real config file.
 
-    def get_job(self, name):
-        return self.jobs.get(name)
-
-    def create_job(self, name, job_def):
-        self.jobs[name] = dict(job_def)
-        self.created[name] = dict(job_def)
-
-    def remove_job(self, name):
-        self.removed.append(name)
-        return self.jobs.pop(name, None) is not None
+    The store, not the timekeeper service, is what the orchestrator seeds into
+    now — the service holds no job state at all since its trusted exception was
+    retired."""
+    saved: dict = {}
+    monkeypatch.setattr("config.config_manager.load_plugin_config", lambda: dict(saved))
+    monkeypatch.setattr("config.config_manager.save_plugin_config", saved.update)
+    yield reset_store({})
+    reset_store({})
 
 
 class _SeederTask(BaseTask):
@@ -40,45 +38,49 @@ class _SeederTask(BaseTask):
     default_jobs = {"seed_job": {"channel": "seed.chan", "cron": "*/15 * * * *", "payload": {}}}
 
 
-def _orchestrator(tk):
+def _orchestrator(with_timekeeper=True):
     db = SimpleNamespace(
         ensure_output_table=lambda *a, **k: None,
         register_task=lambda **k: None,
     )
-    orch = Orchestrator(db, {"max_workers": 1}, {"timekeeper": tk})
-    return orch
+    services = {"timekeeper": object()} if with_timekeeper else {}
+    return Orchestrator(db, {"max_workers": 1}, services)
 
 
-def test_register_task_seeds_declared_default_jobs():
-    tk = _FakeTimekeeper()
-    _orchestrator(tk).register_task(_SeederTask())
-    assert tk.created["seed_job"]["cron"] == "*/15 * * * *"
-    assert tk.created["seed_job"]["channel"] == "seed.chan"
+def test_register_task_seeds_declared_default_jobs(_isolated_store):
+    _orchestrator().register_task(_SeederTask())
+    job = _isolated_store.get_job("seed_job")
+    assert job["cron"] == "*/15 * * * *"
+    assert job["channel"] == "seed.chan"
 
 
-def test_seeding_skips_existing_jobs():
-    tk = _FakeTimekeeper(existing=["seed_job"])
-    _orchestrator(tk).register_task(_SeederTask())
-    assert tk.created == {}
+def test_seeding_skips_existing_jobs(_isolated_store):
+    _isolated_store.create_job("seed_job", {"channel": "other.chan", "cron": "0 0 * * *"})
+    _orchestrator().register_task(_SeederTask())
+    assert _isolated_store.get_job("seed_job")["channel"] == "other.chan"
 
 
-def test_unregister_removes_default_jobs():
-    tk = _FakeTimekeeper()
-    orch = _orchestrator(tk)
+def test_seeding_is_skipped_without_a_scheduler(_isolated_store):
+    """No timekeeper installed means no clock, so a seeded job would be a
+    phantom schedule sitting in config that nothing will ever fire."""
+    _orchestrator(with_timekeeper=False).register_task(_SeederTask())
+    assert _isolated_store.get_job("seed_job") is None
+
+
+def test_unregister_removes_default_jobs(_isolated_store):
+    orch = _orchestrator()
     orch.register_task(_SeederTask())
-    assert "seed_job" in tk.jobs
+    assert _isolated_store.get_job("seed_job") is not None
 
     orch.unregister_task("seeder")
 
-    assert tk.removed == ["seed_job"]
-    assert "seed_job" not in tk.jobs
+    assert _isolated_store.get_job("seed_job") is None
 
 
-def test_reinstall_reseeds_updated_declaration():
+def test_reinstall_reseeds_updated_declaration(_isolated_store):
     # Uninstall + reinstall with a changed cron: the old job is removed at
     # unregistration, so the new registration seeds the new schedule.
-    tk = _FakeTimekeeper()
-    orch = _orchestrator(tk)
+    orch = _orchestrator()
     orch.register_task(_SeederTask())
     orch.unregister_task("seeder")
 
@@ -86,7 +88,7 @@ def test_reinstall_reseeds_updated_declaration():
         default_jobs = {"seed_job": {"channel": "seed.chan", "cron": "* * * * *", "payload": {}}}
 
     orch.register_task(_Updated())
-    assert tk.jobs["seed_job"]["cron"] == "* * * * *"
+    assert _isolated_store.get_job("seed_job")["cron"] == "* * * * *"
 
 
 def test_task_without_default_jobs_needs_no_timekeeper():
@@ -97,22 +99,6 @@ def test_task_without_default_jobs_needs_no_timekeeper():
 
     db = SimpleNamespace(ensure_output_table=lambda *a, **k: None, register_task=lambda **k: None)
     Orchestrator(db, {"max_workers": 1}, {}).register_task(_Plain())  # must not raise
-
-
-def test_timekeeper_remove_and_recreate(monkeypatch):
-    saved = {}
-    monkeypatch.setattr("config.config_manager.load_plugin_config", lambda: {})
-    monkeypatch.setattr("config.config_manager.save_plugin_config", lambda values: saved.update(values))
-    config = {"scheduled_jobs": {"cron": {"enabled": True, "channel": "t", "payload": {}, "cron": "* * * * *"}}}
-    service = TimekeeperService(config)
-
-    assert service.remove_job("cron") is True
-    assert service.get_job("cron") is None
-    assert saved["scheduled_jobs"] == {}
-    assert service.remove_job("cron") is False  # already gone
-
-    service.create_job("cron", {"channel": "t", "cron": "* * * * *"})
-    assert service.get_job("cron") is not None
 
 
 def test_sane_enum_drops_unanswerable_choices():

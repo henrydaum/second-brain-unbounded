@@ -54,6 +54,8 @@ def build_inventory(context):
                 return _settings_catalog()
             if view == "llm_backends":
                 return _llm_backends()
+            if view == "scheduled_jobs":
+                return _scheduled_jobs()
         except Exception:  # noqa: BLE001 — introspection must not break a turn
             logger.exception("inventory view %r failed", view)
             return []
@@ -142,17 +144,25 @@ def _tasks(context) -> list[dict]:
             for name, task in sorted(tasks.items())]
 
 
-def _jobs_by_channel(context) -> dict:
-    """How many timekeeper jobs fire on each channel.
+def _scheduled_jobs() -> list[dict]:
+    """Every scheduled job, with its next fire time as an ISO string.
 
-    Lets ``/tasks`` say "3 scheduled jobs" without holding the timekeeper. Empty
-    when the service is absent — the scheduling bundle is a store package, and
-    the kernel must degrade quietly without it."""
-    timekeeper = (getattr(context, "services", None) or {}).get("timekeeper")
-    if timekeeper is None or not getattr(timekeeper, "loaded", False):
-        return {}
+    Read-tier and ungated: a job definition is a channel name, a cron expression
+    and a payload the caller supplied — the same class of fact as which tasks are
+    registered. Changing one is ``ScheduleOp``; seeing them is this."""
+    from runtime.scheduling import get_store
+
+    return _safe(get_store().snapshot, []) or []
+
+
+def _jobs_by_channel(context) -> dict:
+    """How many scheduled jobs fire on each channel.
+
+    Lets ``/tasks`` say "3 scheduled jobs". Reads the kernel's job store rather
+    than the timekeeper service: the store is where the table lives now, and it
+    is populated whether or not the service happens to be loaded."""
     counts: dict[str, int] = {}
-    for job in _safe(timekeeper.list_jobs, {}).values():
+    for job in _scheduled_jobs():
         channel = job.get("channel") or ""
         if channel:
             counts[channel] = counts.get(channel, 0) + 1

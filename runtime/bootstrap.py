@@ -263,6 +263,7 @@ def _conversation_runtime(scaffold, shutdown_fn, tool_registry, services, config
     )
     runtime.command_registry = registry
     runtime._orchestrator_ref = scaffold.orchestrator
+    runtime.service_ticker = _start_ticker(scaffold, services, config, tool_registry, root_dir, ref)
     ref["runtime"] = runtime
     # Tasks running through the orchestrator reach the runtime via
     # context.runtime.
@@ -272,6 +273,54 @@ def _conversation_runtime(scaffold, shutdown_fn, tool_registry, services, config
         tool_registry.runtime = runtime
         tool_registry.command_registry = registry
     return runtime
+
+
+def _start_ticker(scaffold, services, config, tool_registry, root_dir, ref):
+    """Start the kernel's one clock thread and return the ticker.
+
+    This is what makes ``tick_interval_s`` mean anything. Until it was wired,
+    ``runtime/service_ticker.py`` was an exit nobody had walked through: the
+    machinery that retires "owns a thread or event loop" existed, was tested, and
+    was never started — which is exactly why ``service_timekeeper`` still kept
+    its own thread and its own place on the always-trusted list.
+
+    A tick runs with ``principal = agent`` and no administration surface. That is
+    the right reading of what a tick is: nobody typed it, so it gets the
+    restrictive corner, and the emits it asks for are graded at the bus by what
+    they trigger rather than by who scheduled them.
+    """
+    from runtime.scheduling import reset_store
+    from runtime.service_ticker import ServiceTicker
+
+    # Bind the job store to the live config before anything can read it, and
+    # drop one-time jobs whose moment passed while the app was down.
+    try:
+        reset_store(config).reload(purge_expired=True)
+    except Exception:  # noqa: BLE001 — a bad job definition must not block boot
+        logger.exception("scheduled-job store failed to load")
+
+    def tick_context(service_name: str):
+        """A call context for one ticked service."""
+        return build_context(
+            scaffold.db, config, services, tool_registry=tool_registry,
+            orchestrator=scaffold.orchestrator, runtime=ref.get("runtime"),
+            root_dir=root_dir, session_key=None)
+
+    def approve(target: str, justification: str) -> bool:
+        """Route an egress-tier emit to whoever is attended, if anyone is."""
+        runtime = ref.get("runtime")
+        key = getattr(runtime, "active_session_key", None) if runtime else None
+        if runtime is None or not key:
+            return False
+        ctx = build_context(scaffold.db, config, services, runtime=runtime,
+                            session_key=key, root_dir=root_dir)
+        return bool(ctx.approve_command and ctx.approve_command(target, justification))
+
+    ticker = ServiceTicker(services, tick_context,
+                           tasks=getattr(scaffold.orchestrator, "tasks", {}) or {},
+                           approve=approve)
+    ticker.start()
+    return ticker
 
 
 def _scope(profile, config):

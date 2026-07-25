@@ -27,7 +27,8 @@ future store) — *not* by deleting them. What remains:
 
 - **Services:** `service_llm`, `service_compactor` (context-safety),
   `service_parser` (text + image helper discovery), `service_timekeeper`
-  (lightweight event clock), and `service_plugin_watcher` (hot-reload = the
+  (lightweight event clock — on the effects contract; owns no thread, no bus
+  access, and no job state), and `service_plugin_watcher` (hot-reload = the
   install/uninstall substrate). If another tracked service remains, treat it as
   kernel-boundary debt unless the user explicitly keeps it.
 - **Tasks:** none.
@@ -421,10 +422,21 @@ conversation title on a persistent surface; fed by the
   `data_json.hook`.
 - **Ship a task with a schedule**: declare `default_jobs` on the task
   (`{job_name: {"channel", "cron", "payload"}}`). The orchestrator seeds the
-  Timekeeper job at registration if absent (disabled jobs count as existing)
-  and removes it at unregistration, so default jobs live exactly as long as
-  their task and a reinstall picks up an updated declaration. Disabling —
-  not deleting — is the durable way to silence a default job.
+  job into the kernel's job store (`runtime/scheduling.py`) at registration if
+  absent (disabled jobs count as existing) and removes it at unregistration, so
+  default jobs live exactly as long as their task and a reinstall picks up an
+  updated declaration. Disabling — not deleting — is the durable way to silence
+  a default job. Seeding is skipped entirely when `service_timekeeper` is not
+  installed: with no clock, a seeded job is a phantom schedule.
+- **Do periodic work without a thread**: set `tick_interval_s` on a service and
+  write a `tick` body. The kernel's one clock thread
+  (`runtime/service_ticker.py`, started from `bootstrap`) calls it, and the body
+  *returns* the events it wants fired rather than touching the bus — the ticker
+  fires only channels in `declared_channels` (or resolved from a declared
+  `channels_view`), grading each by `channel_danger_tier` and gating the egress
+  ones. `service_timekeeper` is the worked example. Job CRUD is `ScheduleOp`
+  from a plugin, `runtime.scheduling.get_store()` from the kernel; the job table
+  is readable as the `scheduled_jobs` inventory view.
 - **Observe finished turns** (learn-from-outcome loops, memory writers):
   subscribe to `SESSION_TURN_COMPLETED` — emitted once per logical turn from
   the drive site, foreground and background alike, with `ok`/`cancelled`/

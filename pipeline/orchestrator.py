@@ -142,6 +142,21 @@ class Orchestrator:
 		logger.info(f"Registered task: {task.name}")
 		bus.emit(TASKS_CHANGED, {"name": task.name, "action": "registered"})
 
+	def _job_store(self):
+		"""The kernel's scheduled-job store, or None when scheduling is absent.
+
+		Gated on the timekeeper being installed: the scheduler is what makes a
+		job mean anything, and seeding rows nothing will ever fire would leave
+		phantom schedules in config on a kernel with no clock."""
+		if "timekeeper" not in (self.services or {}):
+			return None
+		try:
+			from runtime.scheduling import get_store
+			return get_store(self.config)
+		except Exception as e:  # noqa: BLE001 — scheduling is optional
+			logger.warning(f"Scheduled-job store unavailable: {e}")
+			return None
+
 	def _seed_default_jobs(self, task: BaseTask):
 		"""Create the task's declared default Timekeeper jobs if absent.
 
@@ -151,14 +166,14 @@ class Orchestrator:
 		so a task's default jobs live exactly as long as the task does.
 		"""
 		jobs = getattr(task, "default_jobs", None) or {}
-		tk = (self.services or {}).get("timekeeper")
-		if not jobs or tk is None or not hasattr(tk, "create_job"):
+		store = self._job_store()
+		if not jobs or store is None:
 			return
 		for name, job_def in jobs.items():
 			try:
-				if tk.get_job(name) is not None:
+				if store.get_job(name) is not None:
 					continue
-				tk.create_job(name, job_def)
+				store.create_job(name, job_def)
 				logger.info(f"Seeded default scheduled job '{name}' for task '{task.name}'")
 			except Exception as e:
 				logger.warning(f"Could not seed default job '{name}' for task '{task.name}': {e}")
@@ -170,12 +185,12 @@ class Orchestrator:
 		a re-registration reseeds from the (possibly updated) declaration,
 		so reinstalling a task picks up new default schedules."""
 		jobs = getattr(task, "default_jobs", None) or {}
-		tk = (self.services or {}).get("timekeeper")
-		if not jobs or tk is None or not hasattr(tk, "remove_job"):
+		store = self._job_store()
+		if not jobs or store is None:
 			return
 		for name in jobs:
 			try:
-				if tk.remove_job(name):
+				if store.remove_job(name):
 					logger.info(f"Removed default scheduled job '{name}' of task '{task.name}'")
 			except Exception as e:
 				logger.warning(f"Could not remove default job '{name}' of task '{task.name}': {e}")

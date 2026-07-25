@@ -62,6 +62,7 @@ from effects.vocabulary import (
     ReadFiles,
     ReloadPlugin,
     Request,
+    ScheduleOp,
     Respond,
     RunProcess,
     ServiceControl,
@@ -97,7 +98,7 @@ _MAX_EGRESS_BYTES = 200_000
 # means adding a name here and a branch in the provider, deliberately.
 INVENTORY_VIEWS: frozenset[str] = frozenset({
     "commands", "tools", "tasks", "services", "frontends", "session_state",
-    "packages", "pipeline", "settings", "llm_backends",
+    "packages", "pipeline", "settings", "llm_backends", "scheduled_jobs",
 })
 
 # Tables a sandboxed request may never touch, by identifier. ``users`` is the
@@ -333,6 +334,13 @@ class EffectContext:
     # these is testable without a live system. ``None`` means administration is
     # unavailable and such a request fails rather than silently doing nothing.
     administer: Callable[[Request], Any] | None = None
+    # Mutates the kernel's scheduled-job table: (request) -> (value, undo). The
+    # undo half is not optional — ScheduleOp is graded *write*, and a write tier
+    # whose handler cannot reverse itself is the tier lying about what it is.
+    # Separate from ``administer`` because scheduling is not administration —
+    # see ScheduleOp's docstring — and because it must be reachable from the
+    # ticker's context, which has no administration surface at all.
+    schedule: Callable[[Request], Any] | None = None
     # Resolves an inventory view (see INVENTORY_VIEWS) to plain JSON-able data:
     # (view) -> list/dict. ``None`` means inventory is unavailable and such a
     # read fails rather than returning a misleading empty list.
@@ -659,6 +667,17 @@ class Interpreter:
             self.journal.record(request.type, _undo, f"delete {path}")
             self._journal_row(request)
             return EffectResult(value={"path": str(path), "existed": existed}, tier=TIER_WRITE)
+
+        if isinstance(request, ScheduleOp):
+            scheduler = self.ctx.schedule
+            if scheduler is None:
+                return EffectResult(ok=False, tier=TIER_WRITE,
+                                    error="no scheduled-job store is available")
+            value, undo = scheduler(request)
+            self.journal.record(request.type, undo,
+                                f"{request.action} job {request.name or ''}".strip())
+            self._journal_row(request)
+            return EffectResult(value=value, tier=TIER_WRITE)
 
         return EffectResult(ok=False, error=f"unhandled write request {request.type!r}", tier=TIER_WRITE)
 

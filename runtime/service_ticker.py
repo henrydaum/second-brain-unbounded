@@ -38,6 +38,29 @@ MIN_INTERVAL_S = 0.5
 TICK_TIMEOUT_S = 30.0
 
 
+def _scheduled_job_channels() -> list[str]:
+    """Channels the kernel's scheduled jobs fire on."""
+    from runtime.scheduling import get_store
+
+    return get_store().channels()
+
+
+# Dynamic channel sources, by the name a service puts in ``channels_view``.
+#
+# A literal ``declared_channels`` list is the normal case and stays the default.
+# But a scheduler's channels come from configured jobs, so it cannot write them
+# down — and handing the kernel a callable to ask instead would be capability #5
+# (a live callable the kernel executes), the exact thing the contract removes.
+#
+# So the service names a view and the kernel resolves it. Deliberately a small
+# closed map for the same reason ``INVENTORY_VIEWS`` is: a view that took
+# arguments would be a generic accessor wearing a declaration's badge, and the
+# declaration is the authority check.
+CHANNEL_VIEWS = {
+    "scheduled_jobs": _scheduled_job_channels,
+}
+
+
 def channel_danger_tier(channel: str, tasks: dict, *, _seen: set | None = None) -> str:
     """How dangerous is it to fire ``channel``? Derived from what it triggers.
 
@@ -150,14 +173,20 @@ class ServiceTicker:
         A raising or slow tick is contained: it is logged and the sweep
         continues, because one broken service must not stop the kernel's clock.
         """
+        # Resolved *before* the body runs. A dynamic ``channels_view`` reads live
+        # kernel state, and a tick may legitimately change that state — the
+        # timekeeper's does, by removing the one-time job it just fired. Reading
+        # the declaration afterwards would judge the tick against the world it
+        # left behind, and silently refuse the very emit it was ticked for.
+        allowed = self._allowed_channels(service)
         try:
             events = service.perform("tick", {}, self._context_factory(name))
         except Exception:  # noqa: BLE001 — a service's fault, not the clock's
             logger.exception("service %r tick failed", name)
             return
-        self._emit(name, service, events)
+        self._emit(name, service, events, allowed)
 
-    def _emit(self, name: str, service, events) -> None:
+    def _emit(self, name: str, service, events, allowed: set | None = None) -> None:
         """Fire the events a tick returned, confined to declared channels.
 
         This is the authority check. The service never touches the bus, so the
@@ -170,7 +199,8 @@ class ServiceTicker:
         if not isinstance(events, list):
             logger.warning("service %r tick returned %s, expected a list", name, type(events).__name__)
             return
-        allowed = set(getattr(service, "declared_channels", []) or [])
+        if allowed is None:
+            allowed = self._allowed_channels(service)
         for event in events:
             if not isinstance(event, dict):
                 logger.warning("service %r returned a malformed event: %r", name, event)
@@ -189,6 +219,26 @@ class ServiceTicker:
                 bus.emit(channel, event.get("payload") or {})
             except Exception:  # noqa: BLE001 — a subscriber's fault, not the ticker's
                 logger.exception("emitting %r for service %r failed", channel, name)
+
+    def _allowed_channels(self, service) -> set:
+        """Which channels this service may fire on: its literal declaration plus
+        whatever its declared ``channels_view`` currently resolves to.
+
+        A failing view resolves to nothing rather than to everything — the
+        declaration is the authority check, so an unreadable one must deny."""
+        allowed = set(getattr(service, "declared_channels", None) or [])
+        view = getattr(service, "channels_view", "") or ""
+        if not view:
+            return allowed
+        resolver = CHANNEL_VIEWS.get(view)
+        if resolver is None:
+            logger.warning("unknown channels_view %r; declaring nothing dynamic", view)
+            return allowed
+        try:
+            return allowed | set(resolver() or [])
+        except Exception:  # noqa: BLE001 — an unreadable view declares nothing
+            logger.exception("channels_view %r failed", view)
+            return allowed
 
     def _permitted(self, name: str, channel: str) -> bool:
         """Whether firing ``channel`` is allowed, given what it triggers.

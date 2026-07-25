@@ -28,6 +28,8 @@ _LITERAL_ALLOWED = {
     "plugins.BaseTool",          # the contract (a plugin sets contract = "effects")
     "plugins.BaseCommand",
     "plugins.BaseTask",
+    "plugins.BaseService",
+    "plugins.BaseFrontend",
     "plugins.BaseSandboxTool",   # deprecated shim; kept until the store is converted
     "effects.vocabulary",
     "sandbox_kit",

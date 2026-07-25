@@ -24,7 +24,6 @@ ROOT = Path(__file__).resolve().parents[1]
 TRUSTED_EXCEPTION = {
     "service_llm": "1 (live sockets/keys), 4 (on_delta streaming callbacks)",
     "service_plugin_watcher": "2 (watchdog Observer thread), 3 (mutates registries)",
-    "service_timekeeper": "2 (scheduler thread + in-process bus)",
     "service_parser": "5 (registry of live parser functions)",
 }
 
@@ -67,7 +66,7 @@ def test_the_exception_list_has_not_grown():
     """The count itself is the metric. If this fails because the list genuinely
     had to grow, update the number *and* say why in PRIMITIVES.md — the point is
     that it cannot happen without someone noticing."""
-    assert len(TRUSTED_EXCEPTION) == 4, (
+    assert len(TRUSTED_EXCEPTION) == 3, (
         f"the always-trusted exception now has {len(TRUSTED_EXCEPTION)} entries; "
         "growth here is the metric that the boundary is eroding"
     )

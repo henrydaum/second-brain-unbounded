@@ -1,34 +1,40 @@
-"""Service plugin for timekeeper."""
+"""Service plugin for timekeeper — the scheduler, on the effects contract.
 
-import json
-import logging
-import threading
-from copy import deepcopy
-from datetime import datetime
+This service used to be the clearest case for the always-trusted exception: it
+owned a thread and it called ``bus.emit`` directly, which is capability #2 twice
+over. Both halves have exits now, and this is the plugin walking through them.
 
-from cron_descriptor import ExpressionDescriptor
-from croniter import croniter
+- **The thread** belongs to ``runtime/service_ticker.py``. One kernel clock ticks
+  every service that declares ``tick_interval_s``; a hundred ticked services cost
+  one thread, and none of them owns a loop.
+- **The bus** is never touched. ``tick`` *returns* the events it wants fired, and
+  the ticker fires only channels this service declared — then grades each one by
+  what subscribes to it (``channel_danger_tier``) and gates the egress ones.
+- **The job table** belongs to ``runtime/scheduling.py``. Cron arithmetic is
+  infrastructure (a sandboxed body cannot import ``croniter``, and widening the
+  import gate for one plugin would make the conversion cosmetic), and the table
+  is read by the orchestrator and by ``/schedule`` as well as by this tick.
 
-import config.config_manager as config_manager
-from config.config_data import DEFAULT_SCHEDULED_JOBS
+What is left is what was always genuinely this plugin's work: **deciding which
+jobs are due right now and what payload each fired event carries**. That is date
+comparison and dict building over a snapshot — pure work, which is exactly what a
+sandboxed body is for. Everything the old version reached for directly, it now
+names: a read for the table, a write to advance the clocks.
+
+Note there is no job CRUD here any more, not even as a thin delegation. Keeping a
+private parent-side API would have meant this file importing the kernel store,
+which the sandbox import gate rejects — and rightly: a plugin with a back door
+that only works in one execution mode is not converted, it is half-converted.
+Callers that manage jobs use ``runtime.scheduling`` (kernel) or ``ScheduleOp``
+(plugins).
+"""
+
 from plugins.BaseService import BaseService
-from events.event_bus import bus
-
-logger = logging.getLogger("TimekeeperService")
-
-
-def _now_local() -> datetime:
-    """Internal helper to handle now local."""
-    return datetime.now().astimezone()
-
-
-def _local_tz():
-    """Internal helper to handle local tz."""
-    return _now_local().tzinfo
 
 
 class TimekeeperService(BaseService):
-    """Timekeeper service."""
+    """Fires scheduled events by cron expression or one-time datetime."""
+
     model_name = "Timekeeper"
     shared = True
     config_settings = [
@@ -36,284 +42,80 @@ class TimekeeperService(BaseService):
             "Scheduled Jobs",
             "scheduled_jobs",
             "JSON object keyed by job name describing scheduled event emissions.",
-            DEFAULT_SCHEDULED_JOBS,
+            {},
             {"type": "text", "hidden": True},
         ),
     ]
 
-    def __init__(self, config: dict):
-        """Initialize the timekeeper service."""
+    contract = "effects"
+    declared_requests = ["read_context", "schedule_op"]
+
+    # Once a second, matching the old poll interval. The ticker floors this at
+    # MIN_INTERVAL_S so no plugin can busy-spin the kernel's clock.
+    tick_interval_s = 1.0
+
+    # Job channels are configured, not hard-coded, so this service cannot list
+    # its channels as a literal. It names the inventory view that holds them and
+    # the kernel resolves it — the same "return a spec, not a live thing"
+    # inversion as a command returning form dicts instead of FormSteps. The
+    # authority check is unweakened: the ticker still refuses any channel not on
+    # the resolved list, and still grades what remains by what it triggers.
+    channels_view = "scheduled_jobs"
+
+    def __init__(self, config: dict = None):
+        """Initialize the timekeeper service.
+
+        The config argument is accepted for the ``build_services(config)``
+        convention and deliberately not kept: this service holds no job state,
+        and the kernel store is bound to the live config at boot."""
         super().__init__()
-        self._config = config
-        self._lock = threading.RLock()
-        self._stop = None
-        self._thread = None
-        self._poll_interval_s = 1.0
-        self._jobs: dict[str, dict] = {}
-        self._next_fire_at: dict[str, datetime | None] = {}
-        self._load_jobs_from_config()
 
-    def _load(self) -> bool:
-        """Internal helper to load timekeeper service."""
-        with self._lock:
-            self._load_jobs_from_config(purge_expired=True)
-            self._stop = threading.Event()
-            self._thread = threading.Thread(target=self._loop, name="Timekeeper", daemon=True)
-            self._thread.start()
-            self.loaded = True
-        return True
+    def tick(self, params):
+        """Return the events whose jobs are due, and advance those jobs' clocks.
 
-    def unload(self):
-        """Handle unload."""
-        stop = self._stop
-        thread = self._thread
-        if stop is not None:
-            stop.set()
-        if thread is not None:
-            thread.join(timeout=5.0)
-        with self._lock:
-            self._stop = None
-            self._thread = None
-            self.loaded = False
+        Two requests, both cheap: read the table, then say which jobs fired.
+        ``fired_at`` carries the time each job was *scheduled for* rather than
+        the time this tick noticed, so a slow tick cannot drift a repeating
+        schedule forward a little on every cycle."""
+        from datetime import datetime
 
-    def list_jobs(self) -> dict[str, dict]:
-        """List jobs."""
-        with self._lock:
-            return {name: deepcopy(job) for name, job in self._jobs.items()}
+        from effects.vocabulary import ReadContext, Respond, ScheduleOp
 
-    def get_job(self, name: str) -> dict | None:
-        """Get job."""
-        with self._lock:
-            job = self._jobs.get(name)
-            return deepcopy(job) if job is not None else None
+        snapshot = yield ReadContext(view="scheduled_jobs")
+        now = datetime.now().astimezone()
 
-    def create_job(self, name: str, job_def: dict) -> dict:
-        """Create job."""
-        with self._lock:
-            if name in self._jobs:
-                raise ValueError(f"Job '{name}' already exists.")
-            normalized = self._normalize_job(name, job_def)
-            self._jobs[name] = normalized
-            self._next_fire_at[name] = self._compute_next_fire(normalized, from_time=_now_local())
-            self._persist_jobs()
-            return deepcopy(normalized)
-
-    def update_job(self, name: str, patch: dict) -> dict:
-        """Update job."""
-        with self._lock:
-            current = self._jobs.get(name)
-            if current is None:
-                raise ValueError(f"Unknown job: '{name}'.")
-            merged = deepcopy(current)
-            merged.update(deepcopy(patch or {}))
-            normalized = self._normalize_job(name, merged)
-            self._jobs[name] = normalized
-            self._next_fire_at[name] = self._compute_next_fire(normalized, from_time=_now_local())
-            self._persist_jobs()
-            return deepcopy(normalized)
-
-    def remove_job(self, name: str) -> bool:
-        """Remove job.
-
-        A removed default job reappears when its task next registers (boot,
-        reinstall, hot-reload) — disabling is the durable way to silence one.
-        """
-        with self._lock:
-            removed = self._jobs.pop(name, None)
-            self._next_fire_at.pop(name, None)
-            if removed is None:
-                return False
-            self._persist_jobs()
-            return True
-
-    def enable_job(self, name: str, enabled: bool = True) -> dict:
-        """Handle enable job."""
-        return self.update_job(name, {"enabled": bool(enabled)})
-
-    def cron_to_text(self, expr: str) -> str:
-        """Handle cron to text."""
-        try:
-            return ExpressionDescriptor(expr).get_description()
-        except Exception as e:
-            raise ValueError(f"Invalid cron expression: {e}")
-
-    def get_next_fire_at(self, name: str) -> datetime | None:
-        """Return the next scheduled fire time for a job, or None if disabled/unknown/exhausted."""
-        with self._lock:
-            job = self._jobs.get(name)
-            if job is None or not job.get("enabled", True):
-                return None
-            cached = self._next_fire_at.get(name)
-            if cached is not None:
-                return cached
-            return self._compute_next_fire(job, from_time=_now_local())
-
-    def describe_job(self, name: str) -> str:
-        """Handle describe job."""
-        with self._lock:
-            job = self._jobs.get(name)
-            if job is None:
-                raise ValueError(f"Unknown job: '{name}'.")
-            if job["one_time"]:
-                return f"One-time at {job['run_at']}"
-            return self.cron_to_text(job["cron"])
-
-    def _loop(self):
-        """Internal helper to handle loop."""
-        while self._stop is not None and not self._stop.wait(self._poll_interval_s):
-            try:
-                self._tick()
-            except Exception as e:
-                logger.error(f"Timekeeper tick failed: {e}", exc_info=True)
-
-    def _tick(self):
-        """Internal helper to handle tick."""
-        now = _now_local()
-        due: list[tuple[str, dict, datetime]] = []
-
-        with self._lock:
-            for name, job in self._jobs.items():
-                if not job.get("enabled", True):
-                    continue
-                next_fire = self._next_fire_at.get(name)
-                if next_fire is None:
-                    next_fire = self._compute_next_fire(job, from_time=now)
-                    self._next_fire_at[name] = next_fire
-                if next_fire is not None and next_fire <= now:
-                    due.append((name, deepcopy(job), next_fire))
-
-        for name, job, scheduled_for in due:
-            self._emit_job(name, job, scheduled_for)
-
-    def _emit_job(self, name: str, job: dict, scheduled_for: datetime):
-        """Internal helper to emit job."""
-        emitted_at = _now_local()
-        payload = deepcopy(job.get("payload", {}))
-        payload["_timekeeper"] = {
-            "job_name": name,
-            "scheduled_for": scheduled_for.isoformat(),
-            "emitted_at": emitted_at.isoformat(),
-            "one_time": job["one_time"],
-            "source": "timekeeper",
-        }
-
-        logger.info(f"Emitting scheduled event '{job['channel']}' for job '{name}'")
-        bus.emit(job["channel"], payload)
-
-        with self._lock:
-            current = self._jobs.get(name)
-            if current is None:
-                return
-
-            if current["one_time"]:
-                self._jobs.pop(name, None)
-                self._next_fire_at.pop(name, None)
-                self._persist_jobs()
-            else:
-                self._next_fire_at[name] = self._compute_next_fire(current, from_time=scheduled_for)
-
-    def _load_jobs_from_config(self, purge_expired: bool = False):
-        """Internal helper to load jobs from config."""
-        raw = self._config.get("scheduled_jobs", {})
-        if isinstance(raw, str):
-            raw = raw.strip()
-            raw = json.loads(raw) if raw else {}
-        if raw is None:
-            raw = {}
-        if not isinstance(raw, dict):
-            raise ValueError("scheduled_jobs must be a JSON object keyed by job name.")
-
-        jobs: dict[str, dict] = {}
-        next_fire: dict[str, datetime | None] = {}
-        now = _now_local()
-        purged = []
-        for name, job_def in raw.items():
-            if not isinstance(job_def, dict):
-                raise ValueError(f"Job '{name}' must be an object.")
-            normalized = self._normalize_job(name, job_def)
-            if purge_expired and normalized["one_time"] and self._parse_datetime(normalized["run_at"], name) < now:
-                purged.append(name)
+        events, fired_at = [], {}
+        for job in (snapshot.value or []):
+            if not job.get("enabled", True):
                 continue
-            jobs[name] = normalized
-            next_fire[name] = self._compute_next_fire(normalized, from_time=now)
-
-        self._jobs = jobs
-        self._next_fire_at = next_fire
-        if purged:
-            logger.info(f"Purged expired one-time job(s): {', '.join(sorted(purged))}")
-            self._persist_jobs()
-
-    def _normalize_job(self, name: str, job_def: dict) -> dict:
-        """Internal helper to normalize job."""
-        job = {
-            "enabled": bool(job_def.get("enabled", True)),
-            "channel": (job_def.get("channel") or "").strip(),
-            "cron": job_def.get("cron"),
-            "run_at": job_def.get("run_at"),
-            "one_time": bool(job_def.get("one_time", False)),
-            "payload": deepcopy(job_def.get("payload", {})),
-        }
-
-        if not job["channel"]:
-            raise ValueError(f"Job '{name}' is missing required field 'channel'.")
-
-        if not isinstance(job["payload"], dict):
-            raise ValueError(f"Job '{name}' payload must be a JSON object.")
-
-        try:
-            json.dumps(job["payload"])
-        except TypeError as e:
-            raise ValueError(f"Job '{name}' payload must be JSON-serializable: {e}")
-
-        if job["one_time"]:
-            if not job["run_at"]:
-                raise ValueError(f"One-time job '{name}' requires 'run_at'.")
-            if job["cron"]:
-                raise ValueError(f"One-time job '{name}' must not define 'cron'.")
-            run_at = self._parse_datetime(job["run_at"], name)
-            job["run_at"] = run_at.isoformat()
-            job["cron"] = None
-        else:
-            if not job["cron"]:
-                raise ValueError(f"Repeating job '{name}' requires 'cron'.")
-            if job["run_at"]:
-                raise ValueError(f"Repeating job '{name}' must not define 'run_at'.")
+            due = job.get("next_fire_at")
+            if not due:
+                continue
             try:
-                croniter(job["cron"], _now_local())
-            except Exception as e:
-                raise ValueError(f"Job '{name}' has invalid cron expression: {e}")
-            job["run_at"] = None
+                when = datetime.fromisoformat(due)
+            except (TypeError, ValueError):
+                continue
+            if when > now:
+                continue
+            name = job.get("name") or ""
+            fired_at[name] = due
+            events.append({
+                "channel": job.get("channel") or "",
+                "payload": {
+                    **dict(job.get("payload") or {}),
+                    "_timekeeper": {
+                        "job_name": name,
+                        "scheduled_for": due,
+                        "emitted_at": now.isoformat(),
+                        "one_time": bool(job.get("one_time")),
+                        "source": "timekeeper",
+                    },
+                },
+            })
 
-        return job
-
-    def _compute_next_fire(self, job: dict, from_time: datetime) -> datetime | None:
-        """Internal helper to handle compute next fire."""
-        if not job.get("enabled", True):
-            return None
-        if job["one_time"]:
-            run_at = self._parse_datetime(job["run_at"], "one_time job")
-            return run_at if run_at >= from_time else None
-        return croniter(job["cron"], from_time).get_next(datetime)
-
-    def _persist_jobs(self):
-        """Internal helper to persist jobs."""
-        plugin_values = config_manager.load_plugin_config()
-        plugin_values["scheduled_jobs"] = deepcopy(self._jobs)
-        config_manager.save_plugin_config(plugin_values)
-        self._config["scheduled_jobs"] = deepcopy(self._jobs)
-
-    @staticmethod
-    def _parse_datetime(value: str, job_name: str) -> datetime:
-        """Internal helper to parse datetime."""
-        try:
-            dt = datetime.fromisoformat(value)
-        except ValueError as e:
-            raise ValueError(f"Job '{job_name}' has invalid run_at datetime: {e}")
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=_local_tz())
-        else:
-            dt = dt.astimezone()
-        return dt
+        if fired_at:
+            yield ScheduleOp(action="advance", names=list(fired_at), fired_at=fired_at)
+        return Respond(data=events)
 
 
 def build_services(config: dict) -> dict:

@@ -227,6 +227,40 @@ class DeleteFile(Request):
 
 
 @dataclass(frozen=True)
+class ScheduleOp(Request):
+    """Create, update, remove, enable, or advance a scheduled job.
+
+    **Write tier, and deliberately not an administration verb.** The instinct is
+    that scheduling autonomous future work must be the most dangerous thing in
+    the vocabulary — but that danger is already measured, and measured better,
+    somewhere else. ``service_ticker.channel_danger_tier`` grades every emit by
+    the maximum tier of the tasks that subscribe to its channel, and gates the
+    egress ones at the approval surface. A job is a promise to emit; the emit is
+    where the effect lands, and that is where the check belongs.
+
+    Putting it in ``ADMIN_REQUESTS`` instead would grade it by *who scheduled*
+    rather than *what fires*, and would then charge an approval prompt to the
+    scheduler's own bookkeeping — the tick that moves a job past the fire it just
+    had is not an administrative act, it happens once a second, and nobody would
+    survive being asked about it.
+
+    Write rather than egress because it is genuinely reversible: the store
+    snapshots the affected rows before touching them, so the turn journal can put
+    them back. ``advance`` carries ``fired_at`` so a repeating job's next fire is
+    computed from when it was *due*, not from when the tick got around to it.
+    """
+
+    type: ClassVar[str] = "schedule_op"
+    tier: ClassVar[str] = TIER_WRITE
+    action: str
+    name: str = ""
+    job: dict[str, Any] | None = None
+    names: list[str] | None = None
+    fired_at: dict[str, str] | None = None
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class Respond(Request):
     """The terminal request: the tool's final result. A well-formed tool run
     ends with exactly one ``Respond``. Carries the model-facing summary plus
@@ -541,7 +575,7 @@ REQUEST_TYPES: dict[str, type[Request]] = {
     for cls in (
         ReadFile, ReadFiles, ListDir, Stat, QueryDb, ReadContext, AskUser,
         ReadConversations,
-        WriteFile, WriteDb, DeleteFile, Respond,
+        WriteFile, WriteDb, DeleteFile, ScheduleOp, Respond,
         HttpRequest, Complete, Embed, ExecSql, RunProcess, ReloadPlugin,
         WriteConfig, ReadConfig, ServiceControl, PackageOp, ConversationOp,
         SessionAction, CallTool, TaskControl,

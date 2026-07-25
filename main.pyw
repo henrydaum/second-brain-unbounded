@@ -354,6 +354,7 @@ def main():
 		supervisor.stop_memory_watchdog()
 		event_trigger.stop()
 		watcher.stop()
+		_stop_ticker(scaffold)
 		orchestrator.stop()
 		for svc in services.values():
 			if getattr(svc, 'loaded', False):
@@ -415,6 +416,7 @@ def main():
 				logger.info("Restart: graceful shutdown starting...")
 				event_trigger.stop()
 				watcher.stop()
+				_stop_ticker(scaffold)
 				orchestrator.stop()
 				for svc in services.values():
 					if getattr(svc, "loaded", False):
@@ -452,6 +454,16 @@ def main():
 	while not _shutdown.is_set():
 		probe.beat()
 		_shutdown.wait(timeout=1.0)
+
+def _stop_ticker(scaffold):
+	"""Stop the kernel's clock thread, if one was started."""
+	ticker = getattr(scaffold.frontend_runtime, "service_ticker", None)
+	if ticker is not None:
+		try:
+			ticker.stop()
+		except Exception as e:
+			logger.debug(f"Service ticker stop failed: {e}")
+
 
 def _bind_runtime_services(services, tool_registry, orchestrator, runtime):
 	for svc in services.values():

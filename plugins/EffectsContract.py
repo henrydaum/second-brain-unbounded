@@ -133,6 +133,11 @@ class EffectsContract:
     # interpreter.
     tick_interval_s: float = 0.0
     declared_channels: list[str] = []
+    # For a service whose channels are configured rather than hard-coded (a
+    # scheduler): the name of a kernel view that resolves to a channel list. See
+    # ``CHANNEL_VIEWS`` in runtime/service_ticker.py. Data, not a callable —
+    # handing the kernel a callable to ask is capability #5.
+    channels_view: str = ""
 
     # Whether this plugin's sandbox should stay open between calls. False for
     # tools/commands/tasks — each call is complete in itself, and a fresh child
@@ -175,6 +180,8 @@ class EffectsContract:
         unload path). Safe to call when there is none."""
         if not self.persistent_sandbox or self.contract != "effects":
             return
+        if not getattr(self, "_source_path", ""):
+            return  # never located on disk, so it never had a worker
         try:
             from sandbox.worker import POOL
             POOL.release(self._source_text())
@@ -218,6 +225,7 @@ class EffectsContract:
             ask_user=self._ask_user(context),
             administer=getattr(context, "administer", None),
             inventory=self._inventory(context),
+            schedule=self._schedule(context),
             call_tool=self._call_tool(context),
             read_conversations=self._read_conversations(context),
             tools=getattr(getattr(context, "tool_registry", None), "tools", None),
@@ -230,7 +238,7 @@ class EffectsContract:
             principal=getattr(context, "principal", None) or PRINCIPAL_AGENT,
             plugin_trusted=self.provenance_trusted(),
             gate_model_calls_after_read=bool(
-                self._config(context).get("gate_model_calls_after_read")),
+                self._effect_config(context).get("gate_model_calls_after_read")),
             tool_name=getattr(self, "name", "plugin"),
             session_key=getattr(context, "session_key", None),
             conversation_id=self._conversation_id(context),
@@ -259,7 +267,7 @@ class EffectsContract:
         except Exception:  # noqa: BLE001 — profile resolution is best-effort
             return services.get("llm")
 
-    def _config(self, context) -> dict:
+    def _effect_config(self, context) -> dict:
         """The live config dict, or an empty one."""
         return getattr(context, "config", None) or {}
 
@@ -267,7 +275,7 @@ class EffectsContract:
         """Roots the plugin may read under. Project root first, so a relative
         path resolves against it."""
         from paths import DATA_DIR
-        roots = self._config(context).get("sandbox_read_roots")
+        roots = self._effect_config(context).get("sandbox_read_roots")
         if roots:
             return [Path(r) for r in roots]
         base = []
@@ -280,7 +288,7 @@ class EffectsContract:
         """Outer confinement: where a write is permitted at all. Whether a given
         write needs approval is a separate question — see ``_free_write_roots``."""
         from paths import DATA_DIR
-        roots = self._config(context).get("sandbox_write_roots")
+        roots = self._effect_config(context).get("sandbox_write_roots")
         if roots:
             return [Path(r) for r in roots]
         base = []
@@ -302,7 +310,7 @@ class EffectsContract:
             free.append(memory_root(getattr(context, "user_id", None)))
         except Exception:  # noqa: BLE001 — memory package may be absent
             pass
-        for extra in (self._config(context).get("sandbox_free_write_roots") or []):
+        for extra in (self._effect_config(context).get("sandbox_free_write_roots") or []):
             free.append(Path(extra))
         return free
 
@@ -365,6 +373,16 @@ class EffectsContract:
         prompt already knows it."""
         from plugins.helpers.inventory import build_inventory
         return build_inventory(context)
+
+    def _schedule(self, context):
+        """Wire ``ScheduleOp`` to the kernel's job store.
+
+        Wired for every family, unlike ``administer``: a job is a promise to emit
+        on a channel, and what that costs is graded at the emit by what the
+        channel triggers. Withholding the surface here would only mean the
+        timekeeper's own tick could not advance its own clock."""
+        from plugins.helpers.scheduling_surface import build_schedule
+        return build_schedule(self._effect_config(context))
 
     def _call_tool(self, context):
         """Wire ``CallTool`` to the tool registry, if one is reachable.
