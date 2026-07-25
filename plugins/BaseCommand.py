@@ -87,7 +87,14 @@ class BaseCommand(EffectsContract):
         outcome = self._perform_effects(context, dict(args or {}))
         if not outcome.success:
             return f"Command '/{self.name}' failed: {outcome.error}"
-        return outcome.summary or None
+        # A command's result *is* its user-facing markdown, so ``summary`` is the
+        # canonical field. ``data`` is accepted when it carries a string because
+        # ``Respond(data=...)`` is the natural thing to write when the whole
+        # return value is the text -- and silently returning None for it would be
+        # a maddening bug to chase.
+        if outcome.summary:
+            return outcome.summary
+        return outcome.data if isinstance(outcome.data, str) and outcome.data else None
 
     def form_steps(self, args: dict, context) -> list[FormStep]:
         """The command's form, as live ``FormStep``s.

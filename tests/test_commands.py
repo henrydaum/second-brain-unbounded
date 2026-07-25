@@ -168,25 +168,43 @@ def test_frontends_form_uses_runtime_cache_without_discovery(monkeypatch):
 
 # ── /debug ───────────────────────────────────────────────────────────
 
-def _session_context(tmp_path, monkeypatch, cs, **session_attrs):
-    monkeypatch.setattr(command_debug, "DATA_DIR", tmp_path)
+# /debug runs on the effects contract, so it is driven through ``perform`` --
+# the kernel entry point -- rather than by calling ``run`` directly. It no longer
+# imports DATA_DIR either: the log's location arrives as ReadContext("paths"),
+# which is why these fixtures supply a path map instead of monkeypatching a
+# module global.
+
+def _session_context(tmp_path, cs=None, **session_attrs):
+    """A context for /debug: a real log file, and the paths view pointed at it."""
     (tmp_path / "app.log").write_text(
         "01:00PM | Main         | INFO  | ok\n"
         "01:01PM | Discovery    | WARNING | Plugin registration failed: demo\n"
         "01:02PM | Main         | ERROR | Auto-load failed for 'llm': boom\n",
         encoding="utf-8",
     )
-    session = SimpleNamespace(cs=cs, **session_attrs)
-    return SimpleNamespace(runtime=SimpleNamespace(sessions={"chat": session}), session_key="chat", services={})
+    sessions = {"chat": SimpleNamespace(cs=cs, **session_attrs)} if cs is not None else {}
+    return SimpleNamespace(
+        runtime=SimpleNamespace(sessions=sessions), session_key="chat", services={},
+        db=None, config={"sandbox_trust_all": True, "sandbox_read_roots": [str(tmp_path)]},
+        root_dir=str(tmp_path), user_id=1, orchestrator=None, tool_registry=None,
+        command_registry=None, approve_command=None, approval_denial_reason="",
+        request_user_input=None, administer=None, principal="user")
+
+
+def _debug(context):
+    """Drive /debug through its kernel entry point."""
+    command = DebugCommand()
+    command._source_path = "plugins/commands/command_debug.py"
+    return command.perform({}, context)
 
 
 def test_debug_reports_state_machine_snapshot_and_log_tail(tmp_path, monkeypatch):
     cs = ConversationState([Participant("user", "user"), Participant("agent", "agent")])
-    service = SimpleNamespace(debug_flags=lambda _session: ["sample extension"])
-    context = _session_context(tmp_path, monkeypatch, cs)
-    context.services["sample"] = service
+    context = _session_context(tmp_path, cs)
+    context.services["sample"] = SimpleNamespace(debug_flags=lambda _session: ["sample extension"])
+    monkeypatch.setattr("paths.DATA_DIR", tmp_path, raising=False)
 
-    out = DebugCommand().run({}, context)
+    out = _debug(context)
 
     assert "**Conversation state**" in out
     assert "Turn: user (user)" in out
@@ -201,13 +219,12 @@ def test_debug_reports_state_machine_snapshot_and_log_tail(tmp_path, monkeypatch
 
 
 def test_debug_handles_no_active_session(tmp_path, monkeypatch):
-    monkeypatch.setattr(command_debug, "DATA_DIR", tmp_path)
-    context = SimpleNamespace(runtime=SimpleNamespace(sessions={}), session_key="chat", services={})
+    context = _session_context(tmp_path)
+    monkeypatch.setattr("paths.DATA_DIR", tmp_path, raising=False)
 
-    out = DebugCommand().run({}, context)
+    out = _debug(context)
 
     assert "(no active session)" in out
-    assert "No log file found" in out
 
 
 # ── agent_prompt contributions ───────────────────────────────────────

@@ -217,6 +217,7 @@ class EffectsContract:
             context_provider=self._context_provider(context),
             ask_user=self._ask_user(context),
             administer=getattr(context, "administer", None),
+            inventory=self._inventory(context),
             # Both ceilings on the administration verbs. The principal comes off
             # the context -- i.e. off the dispatch path that built it -- and is
             # never inferred from what family this plugin belongs to, so a
@@ -349,6 +350,17 @@ class EffectsContract:
             return json.dumps(history, default=str)
 
         return provider
+
+    def _inventory(self, context):
+        """Resolve ``ReadContext`` inventory views ("what plugins exist?").
+
+        Read-tier and non-secret: names and static metadata only, never config
+        values. Unlike ``administer`` this is wired for every family, because
+        knowing what is installed is ordinary ambient knowledge — the same class
+        as ``paths`` — and an agent that can see the tool catalogue in its system
+        prompt already knows it."""
+        from plugins.helpers.inventory import build_inventory
+        return build_inventory(context)
 
     def _ask_user(self, context):
         """Wire ``AskUser`` to the session's input prompt, if a human is there.

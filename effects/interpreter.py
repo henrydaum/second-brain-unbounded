@@ -73,6 +73,27 @@ logger = logging.getLogger("Effects")
 _VALID_TABLE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _MAX_EGRESS_BYTES = 200_000
 
+# Ambient *inventory* views: what plugins exist right now, as plain data.
+#
+# The introspection commands (/commands, /tools, /tasks, /services, /frontends,
+# /debug) are the reason these exist. They read live kernel objects today -- the
+# command registry, ``session.cs``, task instances -- which is exactly what a
+# sandboxed body cannot hold, and it is why "it only reports, it does not mutate"
+# turned out to be the wrong test for whether a command could cross.
+#
+# These are the same class as ``paths``: non-secret facts about the run, keyed by
+# a fixed string, returning JSON-able data. The kernel walks its own registries
+# and hands back names and static metadata; the plugin never touches an object.
+#
+# **This must stay a small closed set, not a dispatcher.** PRIMITIVES.md's rule
+# is that ``ReadContext`` is a mode on a read primitive -- the moment a view takes
+# arguments and reaches arbitrary kernel state, it has become ``CallRuntime(method,
+# args)`` wearing a read badge, which the generality bar rejects. Adding a view
+# means adding a name here and a branch in the provider, deliberately.
+INVENTORY_VIEWS: frozenset[str] = frozenset({
+    "commands", "tools", "tasks", "services", "frontends", "session_state",
+})
+
 # Tables a sandboxed request may never touch, by identifier. ``users`` is the
 # credential store (``password_hash``) and the per-user config blob; a read there
 # is *read*-tier and ungated, and ``Complete``/``Embed`` are allowed by default,
@@ -306,6 +327,10 @@ class EffectContext:
     # these is testable without a live system. ``None`` means administration is
     # unavailable and such a request fails rather than silently doing nothing.
     administer: Callable[[Request], Any] | None = None
+    # Resolves an inventory view (see INVENTORY_VIEWS) to plain JSON-able data:
+    # (view) -> list/dict. ``None`` means inventory is unavailable and such a
+    # read fails rather than returning a misleading empty list.
+    inventory: Callable[[str], Any] | None = None
     # ── who is asking ────────────────────────────────────────────────────
     # Derived from the *dispatch path*, never from the plugin's family: a slash
     # command is the user acting, a tool call in an agent turn is the agent
@@ -479,6 +504,11 @@ class Interpreter:
                 return EffectResult(value=self.ctx.user_id, tier=TIER_READ)
             if view == "paths":
                 return EffectResult(value=dict(self.ctx.paths or {}), tier=TIER_READ)
+            if view in INVENTORY_VIEWS:
+                if self.ctx.inventory is None:
+                    return EffectResult(ok=False, tier=TIER_READ,
+                                        error=f"no inventory provider for view {view!r}")
+                return EffectResult(value=self.ctx.inventory(view), tier=TIER_READ)
             text = ""
             if self.ctx.context_provider is not None:
                 text = self.ctx.context_provider(view, request.k)

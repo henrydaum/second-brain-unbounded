@@ -209,3 +209,98 @@ def test_a_missing_path_is_untrusted():
 
     assert not is_trusted("", trusted=set())
     assert not is_trusted(None, trusted=set())
+
+
+# ── converted kernel plugins, both ways ──────────────────────────────────
+#
+# The tests above prove the property with a purpose-built tool. These prove it
+# for the real kernel plugins as they convert, which is the claim that actually
+# matters: a shipped command must behave the same however it is executed.
+#
+# They drive the class through its *kernel entry point* rather than calling the
+# body, because a body that works while the entry point is broken is exactly the
+# failure the BaseService.perform bug demonstrated -- 700+ green tests, and live
+# compaction raising AttributeError.
+
+def _command_ctx(tmp_path, *, trust_all: bool, **overrides):
+    """A context for driving a kernel command through ``perform``."""
+    from types import SimpleNamespace
+
+    base = dict(
+        db=None, services={}, runtime=None, session_key="s1", user_id=1,
+        root_dir=str(tmp_path), orchestrator=None, tool_registry=None,
+        command_registry=None, approve_command=lambda *_a: True,
+        approval_denial_reason="", request_user_input=None, administer=None,
+        principal="user",
+        config={"sandbox_trust_all": trust_all,
+                "sandbox_read_roots": [str(tmp_path)],
+                "sandbox_write_roots": [str(tmp_path)]},
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _drive_command(cls, source_path, tmp_path, *, trusted: bool, **overrides):
+    """Run a kernel command in one mode, returning its markdown output."""
+    command = cls()
+    command._source_path = str(source_path)
+    return command.perform({}, _command_ctx(tmp_path, trust_all=trusted, **overrides))
+
+
+def _fake_command_registry():
+    """A registry with two commands, so /commands has real content to render."""
+    from types import SimpleNamespace
+
+    entries = [
+        SimpleNamespace(name="alpha", description="first", category="System",
+                        form_steps=lambda _a, _c: []),
+        SimpleNamespace(name="beta", description="second", category="Conversation",
+                        form_steps=lambda _a, _c: []),
+    ]
+    return SimpleNamespace(visible_commands=lambda _predicate=None: entries)
+
+
+@pytest.mark.parametrize("stem,module,class_name,expected,overrides", [
+    ("command_commands", "plugins.commands.command_commands", "CommandsCommand",
+     ["alpha", "beta", "**System**", "**Conversation**"],
+     {"command_registry": _fake_command_registry}),
+    ("command_debug", "plugins.commands.command_debug", "DebugCommand",
+     ["**Conversation state**", "**Recent log warnings/errors**"], {}),
+])
+def test_a_converted_kernel_command_agrees_across_modes(
+        stem, module, class_name, expected, overrides, tmp_path):
+    """Same command, same output, whether or not a process boundary exists.
+
+    The untrusted run execs the real shipped file in a child process, so this
+    also proves the file passes the sandbox import gate -- a converted command
+    that imported something banned would fail here and nowhere else.
+
+    ``expected`` matters: without it, two identical *failures* would satisfy an
+    equality check, and the test would pass while proving nothing."""
+    import importlib
+
+    (tmp_path / "app.log").write_text("01:01PM | D | WARNING | boom\n", encoding="utf-8")
+    source_path = Path(__file__).resolve().parents[1] / "plugins" / "commands" / f"{stem}.py"
+    cls = getattr(importlib.import_module(module), class_name)
+    kwargs = {k: v() for k, v in overrides.items()}
+
+    trusted = _drive_command(cls, source_path, tmp_path, trusted=True, **kwargs)
+    untrusted = _drive_command(cls, source_path, tmp_path, trusted=False, **kwargs)
+
+    assert trusted == untrusted, f"{stem} differs between execution modes"
+    assert "failed:" not in (trusted or ""), f"{stem} failed in both modes: {trusted}"
+    for needle in expected:
+        assert needle in trusted, f"{stem} output missing {needle!r}: {trusted}"
+
+
+def test_the_converted_commands_are_actually_on_the_contract():
+    """Guards against a conversion being silently reverted: if one of these went
+    back to ``legacy`` the both-modes test above would still pass, because a
+    legacy command ignores the mode entirely."""
+    from plugins.commands.command_commands import CommandsCommand
+    from plugins.commands.command_debug import DebugCommand
+    from plugins.commands.command_update import UpdateCommand
+
+    for cls in (CommandsCommand, DebugCommand, UpdateCommand):
+        assert cls.contract == "effects", f"{cls.__name__} is no longer on the contract"
+        assert cls.declared_requests, f"{cls.__name__} declares no requests"
