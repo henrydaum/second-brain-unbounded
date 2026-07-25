@@ -41,6 +41,7 @@ from effects.vocabulary import (
     TIER_EGRESS,
     TIER_READ,
     TIER_WRITE,
+    AskUser,
     Complete,
     DeleteFile,
     Embed,
@@ -269,6 +270,11 @@ class EffectContext:
     # DENIED_SQL_IDENTIFIERS). ``None`` disables the check entirely — reserved
     # for tests; production contexts should keep the default.
     denied_sql_identifiers: frozenset[str] | None = DENIED_SQL_IDENTIFIERS
+    # Asks the human a question: (title, prompt, choices) -> answer text, or
+    # None if they declined. ``None`` for the whole field means no attended
+    # session is available, and an AskUser request fails fast rather than
+    # hanging a turn on a question nobody will see.
+    ask_user: Callable[[str, str, list[str]], str | None] | None = None
     # Gate for egress requests: (request) -> (allowed, reason).
     egress_gate: Callable[[Request], tuple[bool, str]] = default_egress_gate
     # Identity for ledger rows.
@@ -352,6 +358,20 @@ class Interpreter:
             if self.ctx.context_provider is not None:
                 text = self.ctx.context_provider(view, request.k)
             return EffectResult(value=text, tier=TIER_READ)
+        if isinstance(request, AskUser):
+            asker = self.ctx.ask_user
+            if asker is None:
+                return EffectResult(
+                    ok=False, tier=TIER_READ,
+                    error="no attended session is available to answer a question")
+            answer = asker(request.title or "Question", request.prompt,
+                           list(request.choices or []))
+            if answer is None:
+                # Declining to answer is a normal outcome the plugin must handle,
+                # not a failure of the run — same shape as an egress denial.
+                return EffectResult(ok=False, denied=True, tier=TIER_READ,
+                                    error="the user did not answer")
+            return EffectResult(value=str(answer), tier=TIER_READ)
         if isinstance(request, Respond):
             # Terminal; the runner handles it, but fulfilling is harmless.
             return EffectResult(ok=request.success, value=request.to_wire(), error=request.error, tier=TIER_READ)

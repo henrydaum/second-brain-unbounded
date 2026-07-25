@@ -162,6 +162,7 @@ class EffectsContract:
             free_write_roots=self._free_write_roots(context),
             paths=self._paths(context),
             context_provider=self._context_provider(context),
+            ask_user=self._ask_user(context),
             egress_gate=self._egress_gate(context),
             tool_name=getattr(self, "name", "plugin"),
             session_key=getattr(context, "session_key", None),
@@ -264,6 +265,38 @@ class EffectsContract:
             return json.dumps(history, default=str)
 
         return provider
+
+    def _ask_user(self, context):
+        """Wire ``AskUser`` to the session's input prompt, if a human is there.
+
+        Returns ``None`` — meaning the request fails fast — when there is no
+        input channel or the session is unattended. Attendance is a liveness
+        question, not a permission one: a scheduled subagent has nobody to
+        answer, and blocking its turn on a prompt no one will see is a hang, not
+        a safeguard. ``runtime.is_attended`` is the kernel's single reader for
+        this, so background drivers inherit the behaviour automatically."""
+        request_input = getattr(context, "request_user_input", None)
+        if request_input is None:
+            return None
+        runtime = getattr(context, "runtime", None)
+        session_key = getattr(context, "session_key", None)
+        if runtime is not None and session_key:
+            try:
+                if not runtime.is_attended(session_key):
+                    return None
+            except Exception:  # noqa: BLE001 — an unreadable runtime is not attended
+                return None
+
+        def ask(title: str, prompt: str, choices: list[str]):
+            reply = request_input(title, prompt, choices=choices) if choices \
+                else request_input(title, prompt)
+            # Frontends answer with either a bare string or a request object
+            # carrying one; normalise so plugins only ever see text.
+            if reply is None or isinstance(reply, str):
+                return reply
+            return getattr(reply, "response", None) or getattr(reply, "answer", None)
+
+        return ask
 
     def _egress_gate(self, context):
         """Kernel-served model calls pass; boundary-crossing actions route

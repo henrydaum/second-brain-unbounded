@@ -129,6 +129,34 @@ class ReadContext(Request):
     k: int | None = None
 
 
+@dataclass(frozen=True)
+class AskUser(Request):
+    """Ask the human a question and wait for the answer.
+
+    **Not egress**: the user is inside the trust domain, so showing them a
+    prompt is not a boundary crossing and needs no approval — asking to be
+    allowed to ask would be circular. It is read-tier because it mutates
+    nothing the kernel owns; what comes back is untrusted input, exactly like
+    file contents.
+
+    It does gate on **attendance**, which is a liveness question rather than a
+    permission one: an unattended session (a scheduled subagent, a background
+    driver) has nobody to answer, so the request fails fast instead of hanging a
+    turn forever. That check is `runtime.is_attended`, the kernel's single
+    reader for "is a human present at this session right now?".
+
+    ``choices`` renders as buttons where the frontend supports them and is
+    advisory otherwise — the answer is always returned as text, because a
+    frontend may not honour them and a plugin must not assume it did.
+    """
+
+    type: ClassVar[str] = "ask_user"
+    tier: ClassVar[str] = TIER_READ
+    prompt: str
+    title: str = ""
+    choices: list[str] | None = None
+
+
 # ── writes (reversible; journalled) ──────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -262,7 +290,7 @@ class RunProcess(Request):
 REQUEST_TYPES: dict[str, type[Request]] = {
     cls.type: cls
     for cls in (
-        ReadFile, ReadFiles, ListDir, Stat, QueryDb, ReadContext,
+        ReadFile, ReadFiles, ListDir, Stat, QueryDb, ReadContext, AskUser,
         WriteFile, WriteDb, DeleteFile, Respond,
         HttpRequest, Complete, Embed, ExecSql, RunProcess,
     )

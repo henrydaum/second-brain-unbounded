@@ -79,7 +79,7 @@ Apply, in order:
 | Network / services | `HttpRequest` · `Complete` · `Embed` (LLM/embedder served kernel-side; keys never enter the sandbox) | egress |
 | Compute / process | `RunProcess` (argv only — no shell string; cwd-confined; kernel owns the handle) | egress |
 | Kernel state | none — config holds API keys; a read there composes with egress into key theft | — |
-| User | none yet — a future `AskUser` is *not* egress (the human is inside the trust domain) but gates on attendance | — |
+| User | `AskUser` — *not* egress (the human is inside the trust domain, so requiring approval to request approval would be circular); gates on **attendance**, a liveness check, so an unattended session fails fast instead of hanging on a prompt nobody will see. The answer is untrusted text, like file contents. | read |
 
 **`ReadContext` ambient views.** Beyond conversation text, `ReadContext` resolves
 a few non-secret *facts* about the run straight off `EffectContext`:
@@ -146,10 +146,17 @@ Confinement remains context, not vocabulary: these are policies on
   Once the trust model below lands, provenance contains such a plugin
   automatically — but the approval stays, because two independent controls on the
   one path that converts data into code is the right number.
-- **Nondeterminism enters through the boundary.** Time, randomness, and LLM
-  completions must be requests (or params), never ambient — this is what makes
-  a tool run replayable, and it is exactly what will make conversation layers
-  content-addressable later (a stored completion is the layer's "seed").
+- **Nondeterminism enters through the boundary — for the effects that matter.**
+  LLM completions and embeddings are requests, never ambient: they are egress,
+  they cost money, and a stored completion is the seed a content-addressed turn
+  would hash. Time and randomness are deliberately **left ambient** (`time`,
+  `random`, `uuid` stay importable). They are not security-relevant — a clock
+  read crosses no boundary and mutates nothing — and routing them through the
+  wire would buy only replayability, which nothing consumes yet. If the
+  conversation-DAG work later needs deterministic replay, the fix is to add
+  `Now`/`Random` requests and drop those modules from the import allowlist; until
+  then the cost is not worth paying. Recorded here so the gap is a decision
+  rather than an oversight.
 - **Covert channels are out of scope.** Timing and resource-exhaustion
   channels exist in every practical sandbox; they are low-bandwidth and
   accepted, not denied.
