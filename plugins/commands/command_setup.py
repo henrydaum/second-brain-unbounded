@@ -10,15 +10,7 @@ Three phases, all in one pass:
      installed.
 """
 
-import os
-import socket
-
-from config import config_manager
-from paths import DATA_DIR
 from plugins.BaseCommand import BaseCommand
-from plugins.commands.helpers import package_manager
-from plugins.services.service_llm import llm_backend_names
-from state_machine.conversation import FormStep
 
 
 ATLAS_BASE_URL = "https://api.atlascloud.ai/v1"
@@ -105,313 +97,350 @@ PACKAGES_SECTION = (
 
 
 class SetupCommand(BaseCommand):
-    """Slash-command handler for `/setup`."""
+    """Slash-command handler for `/setup`.
+
+    The command a fresh install depends on, and the one most exposed to the scope
+    question: it writes an API key, installs code from the network, and saves
+    Telegram credentials into a plugin's config file *before that plugin exists*.
+    That last case is why ``WriteConfig`` carries an explicit ``plugin`` scope —
+    discovery cannot classify a key whose owner is not installed yet, so the
+    caller has to say which file it means.
+
+    Connectivity checking moved kernel-side with the conversion. Opening a socket
+    to probe the network is exactly the ambient reach a sandboxed body must not
+    have, and the caller only ever wanted a legible failure instead of an opaque
+    download error.
+    """
     name = "setup"
     description = "Onboarding: install a starter bundle, then configure an LLM and Telegram"
     category = "System"
 
-    def form(self, args, context):
-        """Build the dynamic onboarding form."""
-        steps = []
-        backend_ready = bool(llm_backend_names())
+    contract = "effects"
+    declared_requests = ["read_context", "read_config", "write_config", "package_op"]
 
-        # Phase 1 — packages. Only lead with this when there's no LLM backend yet
-        # (a fresh install). A returning user skips straight to reconfiguring.
-        if not backend_ready:
-            steps.append(FormStep(
-                "install_choice", WELCOME_PROMPT, True,
-                enum=[STARTER_BUNDLE, FULL_BUNDLE, "skip"],
-                enum_labels=[
+    def form(self, params):
+        """Build the dynamic onboarding form."""
+        backends = yield from _view("llm_backends")
+        steps = []
+
+        # Phase 1 — packages. Only lead with this when there is no LLM backend
+        # yet (a fresh install). A returning user skips straight to reconfiguring.
+        if not backends:
+            steps.append({
+                "name": "install_choice", "required": True, "columns": 1,
+                "prompt": WELCOME_PROMPT,
+                "enum": [STARTER_BUNDLE, FULL_BUNDLE, "skip"],
+                "enum_labels": [
                     "Install the starter bundle (recommended)",
                     "Install the full bundle (everything — larger download)",
                     "Skip — I'll use /packages myself",
-                ],
-                columns=1,
-            ))
-            choice = args.get("install_choice")
+                ]})
+            choice = params.get("install_choice")
             if not choice or choice == "skip":
                 return steps
             # starter and full both include the LiteLLM backend + Telegram frontend.
             will_have_telegram = True
         else:
-            will_have_telegram = _package_installed(TELEGRAM_PACKAGE)
+            will_have_telegram = yield from _telegram_installed()
 
         # Phase 2 — LLM profile.
-        steps.append(FormStep(
-            "llm_choice", LLM_INTRO_PROMPT, True,
-            enum=["atlas", "other"],
-            enum_labels=["Set up Atlas Cloud", "Use another provider"],
-            columns=1,
-        ))
-        llm_choice = args.get("llm_choice")
+        steps.append({"name": "llm_choice", "required": True, "columns": 1,
+                      "prompt": LLM_INTRO_PROMPT, "enum": ["atlas", "other"],
+                      "enum_labels": ["Set up Atlas Cloud", "Use another provider"]})
+        llm_choice = params.get("llm_choice")
         if llm_choice == "atlas":
-            steps.extend(self._atlas_steps(args))
+            steps += _atlas_steps(params)
         elif llm_choice == "other":
-            steps.extend(self._other_steps(args))
+            steps += _other_steps(backends or [DEFAULT_BACKEND])
 
         # Phase 3 — Telegram, once the LLM branch is satisfied and the frontend
         # is (being) installed.
-        if will_have_telegram and _llm_steps_complete(args, llm_choice):
-            steps.extend(self._telegram_steps(args))
+        if will_have_telegram and _llm_steps_complete(params, llm_choice):
+            steps += _telegram_steps(params)
         return steps
 
-    def _atlas_steps(self, args):
-        """Atlas Cloud key/model collection."""
-        steps = [FormStep(
-            "key_source", KEY_SOURCE_PROMPT, True,
-            enum=["direct", "env_var"],
-            enum_labels=["Paste the key directly", "Use an environment variable (you'll set it yourself)"],
-            columns=1,
-        )]
-        if args.get("key_source") == "direct":
-            steps.append(FormStep("api_key", "Paste your Atlas Cloud API key.", True))
-        elif args.get("key_source") == "env_var":
-            steps.append(FormStep("env_var_name", ENV_VAR_PROMPT, True, default=DEFAULT_ENV_VAR))
-        if args.get("key_source"):
-            steps.append(FormStep(
-                "model_name",
-                "Model name to use as your default profile. You can change this later with /llm.",
-                False, default=ATLAS_DEFAULT_MODEL, prompt_when_missing=True,
-            ))
-        return steps
-
-    def _other_steps(self, args):
-        """Generic LLM profile collection (mirrors /llm add)."""
-        backends = llm_backend_names() or [DEFAULT_BACKEND]
-        return [
-            FormStep("other_model_name", OTHER_MODEL_PROMPT, True),
-            FormStep("other_service_class", OTHER_SERVICE_PROMPT, True,
-                     enum=backends, default=backends[0], columns=1),
-            FormStep("other_endpoint", OTHER_ENDPOINT_PROMPT, False, default="", prompt_when_missing=True),
-            FormStep("other_api_key", OTHER_KEY_PROMPT, False, default="", prompt_when_missing=True),
-            FormStep("other_context_size", OTHER_CONTEXT_PROMPT, False, "integer", default=0, prompt_when_missing=True),
-        ]
-
-    def _telegram_steps(self, args):
-        """Telegram bot credential collection."""
-        steps = [FormStep(
-            "telegram_choice", TELEGRAM_PROMPT, True,
-            enum=["setup", "skip"],
-            enum_labels=["Set up Telegram", "Skip — I'll use the REPL for now"],
-            columns=1,
-        )]
-        if args.get("telegram_choice") == "setup":
-            steps.append(FormStep("telegram_bot_token", TELEGRAM_TOKEN_PROMPT, True))
-            steps.append(FormStep("telegram_allowed_user_id", TELEGRAM_USER_PROMPT, True, "integer"))
-        return steps
-
-    def run(self, args, context):
+    def run(self, params):
         """Execute `/setup` for the active session."""
-        install_choice = args.get("install_choice")
+        from effects.vocabulary import PackageOp, Respond
+
+        install_choice = params.get("install_choice")
         if install_choice == "skip":
-            return self._skip_section()
+            return Respond(data=_skip_section())
 
         sections = []
-        env_warning = None
+        warning = None
 
         # Phase 1 — install the chosen bundle before configuring anything that
-        # depends on it. Bail clearly if there's no connectivity or the install
-        # fails, so we don't pretend a half-set-up instance is ready.
+        # depends on it. Bail clearly rather than pretend a half-set-up instance
+        # is ready.
         if install_choice in (STARTER_BUNDLE, FULL_BUNDLE):
-            if not _has_internet():
-                return (
-                    f"No internet connection detected. Installing the `{install_choice}` "
-                    "bundle needs to download packages and their dependencies. Connect "
-                    "to the internet and run /setup again."
-                )
-            try:
-                result = package_manager.install_package(context.root_dir, install_choice, context)
-            except Exception as e:
-                return (
-                    f"Couldn't install the `{install_choice}` bundle: {e}\n\n"
-                    f"Resolve the issue (or try `/packages install {install_choice}`), then re-run /setup."
-                )
-            sections.append(f"Installed the `{install_choice}` bundle.\n" + _indent(result.text()))
+            result = yield PackageOp(name=install_choice, action="install")
+            if not result.ok:
+                return Respond(data=(
+                    f"Couldn't install the `{install_choice}` bundle: {result.error}\n\n"
+                    f"Resolve the issue (or try `/packages install {install_choice}`), "
+                    "then re-run /setup."))
+            sections.append(f"Installed the `{install_choice}` bundle.\n"
+                            + _indent((result.value or {}).get("text") or ""))
 
         # Phase 2 — LLM profile.
-        llm_choice = args.get("llm_choice")
+        llm_choice = params.get("llm_choice")
         if llm_choice == "atlas":
-            result = self._save_atlas(args, context)
-            if isinstance(result, str):
-                return result
-            sections.append(result[0])
-            env_warning = result[1]
+            outcome = yield from _save_atlas(params)
+            if isinstance(outcome, str):
+                return Respond(data=outcome)
+            section, warning = outcome
+            sections.append(section)
         elif llm_choice == "other":
-            result = self._save_other(args, context)
-            if isinstance(result, str):
-                return result
-            sections.append(result)
+            outcome = yield from _save_other(params)
+            if not outcome.startswith("LLM:"):
+                return Respond(data=outcome)
+            sections.append(outcome)
 
         # Phase 3 — Telegram.
-        if args.get("telegram_choice") == "setup":
-            sections.append(self._save_telegram(args))
-        elif args.get("telegram_choice") == "skip":
-            sections.append("Telegram: skipped. Use /config to add `telegram_bot_token` and `telegram_allowed_user_id` later.")
+        if params.get("telegram_choice") == "setup":
+            sections.append((yield from _save_telegram(params)))
+        elif params.get("telegram_choice") == "skip":
+            sections.append("Telegram: skipped. Use /config to add `telegram_bot_token` "
+                            "and `telegram_allowed_user_id` later.")
 
         sections.append(PACKAGES_SECTION)
-        sections.append(self._location_section())
-        sections.append(self._hint_section())
-        if env_warning:
-            sections.insert(0, env_warning)
-        return "\n\n".join(s for s in sections if s)
+        sections.append((yield from _location_section()))
+        sections.append(_hint_section())
+        if warning:
+            sections.insert(0, warning)
+        return Respond(data="\n\n".join(s for s in sections if s))
 
-    # ──────────────────────────────────────────────────────────────────
-    # Persistence helpers
-    # ──────────────────────────────────────────────────────────────────
 
-    def _save_atlas(self, args, context):
-        """Persist an Atlas Cloud LLM profile. Returns (section, warning|None) or error string."""
-        key_source = args.get("key_source")
-        if key_source == "direct":
-            api_key_field = (args.get("api_key") or "").strip()
-            env_var_set = True
-        elif key_source == "env_var":
-            api_key_field = (args.get("env_var_name") or DEFAULT_ENV_VAR).strip() or DEFAULT_ENV_VAR
-            env_var_set = bool(os.environ.get(api_key_field))
-        else:
-            return "Setup cancelled."
-        if not api_key_field:
-            return "An API key (or environment variable name) is required."
-        model_name = (args.get("model_name") or ATLAS_DEFAULT_MODEL).strip() or ATLAS_DEFAULT_MODEL
+# ──────────────────────────────────────────────────────────────────────
+# Step builders
+# ──────────────────────────────────────────────────────────────────────
 
-        profile = {
-            "llm_endpoint": ATLAS_BASE_URL,
-            "llm_api_key": api_key_field,
-            "llm_context_size": DEFAULT_CONTEXT_SIZE,
-            "llm_service_class": DEFAULT_BACKEND,
-        }
-        _install_llm_profile(context, model_name, profile)
+def _atlas_steps(params: dict) -> list[dict]:
+    """Atlas Cloud key/model collection."""
+    steps = [{"name": "key_source", "required": True, "columns": 1,
+              "prompt": KEY_SOURCE_PROMPT, "enum": ["direct", "env_var"],
+              "enum_labels": ["Paste the key directly",
+                              "Use an environment variable (you'll set it yourself)"]}]
+    if params.get("key_source") == "direct":
+        steps.append({"name": "api_key", "required": True,
+                      "prompt": "Paste your Atlas Cloud API key."})
+    elif params.get("key_source") == "env_var":
+        steps.append({"name": "env_var_name", "required": True,
+                      "default": DEFAULT_ENV_VAR, "prompt": ENV_VAR_PROMPT})
+    if params.get("key_source"):
+        steps.append({"name": "model_name", "required": False,
+                      "default": ATLAS_DEFAULT_MODEL, "prompt_when_missing": True,
+                      "prompt": ("Model name to use as your default profile. You can "
+                                 "change this later with /llm.")})
+    return steps
 
-        section = (
-            f"LLM: Atlas Cloud set up. Default profile: {model_name}\n"
-            f"  Endpoint: {ATLAS_BASE_URL}\n"
-            f"  Coding plan: {ATLAS_CODING_PLAN_URL}\n"
-            "  Use /llm to edit the profile or add more models."
-        )
-        warning = None
-        if key_source == "env_var" and not env_var_set:
-            warning = (
-                f"Note: ${api_key_field} is not currently set in this environment. "
-                "Set it before sending your first message or Atlas calls will fail."
-            )
-        return section, warning
 
-    def _save_other(self, args, context):
-        """Persist a generic LLM profile. Returns section string or error string."""
-        name = (args.get("other_model_name") or "").strip()
-        if not name:
-            return "Model name is required."
-        profile = {
-            "llm_endpoint": (args.get("other_endpoint") or "").strip(),
-            "llm_api_key": (args.get("other_api_key") or "").strip(),
-            "llm_context_size": int(args.get("other_context_size") or 0),
-            "llm_service_class": (args.get("other_service_class") or DEFAULT_BACKEND).strip() or DEFAULT_BACKEND,
-        }
-        _install_llm_profile(context, name, profile)
-        endpoint = profile["llm_endpoint"] or "(provider default)"
-        return (
-            f"LLM: profile `{name}` added and set as default.\n"
-            f"  Service class: {profile['llm_service_class']}\n"
-            f"  Endpoint: {endpoint}\n"
-            "  Use /llm to edit or add more models."
-        )
+def _other_steps(backends: list[str]) -> list[dict]:
+    """Generic LLM profile collection (mirrors /llm add)."""
+    return [
+        {"name": "other_model_name", "required": True, "prompt": OTHER_MODEL_PROMPT},
+        {"name": "other_service_class", "required": True, "columns": 1,
+         "enum": backends, "default": backends[0], "prompt": OTHER_SERVICE_PROMPT},
+        {"name": "other_endpoint", "required": False, "default": "",
+         "prompt_when_missing": True, "prompt": OTHER_ENDPOINT_PROMPT},
+        {"name": "other_api_key", "required": False, "default": "",
+         "prompt_when_missing": True, "prompt": OTHER_KEY_PROMPT},
+        {"name": "other_context_size", "required": False, "type": "integer",
+         "default": 0, "prompt_when_missing": True, "prompt": OTHER_CONTEXT_PROMPT},
+    ]
 
-    def _save_telegram(self, args):
-        """Persist Telegram credentials into plugin_config."""
-        token = (args.get("telegram_bot_token") or "").strip()
-        user_id = int(args.get("telegram_allowed_user_id") or 0)
-        saved = config_manager.load_plugin_config()
-        saved["telegram_bot_token"] = token
-        saved["telegram_allowed_user_id"] = user_id
-        config_manager.save_plugin_config(saved)
-        return (
-            f"Telegram: configured for user {user_id}.\n"
-            "  Restart Second Brain to bring the bot online, then send /start to your bot in Telegram."
-        )
 
-    def _skip_section(self):
-        """Guidance when the user declines the starter install."""
-        return (
-            "Skipped package install.\n\n"
+def _telegram_steps(params: dict) -> list[dict]:
+    """Telegram bot credential collection."""
+    steps = [{"name": "telegram_choice", "required": True, "columns": 1,
+              "prompt": TELEGRAM_PROMPT, "enum": ["setup", "skip"],
+              "enum_labels": ["Set up Telegram", "Skip — I'll use the REPL for now"]}]
+    if params.get("telegram_choice") == "setup":
+        steps.append({"name": "telegram_bot_token", "required": True,
+                      "prompt": TELEGRAM_TOKEN_PROMPT})
+        steps.append({"name": "telegram_allowed_user_id", "required": True,
+                      "type": "integer", "prompt": TELEGRAM_USER_PROMPT})
+    return steps
+
+
+def _llm_steps_complete(params: dict, choice) -> bool:
+    """Whether the LLM branch has collected enough to move on to Telegram."""
+    if choice == "atlas":
+        source = params.get("key_source")
+        if source == "direct":
+            return bool(params.get("api_key"))
+        if source == "env_var":
+            return bool(params.get("env_var_name"))
+        return False
+    if choice == "other":
+        return bool(params.get("other_model_name") and params.get("other_service_class"))
+    return False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Persistence
+# ──────────────────────────────────────────────────────────────────────
+
+def _save_atlas(params: dict):
+    """Persist an Atlas Cloud LLM profile. Returns (section, warning) or an error."""
+    source = params.get("key_source")
+    if source == "direct":
+        key_field = (params.get("api_key") or "").strip()
+    elif source == "env_var":
+        key_field = (params.get("env_var_name") or DEFAULT_ENV_VAR).strip() or DEFAULT_ENV_VAR
+    else:
+        return "Setup cancelled."
+    if not key_field:
+        return "An API key (or environment variable name) is required."
+
+    model = (params.get("model_name") or ATLAS_DEFAULT_MODEL).strip() or ATLAS_DEFAULT_MODEL
+    error = yield from _install_profile(model, {
+        "llm_endpoint": ATLAS_BASE_URL,
+        "llm_api_key": key_field,
+        "llm_context_size": DEFAULT_CONTEXT_SIZE,
+        "llm_service_class": DEFAULT_BACKEND,
+    })
+    if error:
+        return error
+
+    section = (f"LLM: Atlas Cloud set up. Default profile: {model}\n"
+               f"  Endpoint: {ATLAS_BASE_URL}\n"
+               f"  Coding plan: {ATLAS_CODING_PLAN_URL}\n"
+               "  Use /llm to edit the profile or add more models.")
+    warning = None
+    if source == "env_var":
+        # The plugin cannot read the environment — that is ambient reach it does
+        # not have — so this note is unconditional rather than conditional on the
+        # variable actually being unset. A reminder the user does not need is
+        # cheaper than a silent failure on their first message.
+        warning = (f"Note: make sure ${key_field} is set in your environment before "
+                   "sending your first message, or Atlas calls will fail.")
+    return section, warning
+
+
+def _save_other(params: dict):
+    """Persist a generic LLM profile. Returns a section or an error string."""
+    name = (params.get("other_model_name") or "").strip()
+    if not name:
+        return "Model name is required."
+    try:
+        size = int(params.get("other_context_size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    service_class = ((params.get("other_service_class") or DEFAULT_BACKEND).strip()
+                     or DEFAULT_BACKEND)
+    endpoint = (params.get("other_endpoint") or "").strip()
+
+    error = yield from _install_profile(name, {
+        "llm_endpoint": endpoint,
+        "llm_api_key": (params.get("other_api_key") or "").strip(),
+        "llm_context_size": size,
+        "llm_service_class": service_class,
+    })
+    if error:
+        return error
+    return (f"LLM: profile `{name}` added and set as default.\n"
+            f"  Service class: {service_class}\n"
+            f"  Endpoint: {endpoint or '(provider default)'}\n"
+            "  Use /llm to edit or add more models.")
+
+
+def _install_profile(name: str, profile: dict):
+    """Add a profile and make it the default. Returns '' or an error message.
+
+    Writing ``llm_profiles`` is also what hot-loads the backend: the kernel
+    resyncs the router when that key changes, so there is nothing for the plugin
+    to register."""
+    from effects.vocabulary import ReadConfig, WriteConfig
+
+    current = yield ReadConfig(key="llm_profiles")
+    profiles = dict(current.value or {})
+    profiles[name] = profile
+
+    # scope="plugin" explicitly rather than relying on discovery to classify
+    # these as plugin-declared. /setup is the *fresh install* path, so it must
+    # not depend on service_llm's settings having been discovered yet -- that is
+    # precisely the ordering that is least likely to hold here.
+    written = yield WriteConfig(key="llm_profiles", value=profiles, scope="plugin")
+    if not written.ok:
+        return f"Could not save the LLM profile: {written.error}"
+    written = yield WriteConfig(key="default_llm_profile", value=name, scope="plugin")
+    if not written.ok:
+        return f"Could not set the default LLM: {written.error}"
+    return ""
+
+
+def _save_telegram(params: dict):
+    """Persist Telegram credentials into plugin config."""
+    from effects.vocabulary import WriteConfig
+
+    token = (params.get("telegram_bot_token") or "").strip()
+    try:
+        user_id = int(params.get("telegram_allowed_user_id") or 0)
+    except (TypeError, ValueError):
+        user_id = 0
+
+    # scope="plugin" explicitly: the Telegram frontend may not be installed yet,
+    # so discovery cannot tell these keys are plugin-owned.
+    for key, value in (("telegram_bot_token", token),
+                       ("telegram_allowed_user_id", user_id)):
+        written = yield WriteConfig(key=key, value=value, scope="plugin")
+        if not written.ok:
+            return f"Telegram: could not save credentials ({written.error})."
+    return (f"Telegram: configured for user {user_id}.\n"
+            "  Restart Second Brain to bring the bot online, then send /start to "
+            "your bot in Telegram.")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Sections
+# ──────────────────────────────────────────────────────────────────────
+
+def _view(name: str):
+    """Yield one inventory view."""
+    from effects.vocabulary import ReadContext
+
+    result = yield ReadContext(view=name)
+    return result.value or []
+
+
+def _telegram_installed():
+    """Whether the Telegram frontend has an install receipt."""
+    catalog = yield from _view("packages")
+    installed = catalog.get("installed", []) if isinstance(catalog, dict) else []
+    return any(item.get("id") == TELEGRAM_PACKAGE for item in installed)
+
+
+def _skip_section() -> str:
+    """Guidance when the user declines the starter install."""
+    return ("Skipped package install.\n\n"
             "Second Brain needs at least an LLM backend before it can do anything. "
             "When you're ready:\n"
             f"  /packages install {STARTER_BUNDLE}   — the recommended baseline\n"
             f"  /packages install {FULL_BUNDLE}      — everything\n"
             "  /packages available        — browse the store by category\n\n"
-            "Then run /setup again to configure your LLM and Telegram."
-        )
-
-    def _location_section(self):
-        """One-paragraph summary of where things live on disk."""
-        return (
-            "Files & data:\n"
-            f"  DATA_DIR: {DATA_DIR}\n"
-            "  Holds your config (config.json, plugin_config.json), the SQLite database, the attachment cache, installed packages, and any sandbox plugins the agent writes for itself.\n"
-            "  Run /locations to see existing plugins, and /config to view and edit your config files."
-        )
-
-    def _hint_section(self):
-        """Closing hint about how to continue."""
-        return (
-            "You're ready. Run /new to start a conversation, then just ask the LLM anything — "
-            "how Second Brain works, what tools are available, how to set up a task, and more!"
-        )
+            "Then run /setup again to configure your LLM and Telegram.")
 
 
-def _llm_steps_complete(args, choice):
-    """Return True once the LLM branch has collected enough to move on to Telegram."""
-    if choice == "atlas":
-        key_source = args.get("key_source")
-        if key_source == "direct":
-            return bool(args.get("api_key"))
-        if key_source == "env_var":
-            return bool(args.get("env_var_name"))
-        return False
-    if choice == "other":
-        return bool(args.get("other_model_name") and args.get("other_service_class"))
-    return False
+def _location_section():
+    """One-paragraph summary of where things live on disk."""
+    paths = yield from _view("paths")
+    data_dir = paths.get("data", "(unknown)") if isinstance(paths, dict) else "(unknown)"
+    return ("Files & data:\n"
+            f"  DATA_DIR: {data_dir}\n"
+            "  Holds your config (config.json, plugin_config.json), the SQLite "
+            "database, the attachment cache, installed packages, and any sandbox "
+            "plugins the agent writes for itself.\n"
+            "  Run /locations to see existing plugins, and /config to view and edit "
+            "your config files.")
 
 
-def _install_llm_profile(context, name, profile):
-    """Register a new LLM profile, set it as default, hot-load it, and persist."""
-    profiles = context.config.setdefault("llm_profiles", {})
-    profiles[name] = profile
-    context.config["default_llm_profile"] = name
-    router = (context.services or {}).get("llm")
-    if router and hasattr(router, "add_llm"):
-        try:
-            router.add_llm(name, profile)
-        except Exception:
-            # Config is still persisted below; the profile loads on next start
-            # even if hot-loading the backend now didn't take.
-            pass
-    _save(context.config)
-
-
-def _save(config):
-    """Internal helper to save setup-affected keys to plugin config."""
-    saved = config_manager.load_plugin_config()
-    saved.update({k: config.get(k) for k in ("llm_profiles", "default_llm_profile")})
-    config_manager.save_plugin_config(saved)
-
-
-def _package_installed(package_id):
-    """Whether a package id has an install receipt."""
-    try:
-        return any(p.get("id") == package_id for p in package_manager.installed_packages())
-    except Exception:
-        return False
-
-
-def _has_internet(timeout: float = 3.0) -> bool:
-    """Best-effort connectivity check before a package download."""
-    for host, port in (("github.com", 443), ("1.1.1.1", 53)):
-        try:
-            with socket.create_connection((host, port), timeout=timeout):
-                return True
-        except OSError:
-            continue
-    return False
+def _hint_section() -> str:
+    """Closing hint about how to continue."""
+    return ("You're ready. Run /new to start a conversation, then just ask the LLM "
+            "anything — how Second Brain works, what tools are available, how to set "
+            "up a task, and more!")
 
 
 def _indent(text: str) -> str:

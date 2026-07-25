@@ -364,10 +364,21 @@ class RunProcess(Request):
 
 @dataclass(frozen=True)
 class WriteConfig(Request):
-    """Set one config key. ``scope`` is ``"global"`` (the kernel config file) or
-    ``"user"`` (the current user's config blob). Irreversible in the sense that
-    matters: the value it overwrites is not journalled, and config governs the
-    confinement policy itself."""
+    """Set one config key. Irreversible in the sense that matters: the value it
+    overwrites is not journalled, and config governs the confinement policy
+    itself.
+
+    ``scope`` names one of the three places config actually lives, which is the
+    same three ``/config`` shows as storage locations:
+
+    - ``global`` — the kernel config file, plus plugin_config.json when the key
+      turns out to be plugin-declared.
+    - ``plugin`` — plugin_config.json explicitly, for a key whose owning plugin
+      is not installed *yet*. ``/setup`` needs this: it writes Telegram
+      credentials before the Telegram frontend exists, so discovery cannot tell
+      that the key is plugin-owned.
+    - ``user`` — the current user's config blob, never the shared files.
+    """
 
     type: ClassVar[str] = "write_config"
     tier: ClassVar[str] = TIER_EGRESS

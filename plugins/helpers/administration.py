@@ -75,6 +75,19 @@ def _rescan_watcher(context) -> None:
         watcher.rescan()
 
 
+def _has_internet(timeout: float = 3.0) -> bool:
+    """Best-effort connectivity probe before a package download."""
+    import socket
+
+    for host, port in (("github.com", 443), ("1.1.1.1", 53)):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _progress_sink(runtime, session_key):
     """Where long-running administration reports its progress.
 
@@ -122,6 +135,18 @@ def build_administer(db, config: dict, services: dict, runtime, session_key: str
                 blob = db.get_user_config(uid)
                 blob[request.key] = request.value
                 db.set_user_config(uid, blob)
+            elif request.scope == "plugin":
+                # Explicitly plugin config, for a key whose owning plugin is not
+                # installed yet — /setup writing Telegram credentials before the
+                # Telegram frontend exists. Discovery cannot classify such a key,
+                # so the caller has to say.
+                plugin_saved = config_manager.load_plugin_config()
+                plugin_saved[request.key] = request.value
+                config_manager.save_plugin_config(plugin_saved)
+                if config is not None:
+                    config[request.key] = request.value
+                if runtime is not None and getattr(runtime, "config", None) is not None:
+                    runtime.config[request.key] = request.value
             else:
                 saved = config_manager.load()
                 saved[request.key] = request.value
@@ -197,6 +222,15 @@ def build_administer(db, config: dict, services: dict, runtime, session_key: str
             root = getattr(context, "root_dir", None)
             progress = _progress_sink(runtime, session_key)
             action = request.action
+            if action in ("install", "update") and not _has_internet():
+                # Checked here rather than in the plugin: opening a socket to
+                # probe connectivity is exactly the kind of ambient network reach
+                # a sandboxed body must not have, and the caller only wants a
+                # legible failure rather than an opaque download error.
+                raise RuntimeError(
+                    "No internet connection detected. Installing packages needs to "
+                    "download them and their dependencies. Connect to the internet "
+                    "and try again.")
             if action == "install":
                 result = package_manager.install_package(
                     root, request.name, context, progress=progress)

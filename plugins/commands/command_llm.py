@@ -184,7 +184,9 @@ def _save_profiles(profiles: dict) -> str:
     derived state, so the plugin does not touch it."""
     from effects.vocabulary import WriteConfig
 
-    result = yield WriteConfig(key="llm_profiles", value=profiles)
+    # scope="plugin": these keys belong to service_llm's config file, and saying
+    # so is more robust than relying on discovery to classify them.
+    result = yield WriteConfig(key="llm_profiles", value=profiles, scope="plugin")
     return "" if result.ok else f"Could not save LLM profiles: {result.error}"
 
 
@@ -192,7 +194,7 @@ def _save_default(name: str) -> str:
     """Persist the default profile name. Returns an error message, or ''."""
     from effects.vocabulary import WriteConfig
 
-    result = yield WriteConfig(key="default_llm_profile", value=name)
+    result = yield WriteConfig(key="default_llm_profile", value=name, scope="plugin")
     return "" if result.ok else f"Could not set the default LLM: {result.error}"
 
 
