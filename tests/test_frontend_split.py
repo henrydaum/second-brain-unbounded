@@ -74,3 +74,74 @@ def test_the_transport_exception_is_documented():
     doc = (Path(__file__).resolve().parents[1] / "effects" / "PRIMITIVES.md").read_text(encoding="utf-8")
 
     assert "frontend transports" in doc
+
+
+# ── the contract branches at one place ───────────────────────────────────
+
+def test_a_legacy_frontend_renders_directly(monkeypatch):
+    """The default contract calls the subclass method, exactly as before."""
+    seen = []
+
+    class _Legacy(BaseFrontend):
+        name = "legacy_fe"
+
+        def render_messages(self, session_key, messages):
+            seen.append((session_key, messages))
+
+    fe = _Legacy()
+    fe._render("render_messages", "s1", ["hi"])
+
+    assert seen == [("s1", ["hi"])]
+
+
+def test_an_effects_frontend_renders_through_the_boundary():
+    """An effects frontend has its render driven through the shared boundary,
+    with the payload passed as data -- possible only because rendering is
+    addressed by session_key rather than by a live connection."""
+    calls = []
+
+    class _Effects(BaseFrontend):
+        name = "effects_fe"
+        contract = "effects"
+
+        def _render_context(self, session_key):
+            return None
+
+        def _perform_effects(self, context, params, *, method="run"):
+            calls.append((method, params))
+            from sandbox.driver import SandboxOutcome
+            return SandboxOutcome(success=True, data="rendered")
+
+    fe = _Effects()
+    result = fe._render("render_messages", "s1", ["hi"])
+
+    assert result == "rendered"
+    assert calls == [("render_messages", {"session_key": "s1", "args": [["hi"]]})]
+
+
+def test_a_failing_sandboxed_render_does_not_break_the_turn():
+    """A frontend that cannot draw must not break the turn that produced the
+    text -- renders are fire-and-forget by design."""
+
+    class _Broken(BaseFrontend):
+        name = "broken_fe"
+        contract = "effects"
+
+        def _render_context(self, session_key):
+            return None
+
+        def _perform_effects(self, context, params, *, method="run"):
+            from sandbox.driver import SandboxOutcome
+            return SandboxOutcome.failed("child died", "SandboxFailure")
+
+    assert _Broken()._render("render_messages", "s1", ["hi"]) is None
+
+
+def test_transport_methods_are_never_routed_through_the_contract():
+    """start/stop stay on the trusted side: a frontend's transport is the half
+    that holds the handle and owns the loop."""
+    import inspect
+
+    source = inspect.getsource(BaseFrontend._render)
+    for method in TRANSPORT_METHODS:
+        assert f'"{method}"' not in source

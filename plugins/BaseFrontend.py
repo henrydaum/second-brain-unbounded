@@ -55,6 +55,7 @@ from state_machine.conversation_phases import (
 from state_machine.approval import StateMachineApprovalRequest
 from runtime.session import RuntimeResult
 from pipeline.database import DEFAULT_USER_ID
+from plugins.EffectsContract import EffectsContract
 
 logger = logging.getLogger("Frontend")
 
@@ -113,7 +114,7 @@ class FrontendCapabilities:
     supports_streaming: bool = False
 
 
-class BaseFrontend:
+class BaseFrontend(EffectsContract):
     """
     The contract every frontend implements.
 
@@ -278,6 +279,46 @@ class BaseFrontend:
         "render_typing", "render_tool_status", "render_stream_delta",
         "render_queued_ack", "render_conversation_banner",
     )
+
+    def _render(self, method: str, session_key: str, *args):
+        """Every render goes through here, so the contract branches once.
+
+        A ``legacy`` frontend calls its own method, exactly as before. An
+        ``effects`` frontend has that method driven through the boundary, with
+        the payload passed as data — which is possible only because rendering is
+        addressed by ``session_key`` rather than by a live connection.
+
+        Renders are **fire-and-forget by design**: the base already wraps every
+        call site in a try/except because a frontend that cannot draw must not
+        break the turn that produced the text. The one exception is
+        ``render_queued_ack``, whose truthy return means "handled out of band",
+        so its value is passed back.
+        """
+        if self.contract != "effects":
+            return getattr(self, method)(session_key, *args)
+        payload = {"session_key": session_key, "args": list(args)}
+        outcome = self._perform_effects(self._render_context(session_key), payload,
+                                        method=method)
+        if not outcome.success:
+            logger.warning("Frontend '%s' %s failed: %s", self.name, method, outcome.error)
+            return None
+        return outcome.data
+
+    def _render_context(self, session_key: str):
+        """A ``SecondBrainContext`` for a sandboxed render call.
+
+        The frontend never receives the runtime here — the transport half holds
+        that, on this side of the line."""
+        from runtime.context import build_context
+
+        runtime = self.runtime
+        return build_context(
+            getattr(runtime, "db", None),
+            getattr(runtime, "config", {}) or {},
+            getattr(runtime, "services", {}) or {},
+            runtime=runtime,
+            session_key=session_key,
+        )
 
     def render_messages(self, session_key: str, messages: list[str]) -> None:
         """Render messages."""
@@ -613,7 +654,7 @@ class BaseFrontend:
                 with self._approval_lock:
                     self._pending_approvals.setdefault(key, {})[req.id] = req
                     self._pending_approval_order.setdefault(key, []).append(req.id)
-                self.render_approval_request(key, req)
+                self._render("render_approval_request", key, req)
             except Exception:
                 logger.exception(f"render_approval_request failed for '{self.name}'")
 
@@ -632,7 +673,7 @@ class BaseFrontend:
         keys = [target] if target in live else live
         for key in keys:
             try:
-                self.render_form_field(key, dict(form))
+                self._render("render_form_field", key, dict(form))
             except Exception:
                 logger.exception(f"render_form_field failed for '{self.name}'")
 
@@ -688,7 +729,7 @@ class BaseFrontend:
             if self._consume_streamed(key, body):
                 continue  # already rendered incrementally as a stream
             try:
-                self.render_messages(key, [body])
+                self._render("render_messages", key, [body])
             except Exception:
                 logger.exception(f"render_messages (push) failed for '{self.name}'")
 
@@ -716,7 +757,7 @@ class BaseFrontend:
             with self._stream_lock:
                 self._active_stream_ids[key] = stream_id
         try:
-            self.render_stream_delta(key, dict(payload))
+            self._render("render_stream_delta", key, dict(payload))
         except Exception:
             logger.exception(f"render_stream_delta failed for '{self.name}'")
 
@@ -774,7 +815,7 @@ class BaseFrontend:
         if not session_key or session_key not in self._live_session_keys():
             return
         try:
-            self.render_typing(session_key, on)
+            self._render("render_typing", session_key, on)
         except Exception:
             logger.exception(f"render_typing failed for '{self.name}'")
 
@@ -785,7 +826,7 @@ class BaseFrontend:
         if not key or key not in self._live_session_keys():
             return
         try:
-            self.render_conversation_banner(key, dict(payload))
+            self._render("render_conversation_banner", key, dict(payload))
         except Exception:
             logger.exception(f"render_conversation_banner failed for '{self.name}'")
 
@@ -836,23 +877,23 @@ class BaseFrontend:
         """Internal helper to render result."""
         if result is None:
             return
-        if (result.data or {}).get("queued") and self.render_queued_ack(session_key):
+        if (result.data or {}).get("queued") and self._render("render_queued_ack", session_key):
             return  # acknowledged out-of-band (e.g. a message reaction)
         if result.messages:
             messages = [m for m in result.messages if not self._consume_streamed(session_key, m)]
             if messages:
-                self.render_messages(session_key, messages)
+                self._render("render_messages", session_key, messages)
         if result.attachments:
-            self.render_attachments(session_key, list(result.attachments))
+            self._render("render_attachments", session_key, list(result.attachments))
         if result.form:
-            self.render_form_field(session_key, dict(result.form))
+            self._render("render_form_field", session_key, dict(result.form))
         if result.buttons:
-            self.render_buttons(session_key, list(result.buttons))
+            self._render("render_buttons", session_key, list(result.buttons))
         if result.error:
-            self.render_error(session_key, dict(result.error))
+            self._render("render_error", session_key, dict(result.error))
         req = self._current_approval_request(session_key)
         if req:
-            self.render_approval_request(session_key, req)
+            self._render("render_approval_request", session_key, req)
 
     def _current_phase(self, session_key: str) -> str:
         """Return current phase."""
@@ -898,6 +939,6 @@ class BaseFrontend:
         if not key or key not in self._live_session_keys():
             return
         try:
-            self.render_tool_status(key, payload)
+            self._render("render_tool_status", key, payload)
         except Exception:
             logger.exception(f"render_tool_status failed for '{self.name}'")

