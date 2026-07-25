@@ -393,15 +393,53 @@ class EffectsContract:
         return call
 
     def _session_action(self, context):
-        """Wire ``SessionAction`` to the runtime's state machine, if present."""
+        """Wire ``SessionAction`` to the live session.
+
+        Two kinds of action share the verb because they share a resource — the
+        ephemeral session. Most are state-machine transitions (``cancel``,
+        ``back``, ``skip``) and go to ``handle_action``. A few are session
+        *properties* the state machine does not model, like which agent profile
+        this session is using; those are named explicitly below rather than
+        letting the verb become a generic method dispatcher on the runtime.
+        """
         runtime = getattr(context, "runtime", None)
         session_key = getattr(context, "session_key", None)
-        if runtime is None or not session_key or not hasattr(runtime, "handle_action"):
+        if runtime is None or not session_key:
             return None
 
         def act(action: str, payload: dict):
-            """Drive one state-machine action and return its outcome as data."""
-            result = runtime.handle_action(session_key, action, **(payload or {}))
+            """Carry out one session action and return its outcome as data."""
+            payload = payload or {}
+
+            if action == "set_agent_profile":
+                name = payload.get("name") or ""
+                ok = bool(runtime.set_agent_profile(session_key, name)) \
+                    if hasattr(runtime, "set_agent_profile") else False
+                return {"ok": ok, "messages": [], "error": ""}
+
+            if action == "rename_agent_profile":
+                # Live sessions hold the profile name by value, so a rename
+                # leaves stale references behind. Fixing them is kernel work:
+                # it reaches every session, not just this one, and a plugin has
+                # no business walking the session table.
+                old, new = payload.get("old") or "", payload.get("new") or ""
+                for session in (getattr(runtime, "sessions", None) or {}).values():
+                    if getattr(session, "active_agent_profile", None) == old:
+                        session.active_agent_profile = new
+                    if getattr(session, "profile_override", None) == old:
+                        session.profile_override = new
+                if hasattr(runtime, "refresh_session_specs"):
+                    runtime.refresh_session_specs()
+                return {"ok": True, "messages": [], "error": ""}
+
+            if action == "refresh_specs":
+                if hasattr(runtime, "refresh_session_specs"):
+                    runtime.refresh_session_specs()
+                return {"ok": True, "messages": [], "error": ""}
+
+            if not hasattr(runtime, "handle_action"):
+                return {"ok": False, "messages": [], "error": "no state machine available"}
+            result = runtime.handle_action(session_key, action, **payload)
             error = getattr(result, "error", None)
             if isinstance(error, dict):
                 error = error.get("message")

@@ -258,12 +258,23 @@ def test_agent_switch_persists_active_profile_per_user(tmp_path):
         "agent_profiles": {"default": {"llm": "default"}, "writer": {"llm": "default"}},
     })
     rt.set_session_user("alice", uid)
-    context = SimpleNamespace(
-        config={"agent_profiles": rt.config["agent_profiles"], "active_agent_profile": "default"},
-        runtime=rt, session_key="alice", db=db, user_id=uid,
-    )
+    from plugins.helpers.administration import build_administer
 
-    assert AgentCommand().run({"profile_name": "writer", "action": "switch"}, context) == "Switched agent profile to: writer"
+    context = SimpleNamespace(
+        config={"agent_profiles": rt.config["agent_profiles"],
+                "active_agent_profile": "default", "sandbox_trust_all": True},
+        runtime=rt, session_key="alice", db=db, user_id=uid, services={},
+        root_dir=".", orchestrator=None, tool_registry=None, command_registry=None,
+        approve_command=lambda *_a: True, approval_denial_reason="",
+        request_user_input=None, principal="user",
+    )
+    context.administer = build_administer(db, context.config, {}, rt, "alice",
+                                          context=context)
+
+    command = AgentCommand()
+    command._source_path = "plugins/commands/command_agent.py"
+    assert command.perform({"profile_name": "writer", "action": "switch"},
+                           context) == "Switched agent profile to: writer"
     assert db.get_user_config(uid)["active_agent_profile"] == "writer"
     assert "active_agent_profile" not in rt.config
 

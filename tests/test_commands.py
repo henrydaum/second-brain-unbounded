@@ -132,22 +132,45 @@ def test_llm_command_remove_last_default_blanks_default(monkeypatch):
 # ── /agent ───────────────────────────────────────────────────────────
 
 def test_agent_command_can_rename_profile(monkeypatch):
-    saved = []
-    monkeypatch.setattr("plugins.commands.command_agent._save", lambda config: saved.append(dict(config)))
-    session = SimpleNamespace(active_agent_profile="builder", profile_override="builder")
-    runtime = SimpleNamespace(sessions={"chat": session}, refresh_session_specs=lambda: None)
-    context = SimpleNamespace(config={"agent_profiles": {"builder": {"llm": "default"}}, "active_agent_profile": "builder"}, runtime=runtime)
+    """A rename touches three places, and the split of *who* touches them is the
+    point of the conversion: the profile dict is a global WriteConfig, the active
+    selection is a user-scoped one, and the stale references on live sessions are
+    fixed by the kernel through SessionAction -- a plugin has no business walking
+    the session table."""
+    from plugins.helpers.administration import build_administer
 
-    steps = AgentCommand().form({"profile_name": "builder", "action": "edit"}, context)
-    result = AgentCommand().run({"profile_name": "builder", "action": "edit", "field": "agent_profile_name", "value": "writer"}, context)
+    saved = {}
+    monkeypatch.setattr("config.config_manager.save", lambda cfg: saved.update(cfg))
+    monkeypatch.setattr("config.config_manager.load",
+                        lambda: {"agent_profiles": {"builder": {"llm": "default"}}})
+
+    session = SimpleNamespace(active_agent_profile="builder", profile_override="builder")
+    runtime = SimpleNamespace(sessions={"chat": session},
+                              refresh_session_specs=lambda: None,
+                              set_agent_profile=lambda _k, _n: True)
+    context = SimpleNamespace(
+        config={"agent_profiles": {"builder": {"llm": "default"}},
+                "active_agent_profile": "builder", "sandbox_trust_all": True},
+        runtime=runtime, session_key="chat", db=None, user_id=1, services={},
+        root_dir=".", orchestrator=None, tool_registry=None, command_registry=None,
+        approve_command=lambda *_a: True, approval_denial_reason="",
+        request_user_input=None, principal="user")
+    context.administer = build_administer(None, context.config, {}, runtime, "chat",
+                                          context=context)
+
+    command = AgentCommand()
+    command._source_path = "plugins/commands/command_agent.py"
+    steps = command.form_steps({"profile_name": "builder", "action": "edit"}, context)
+    result = command.perform({"profile_name": "builder", "action": "edit",
+                              "field": "agent_profile_name", "value": "writer"}, context)
 
     assert "agent_profile_name" in next(s.enum for s in steps if s.name == "field")
     assert result == "Updated agent profile: writer"
-    assert "builder" not in context.config["agent_profiles"]
-    assert context.config["active_agent_profile"] == "writer"
+    assert "builder" not in saved["agent_profiles"]
+    assert "writer" in saved["agent_profiles"]
+    # the kernel fixed the live session's stale references
     assert session.active_agent_profile == "writer"
     assert session.profile_override == "writer"
-    assert saved[-1]["active_agent_profile"] == "writer"
 
 
 # ── /frontends ───────────────────────────────────────────────────────
