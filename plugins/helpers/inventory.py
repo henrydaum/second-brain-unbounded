@@ -48,6 +48,8 @@ def build_inventory(context):
                 return _session_state(context)
             if view == "packages":
                 return _packages(context)
+            if view == "pipeline":
+                return _pipeline(context)
         except Exception:  # noqa: BLE001 — introspection must not break a turn
             logger.exception("inventory view %r failed", view)
             return []
@@ -121,13 +123,48 @@ def _tasks(context) -> list[dict]:
         if hasattr(db, "get_run_stats"):
             counts = counts | (db.get_run_stats() or {})
     paused = getattr(orch, "paused", set()) or set()
+    jobs = _jobs_by_channel(context)
     return [{"name": name,
              "trigger": getattr(task, "trigger", "path"),
              "counts": counts.get(name, {}),
              "paused": name in paused,
              "requires_services": list(getattr(task, "requires_services", []) or []),
-             "trigger_channels": list(getattr(task, "trigger_channels", []) or [])}
+             "trigger_channels": list(getattr(task, "trigger_channels", []) or []),
+             "event_payload_schema": getattr(task, "event_payload_schema", {}) or {},
+             "scheduled_jobs": sum(
+                 jobs.get(channel, 0)
+                 for channel in (getattr(task, "trigger_channels", []) or [])),
+             "settings": _settings(task)}
             for name, task in sorted(tasks.items())]
+
+
+def _jobs_by_channel(context) -> dict:
+    """How many timekeeper jobs fire on each channel.
+
+    Lets ``/tasks`` say "3 scheduled jobs" without holding the timekeeper. Empty
+    when the service is absent — the scheduling bundle is a store package, and
+    the kernel must degrade quietly without it."""
+    timekeeper = (getattr(context, "services", None) or {}).get("timekeeper")
+    if timekeeper is None or not getattr(timekeeper, "loaded", False):
+        return {}
+    counts: dict[str, int] = {}
+    for job in _safe(timekeeper.list_jobs, {}).values():
+        channel = job.get("channel") or ""
+        if channel:
+            counts[channel] = counts.get(channel, 0) + 1
+    return counts
+
+
+def _pipeline(context) -> str:
+    """The dependency-pipeline graph as pre-rendered text.
+
+    The orchestrator already knows how to draw it and the drawing is not the
+    plugin's business — so this crosses as a string rather than as a graph the
+    command would have to lay out itself."""
+    orch = getattr(context, "orchestrator", None)
+    if orch is None or not hasattr(orch, "dependency_pipeline_graph"):
+        return "Pipeline unavailable."
+    return _safe(orch.dependency_pipeline_graph, "Pipeline unavailable.")
 
 
 def _services(context) -> list[dict]:

@@ -148,7 +148,7 @@ PRINCIPAL_AGENT = "agent"
 # keeping the set explicit means adding a verb does not silently opt it in.
 ADMIN_REQUESTS: frozenset[str] = frozenset({
     "write_config", "read_config", "service_control", "package_op",
-    "conversation_op",
+    "conversation_op", "task_control",
     # Cancelling your own form is the clearest case for the policy: friction-free
     # for the human who typed /cancel, gated when an agent wants to reach into a
     # live session it does not own.

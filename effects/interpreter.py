@@ -66,6 +66,7 @@ from effects.vocabulary import (
     ServiceControl,
     SessionAction,
     Stat,
+    TaskControl,
     WriteConfig,
     WriteDb,
     WriteFile,
@@ -95,7 +96,7 @@ _MAX_EGRESS_BYTES = 200_000
 # means adding a name here and a branch in the provider, deliberately.
 INVENTORY_VIEWS: frozenset[str] = frozenset({
     "commands", "tools", "tasks", "services", "frontends", "session_state",
-    "packages",
+    "packages", "pipeline",
 })
 
 # Tables a sandboxed request may never touch, by identifier. ``users`` is the
@@ -686,7 +687,7 @@ class Interpreter:
                                 tier=TIER_EGRESS)
 
         if isinstance(request, (WriteConfig, ReadConfig, ServiceControl, PackageOp,
-                                ConversationOp)):
+                                ConversationOp, TaskControl)):
             administer = self.ctx.administer
             if administer is None:
                 return EffectResult(ok=False, tier=TIER_EGRESS,

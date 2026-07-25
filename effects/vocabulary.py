@@ -370,6 +370,30 @@ class PackageOp(Request):
 
 
 @dataclass(frozen=True)
+class TaskControl(Request):
+    """Pause, unpause, reset, retry, or trigger a pipeline task.
+
+    Egress rather than write, for two different reasons depending on the action,
+    which is why they share one verb rather than splitting further: ``reset`` and
+    ``retry`` discard processing state the journal never captured, and ``trigger``
+    *runs* a task — the deferred-execution rule again.
+
+    Unlike ``CallTool`` this does not borrow its tier from the target. It could,
+    and the machinery exists — but ``/tasks`` is an administration command a human
+    runs occasionally, not a hot path, so the principal policy already removes the
+    friction (the user typing ``/tasks`` is the ``allow`` corner) without needing
+    per-target derivation. ``CallTool`` earned that complexity by being the
+    generic caller the agent uses constantly; this has not.
+    """
+
+    type: ClassVar[str] = "task_control"
+    tier: ClassVar[str] = TIER_EGRESS
+    name: str
+    action: str = "pause"
+    payload: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class ReadConfig(Request):
     """Read one config value — the domain PRIMITIVES.md had to leave empty.
 
@@ -472,7 +496,7 @@ REQUEST_TYPES: dict[str, type[Request]] = {
         WriteFile, WriteDb, DeleteFile, Respond,
         HttpRequest, Complete, Embed, ExecSql, RunProcess, ReloadPlugin,
         WriteConfig, ReadConfig, ServiceControl, PackageOp, ConversationOp,
-        SessionAction, CallTool,
+        SessionAction, CallTool, TaskControl,
     )
 }
 

@@ -132,6 +132,49 @@ def build_administer(db, config: dict, services: dict, runtime, session_key: str
                 raise ValueError(f"unknown package action {action!r}")
             return {"text": result.text(), "ok": bool(getattr(result, "ok", True))}
 
+        if rtype == "task_control":
+            import json
+            from uuid import uuid4
+
+            orch = getattr(context, "orchestrator", None)
+            if orch is None:
+                raise RuntimeError("no orchestrator available")
+            task = (getattr(orch, "tasks", {}) or {}).get(request.name)
+            if task is None:
+                raise ValueError(f"unknown task {request.name!r}")
+            event_driven = getattr(task, "trigger", "path") == "event"
+            action = request.action
+
+            if action in ("pause", "unpause"):
+                orch.paused.add(request.name) if action == "pause" \
+                    else orch.paused.discard(request.name)
+                if action == "unpause":
+                    orch.clear_skip_cache(request.name)
+                return {"action": action, "name": request.name}
+
+            if action in ("reset", "retry"):
+                if event_driven:
+                    raise ValueError(f"only path-driven tasks can be {action}")
+                if db is None:
+                    raise RuntimeError("no database available")
+                (db.reset_task if action == "reset" else db.reset_failed_tasks)(request.name)
+                orch.clear_skip_cache(request.name)
+                return {"action": action, "name": request.name}
+
+            if action == "trigger":
+                if not event_driven:
+                    raise ValueError("only event-driven tasks can be triggered manually")
+                if db is None or not hasattr(db, "create_run"):
+                    raise RuntimeError("no database is available for task runs")
+                run_id = f"{request.name}:{uuid4().hex[:12]}"
+                db.create_run(run_id, request.name, triggered_by="manual",
+                              payload_json=json.dumps(request.payload or {}))
+                if hasattr(orch, "on_run_enqueued"):
+                    orch.on_run_enqueued(run_id, request.name)
+                return {"action": action, "name": request.name, "run_id": run_id}
+
+            raise ValueError(f"unknown task action {action!r}")
+
         if rtype == "conversation_op":
             if runtime is None:
                 raise RuntimeError("no runtime available for conversation operations")
