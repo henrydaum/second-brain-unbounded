@@ -211,6 +211,15 @@ Confinement remains context, not vocabulary: these are policies on
   trust input here: it answers "where does this body run?", not "whose code is
   it?" — conflating them would let a debug flag grant authority and would make
   the all-trusted equivalence run meaningless. Pinned by `tests/test_principal.py`.
+- **`Complete`'s tier is really a property of the backend** (known imprecision).
+  It is graded egress because the common case ships the prompt to a hosted
+  provider. A completion served by a *local* model crosses no boundary at all and
+  is not egress in any meaningful sense — so the current grade over-states the
+  danger for local backends and is exactly right for cloud ones. The honest fix
+  is for an LLM service to declare whether its endpoint is local, the same
+  "derive, never assert" move used everywhere else, and let the tier follow.
+  Deferred to the LLM-service rework rather than guessed at here; recorded so the
+  imprecision is a decision. The same reasoning applies to `Embed`.
 - **Covert channels are out of scope.** Timing and resource-exhaustion
   channels exist in every practical sandbox; they are low-bandwidth and
   accepted, not denied.

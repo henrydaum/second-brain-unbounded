@@ -24,8 +24,26 @@ from __future__ import annotations
 from pipeline.database import DEFAULT_USER_ID
 
 
-def build_administer(db, config: dict, services: dict, runtime, session_key: str | None):
+def _progress_sink(runtime, session_key):
+    """Where long-running administration reports its progress.
+
+    Kernel-side on purpose. A pip install can run for minutes and the user needs
+    to see movement, but handing the plugin a callback to report through is the
+    "called back mid-operation" capability the boundary exists to avoid. The
+    kernel already knows which session asked, so it pushes; the plugin stays a
+    pure body that named an intent."""
+    if runtime is not None and session_key and hasattr(runtime, "push_message"):
+        return lambda message: runtime.push_message(session_key, message, source="packages")
+    return lambda message: None
+
+
+def build_administer(db, config: dict, services: dict, runtime, session_key: str | None,
+                     context=None):
     """Return the callable that carries out administration requests.
+
+    ``context`` is the live ``SecondBrainContext`` when one exists. It is passed
+    through to machinery that already expects one (``package_manager`` records
+    ledger rows from it) and is otherwise unused — the plugin never sees it.
 
     This is the kernel side of ``WriteConfig`` / ``ServiceControl`` /
     ``PackageOp`` / ``ConversationOp``. It exists so kernel commands can run on
@@ -97,12 +115,22 @@ def build_administer(db, config: dict, services: dict, runtime, session_key: str
                     "loaded": bool(getattr(service, "loaded", False))}
 
         if rtype == "package_op":
-            from plugins.helpers import package_manager
-            if request.action == "install":
-                return package_manager.install(request.name)
-            if request.action == "uninstall":
-                return package_manager.uninstall(request.name)
-            raise ValueError(f"unknown package action {request.action!r}")
+            from plugins.commands.helpers import package_manager
+
+            root = getattr(context, "root_dir", None)
+            progress = _progress_sink(runtime, session_key)
+            action = request.action
+            if action == "install":
+                result = package_manager.install_package(
+                    root, request.name, context, progress=progress)
+            elif action == "uninstall":
+                result = package_manager.uninstall_package(
+                    request.name, context, progress=progress, root_dir=root)
+            elif action == "update":
+                result = package_manager.update_packages(root, context, progress=progress)
+            else:
+                raise ValueError(f"unknown package action {action!r}")
+            return {"text": result.text(), "ok": bool(getattr(result, "ok", True))}
 
         if rtype == "conversation_op":
             if runtime is None:

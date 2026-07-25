@@ -46,6 +46,8 @@ def build_inventory(context):
                 return _frontends(context)
             if view == "session_state":
                 return _session_state(context)
+            if view == "packages":
+                return _packages(context)
         except Exception:  # noqa: BLE001 — introspection must not break a turn
             logger.exception("inventory view %r failed", view)
             return []
@@ -87,12 +89,25 @@ def _tools(context) -> list[dict]:
     registry = getattr(context, "tool_registry", None)
     tools = (getattr(registry, "tools", {}) or {}) if registry else {}
     return [{"name": name,
-             "description": getattr(tool, "description", ""),
+             "description": _schema(tool).get("description", "")
+                            or getattr(tool, "description", ""),
+             # The JSON-schema parameter block, as data. /tools builds its
+             # argument form from this rather than calling to_schema() on a live
+             # object -- which is the whole point of the view.
+             "parameters": _schema(tool).get("parameters") or {},
              "danger_tier": _safe(lambda: tool.danger_tier, ""),
              "contract": getattr(tool, "contract", "legacy"),
              "background_safe": bool(getattr(tool, "background_safe", True)),
-             "declared_requests": list(getattr(tool, "declared_requests", []) or [])}
+             "declared_requests": list(getattr(tool, "declared_requests", []) or []),
+             "settings": _settings(tool)}
             for name, tool in sorted(tools.items())]
+
+
+def _schema(tool) -> dict:
+    """A tool's OpenAI-style function schema, or an empty dict.
+
+    Best-effort: one tool with a broken schema must not empty the catalog."""
+    return _safe(lambda: tool.to_schema()["function"], {}) or {}
 
 
 def _tasks(context) -> list[dict]:
@@ -202,6 +217,25 @@ def _session_state(context) -> dict:
         "flags": flags,
         "busy": bool(getattr(session, "busy", False)),
     }
+
+
+def _packages(context) -> dict:
+    """What the store offers and what is installed, as three flat lists.
+
+    Store lookups hit the network, so this is one round trip returning
+    everything ``/packages`` needs rather than a request per view — the plugin
+    filters by category itself, which is pure work."""
+    from plugins.commands.helpers import package_manager
+
+    root = getattr(context, "root_dir", None)
+    installed = package_manager.installed_packages()
+    installed_paths = {item["path"] for item in installed}
+    available = [item for item in package_manager.search_packages(root)
+                 if item["path"] not in installed_paths]
+    bundles = package_manager.search_bundles(root)
+    return {"installed": installed, "available": available,
+            "removable": package_manager.removable_packages(),
+            "bundles": bundles}
 
 
 def _frontend_of(context):

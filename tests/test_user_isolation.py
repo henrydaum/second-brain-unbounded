@@ -18,7 +18,6 @@ from state_machine import ConversationRuntime
 from pipeline.database import Database, DEFAULT_USER_ID
 from plugins.BaseFrontend import BaseFrontend
 from plugins.commands.command_agent import AgentCommand
-from plugins.commands.command_tools import _toggle_skip
 
 
 @pytest.fixture
@@ -270,16 +269,43 @@ def test_agent_switch_persists_active_profile_per_user(tmp_path):
 
 
 def test_skip_permissions_persist_per_user(tmp_path):
+    """A user-scoped setting lands on that user's config blob and never on the
+    global one.
+
+    /tools now expresses this as ``WriteConfig(scope="user")`` rather than
+    remembering to call the user-config writer, so the scope travels with the
+    request. This drives the command through ``perform`` to prove the request
+    actually carries the scope, not just that the writer exists."""
+    from plugins.commands.command_tools import ToolsCommand
+    from plugins.helpers.administration import build_administer
+
     db = Database(str(tmp_path / "skip.db"))
     uid = db.upsert_user("web", "alice")
     rt = ConversationRuntime(db=db, services={}, config={})
     rt.set_session_user("alice", uid)
-    context = SimpleNamespace(
-        config={"skip_permissions": []},
-        runtime=rt, session_key="alice", db=db, user_id=uid,
-    )
 
-    assert _toggle_skip(context, "run_command", True) == "Skip permissions enabled for run_command."
+    tool = SimpleNamespace(
+        name="run_command", description="run a shell command",
+        danger_tier="egress", contract="legacy", background_safe=True,
+        declared_requests=[], config_settings=[],
+        to_schema=lambda: {"function": {"name": "run_command", "description": "",
+                                        "parameters": {}}})
+    context = SimpleNamespace(
+        config={"skip_permissions": [], "sandbox_trust_all": True},
+        runtime=rt, session_key="alice", db=db, user_id=uid, services={},
+        root_dir=".", orchestrator=None, principal="user",
+        tool_registry=SimpleNamespace(tools={"run_command": tool}),
+        command_registry=None, approve_command=lambda *_a: True,
+        approval_denial_reason="", request_user_input=None)
+    context.administer = build_administer(db, context.config, {}, rt, "alice",
+                                          context=context)
+
+    command = ToolsCommand()
+    command._source_path = "plugins/commands/command_tools.py"
+    out = command.perform({"tool_name": "run_command",
+                           "action": "toggle_skip_permissions"}, context)
+
+    assert out == "Skip permissions enabled for run_command."
     assert db.get_user_config(uid)["skip_permissions"] == ["run_command"]
     assert "skip_permissions" not in rt.config
 

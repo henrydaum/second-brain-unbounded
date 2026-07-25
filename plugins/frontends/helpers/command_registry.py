@@ -75,7 +75,8 @@ class CommandRegistry:
                 if getattr(ctx, "administer", None) is None:
                     from plugins.helpers.administration import build_administer
                     ctx.administer = build_administer(
-                        ctx.db, ctx.config, ctx.services, ctx.runtime, session_key)
+                        ctx.db, ctx.config, ctx.services, ctx.runtime, session_key,
+                        context=ctx)
             except Exception:
                 logger.debug("wiring command context failed", exc_info=True)
         return ctx
