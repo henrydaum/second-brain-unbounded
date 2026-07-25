@@ -9,17 +9,19 @@ with ``kit.sql_str``.
 """
 
 import sandbox_kit as kit
-from plugins.BaseSandboxTool import BaseSandboxTool
+from plugins.BaseTool import BaseTool
 from effects.vocabulary import QueryDb, Respond
 
 
-class LexicalSearchTool(BaseSandboxTool):
+class LexicalSearchTool(BaseTool):
+    contract = "effects"
     name = "lexical_search"
     description = (
-        "Search indexed files by keyword using BM25-ranked full-text search over "
-        "all indexed text (chunks, OCR, tabular). Supports FTS5 syntax: \"exact "
-        "phrase\", term1 AND term2, term1 OR term2, NOT term, prefix*. Plain "
-        "keywords are ANDed. Use for error strings, identifiers, and rare terms."
+        "Search indexed files by keyword using BM25-ranked full-text search over all indexed "
+        "text (chunks, OCR, tabular). Supports FTS5 syntax: \"exact phrase\", term1 AND term2, "
+        "term1 OR term2, NOT term, prefix*. Plain keywords are ANDed. Use for error strings, "
+        "identifiers, and rare terms. Give the `query`. Use FTS5 syntax for phrases/booleans; "
+        "set `top_k`, `sources`, or `folder` to narrow."
     )
     parameters = {
         "type": "object",
@@ -31,7 +33,6 @@ class LexicalSearchTool(BaseSandboxTool):
         },
         "required": ["query"],
     }
-    fill_prompt = "Give the `query`. Use FTS5 syntax for phrases/booleans; set `top_k`, `sources`, or `folder` to narrow."
     declared_requests = ["query_db"]
     view = "params_only"
     max_calls = 10

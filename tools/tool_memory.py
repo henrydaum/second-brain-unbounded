@@ -11,7 +11,7 @@ kernel's ``memory_paths.topic_path`` (which can't be imported in-sandbox).
 import re
 
 import sandbox_kit as kit
-from plugins.BaseSandboxTool import BaseSandboxTool
+from plugins.BaseTool import BaseTool
 from effects.vocabulary import ReadContext, ReadFile, WriteFile, DeleteFile, ListDir, Respond
 
 INDEX_FILENAME = "MEMORY.md"
@@ -19,12 +19,15 @@ MAX_READ_CHARS = 20_000
 _TOPIC_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]*$")
 
 
-class MemoryTool(BaseSandboxTool):
+class MemoryTool(BaseTool):
+    contract = "effects"
     name = "memory"
     description = (
-        "Read, save, append, or forget durable memory topics. Each topic is a "
-        "markdown file; the MEMORY.md index in your system prompt maps topics. "
-        "Read a topic before answering from it — the index is a map, not the content."
+        "Read, save, append, or forget durable memory topics. Each topic is a markdown file; "
+        "the MEMORY.md index in your system prompt maps topics. Read a topic before answering "
+        "from it — the index is a map, not the content. Choose the `action` and `topic`. For "
+        "save/append give `content` and a one-line `description` for the index. Read a topic "
+        "before answering from it."
     )
     parameters = {
         "type": "object",
@@ -36,10 +39,6 @@ class MemoryTool(BaseSandboxTool):
         },
         "required": ["action", "topic"],
     }
-    fill_prompt = (
-        "Choose the `action` and `topic`. For save/append give `content` and a "
-        "one-line `description` for the index. Read a topic before answering from it."
-    )
     declared_requests = ["read_file", "write_file", "delete_file", "list_dir"]
     view = "params_only"
     max_calls = 10

@@ -4,19 +4,21 @@ A ``Stat`` per path checks existence (root-confined, kernel-side); the terminal
 ``Respond`` carries the valid paths as attachments, which the frontend renders.
 """
 
-from plugins.BaseSandboxTool import BaseSandboxTool
+from plugins.BaseTool import BaseTool
 from effects.vocabulary import Stat, Respond
 
 MAX_FILES = 10
 
 
-class RenderFilesTool(BaseSandboxTool):
+class RenderFilesTool(BaseTool):
+    contract = "effects"
     name = "render_files"
     description = (
-        "Display one or more local files to the user in chat with an optional "
-        "caption. Always use this for images, audio, and video — a description is "
-        "not a substitute. Use it for documents the user asked to find or open. "
-        "Skip it when your text reply already covers the content. Max 10 per call."
+        "Display one or more local files to the user in chat with an optional caption. Always "
+        "use this for images, audio, and video — a description is not a substitute. Use it "
+        "for documents the user asked to find or open. Skip it when your text reply already "
+        "covers the content. Max 10 per call. List the file `paths` to show (max 10). Add a "
+        "`caption` when the message is about the files — it replaces a separate text reply."
     )
     parameters = {
         "type": "object",
@@ -26,10 +28,6 @@ class RenderFilesTool(BaseSandboxTool):
         },
         "required": ["paths"],
     }
-    fill_prompt = (
-        "List the file `paths` to show (max 10). Add a `caption` when the message "
-        "is about the files — it replaces a separate text reply."
-    )
     declared_requests = ["stat"]
     view = "params_only"
     max_calls = 5

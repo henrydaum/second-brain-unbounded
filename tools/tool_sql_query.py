@@ -11,7 +11,7 @@ import re
 from difflib import get_close_matches
 
 import sandbox_kit as kit
-from plugins.BaseSandboxTool import BaseSandboxTool
+from plugins.BaseTool import BaseTool
 from effects.vocabulary import QueryDb, ExecSql, Respond
 
 _READ_ONLY_PREFIXES = ("select", "pragma", "explain")
@@ -24,15 +24,18 @@ def _is_read_only(sql: str) -> bool:
     return " ".join(sql.strip().split()).lower().startswith(_READ_ONLY_PREFIXES)
 
 
-class SqlQueryTool(BaseSandboxTool):
+class SqlQueryTool(BaseTool):
+    contract = "effects"
     name = "sql_query"
     description = (
-        "Run one SQL statement against the local file database. SELECT / PRAGMA / "
-        "EXPLAIN run immediately (capped rows) — use them to inspect schema, file "
-        "metadata, pipeline state, extracted text, and stored conversations. "
-        "Mutating statements (INSERT / UPDATE / DELETE / DDL) are allowed but each "
-        "pauses for explicit user approval of the exact SQL, so give a clear "
-        "`justification`. Default to read-only; only write when the user asked you to."
+        "Run one SQL statement against the local file database. SELECT / PRAGMA / EXPLAIN run "
+        "immediately (capped rows) — use them to inspect schema, file metadata, pipeline "
+        "state, extracted text, and stored conversations. Mutating statements (INSERT / "
+        "UPDATE / DELETE / DDL) are allowed but each pauses for explicit user approval of the "
+        "exact SQL, so give a clear `justification`. Default to read-only; only write when "
+        "the user asked you to. Write one SQL statement in `sql`. Explore with SELECT / "
+        "PRAGMA first. Only write (INSERT/UPDATE/DELETE/DDL) if the user asked — and add a "
+        "`justification`."
     )
     parameters = {
         "type": "object",
@@ -42,10 +45,6 @@ class SqlQueryTool(BaseSandboxTool):
         },
         "required": ["sql"],
     }
-    fill_prompt = (
-        "Write one SQL statement in `sql`. Explore with SELECT / PRAGMA first. Only "
-        "write (INSERT/UPDATE/DELETE/DDL) if the user asked — and add a `justification`."
-    )
     declared_requests = ["query_db", "exec_sql"]
     view = "params_only"
     max_calls = 6  # failed queries are common; allow a few retries

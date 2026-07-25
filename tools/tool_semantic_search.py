@@ -13,20 +13,21 @@ the embedder being selectable per request.
 """
 
 import sandbox_kit as kit
-from plugins.BaseSandboxTool import BaseSandboxTool
+from plugins.BaseTool import BaseTool
 from effects.vocabulary import Embed, QueryDb, Respond
 
 SOURCE = "text_embedding"
 STREAM = "text_semantic"
 
 
-class SemanticSearchTool(BaseSandboxTool):
+class SemanticSearchTool(BaseTool):
+    contract = "effects"
     name = "semantic_search"
     description = (
-        "Search indexed files by meaning using vector similarity. Embeds your "
-        "query and compares it against stored text embeddings, returning the most "
-        "semantically similar chunks. Use for paraphrased or conceptual questions "
-        "where exact wording won't match."
+        "Search indexed files by meaning using vector similarity. Embeds your query and "
+        "compares it against stored text embeddings, returning the most semantically similar "
+        "chunks. Use for paraphrased or conceptual questions where exact wording won't match. "
+        "Give a natural-language `query`; set `top_k` or `folder` to narrow."
     )
     parameters = {
         "type": "object",
@@ -37,7 +38,6 @@ class SemanticSearchTool(BaseSandboxTool):
         },
         "required": ["query"],
     }
-    fill_prompt = "Give a natural-language `query`; set `top_k` or `folder` to narrow."
     declared_requests = ["embed", "query_db"]
     view = "params_only"
     max_calls = 10

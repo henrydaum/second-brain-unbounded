@@ -9,20 +9,22 @@ indexing-pipeline package has populated the index tables.
 """
 
 import sandbox_kit as kit
-from plugins.BaseSandboxTool import BaseSandboxTool
+from plugins.BaseTool import BaseTool
 from effects.vocabulary import Embed, QueryDb, Respond
 
 RRF_K = 60  # standard constant from the RRF paper; higher = flatter rank weighting
 _CONTENT_FIELDS = ("content", "score", "chunk_index")
 
 
-class HybridSearchTool(BaseSandboxTool):
+class HybridSearchTool(BaseTool):
+    contract = "effects"
     name = "hybrid_search"
     description = (
-        "Search indexed files using both keyword and semantic retrieval, then fuse "
-        "the results (Reciprocal Rank Fusion) for better ranking. Prefer this over "
-        "lexical_search or semantic_search alone when finding local files or excerpts. "
-        "Optional folder/modality filters narrow the search."
+        "Search indexed files using both keyword and semantic retrieval, then fuse the "
+        "results (Reciprocal Rank Fusion) for better ranking. Prefer this over lexical_search "
+        "or semantic_search alone when finding local files or excerpts. Optional "
+        "folder/modality filters narrow the search. Give the `query`; set `max_results`, "
+        "`folder`, or `modality` to narrow. This fuses keyword + semantic ranking."
     )
     parameters = {
         "type": "object",
@@ -34,7 +36,6 @@ class HybridSearchTool(BaseSandboxTool):
         },
         "required": ["query"],
     }
-    fill_prompt = "Give the `query`; set `max_results`, `folder`, or `modality` to narrow. This fuses keyword + semantic ranking."
     agent_prompt = (
         "## Searching indexed files\n"
         "Three retrieval tools search the indexed corpus (your sync directories plus "

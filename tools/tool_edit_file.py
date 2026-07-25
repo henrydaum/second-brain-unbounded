@@ -11,7 +11,7 @@ approval surface before it lands, and a denial returns as a normal failure.
 import re
 from difflib import SequenceMatcher
 
-from plugins.BaseSandboxTool import BaseSandboxTool
+from plugins.BaseTool import BaseTool
 from effects.vocabulary import ReadFile, WriteFile, DeleteFile, Stat, Respond
 
 NEAREST_MIN_RATIO = 0.4
@@ -24,14 +24,17 @@ LINE_PREFIX_HINT = (
 )
 
 
-class EditFileTool(BaseSandboxTool):
+class EditFileTool(BaseTool):
+    contract = "effects"
     name = "edit_file"
     description = (
-        "Create, overwrite, exact-replace, append to, or delete a UTF-8 text file. "
-        "For replace, old_text must match the raw file exactly — read with "
-        "line_numbers=false when copying text to replace. Paths may be absolute or "
-        "relative to the project root. Edits under the scratch and sandbox folders "
-        "are frictionless; edits elsewhere pause for your approval."
+        "Create, overwrite, exact-replace, append to, or delete a UTF-8 text file. For "
+        "replace, old_text must match the raw file exactly — read with line_numbers=false "
+        "when copying text to replace. Paths may be absolute or relative to the project root. "
+        "Edits under the scratch and sandbox folders are frictionless; edits elsewhere pause "
+        "for your approval. Pick the `operation`, give the `path`, and a one-line "
+        "`justification`. For replace, `old_text` must match the raw file exactly (read with "
+        "line_numbers=false first). Use `replace_all` when the text repeats."
     )
     parameters = {
         "type": "object",
@@ -46,11 +49,6 @@ class EditFileTool(BaseSandboxTool):
         },
         "required": ["operation", "path", "justification"],
     }
-    fill_prompt = (
-        "Pick the `operation`, give the `path`, and a one-line `justification`. For "
-        "replace, `old_text` must match the raw file exactly (read with "
-        "line_numbers=false first). Use `replace_all` when the text repeats."
-    )
     declared_requests = ["read_file", "write_file", "delete_file", "stat"]
     view = "params_only"
     max_calls = 20

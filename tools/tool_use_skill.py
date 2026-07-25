@@ -9,19 +9,21 @@ ListDir + ReadFile, mirroring ``service_skills.scan``/``read`` purely.
 """
 
 import sandbox_kit as kit
-from plugins.BaseSandboxTool import BaseSandboxTool
+from plugins.BaseTool import BaseTool
 from effects.vocabulary import ReadContext, ListDir, ReadFile, Respond
 
 SKILL_FILENAME = "SKILL.md"
 MAX_SUPPORT_FILES = 50
 
 
-class UseSkillTool(BaseSandboxTool):
+class UseSkillTool(BaseTool):
+    contract = "effects"
     name = "use_skill"
     description = (
-        "Load the full instructions of an installed skill by name. Call this as soon "
-        "as a request matches a skill in the Skills index, before attempting the task. "
-        "The index holds only summaries — this returns the actual playbook."
+        "Load the full instructions of an installed skill by name. Call this as soon as a "
+        "request matches a skill in the Skills index, before attempting the task. The index "
+        "holds only summaries — this returns the actual playbook. Give the `name` of the "
+        "skill exactly as it appears in the Skills index."
     )
     parameters = {
         "type": "object",
@@ -30,7 +32,6 @@ class UseSkillTool(BaseSandboxTool):
         },
         "required": ["name"],
     }
-    fill_prompt = "Give the `name` of the skill exactly as it appears in the Skills index."
     declared_requests = ["read_file", "list_dir"]
     view = "params_only"
     max_calls = 5

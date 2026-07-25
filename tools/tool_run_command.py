@@ -9,20 +9,23 @@ dedicated read tools — read_file, glob, grep — not here.
 """
 
 import sandbox_kit as kit
-from plugins.BaseSandboxTool import BaseSandboxTool
+from plugins.BaseTool import BaseTool
 from effects.vocabulary import RunProcess, Respond
 
 MAX_STREAM = 20_000
 
 
-class RunCommandTool(BaseSandboxTool):
+class RunCommandTool(BaseTool):
+    contract = "effects"
     name = "run_command"
     description = (
-        "Run a subprocess and return its output. Give the command as an argv list "
-        "(e.g. [\"git\", \"status\"]) — it is executed directly, without a shell, so "
-        "no pipes/globs/redirection. Every command pauses for your approval before it "
-        "runs; the working directory is confined to the project and data roots. For "
-        "reading files or searching, use read_file / glob / grep instead."
+        "Run a subprocess and return its output. Give the command as an argv list (e.g. "
+        "[\"git\", \"status\"]) — it is executed directly, without a shell, so no "
+        "pipes/globs/redirection. Every command pauses for your approval before it runs; the "
+        "working directory is confined to the project and data roots. For reading files or "
+        "searching, use read_file / glob / grep instead. Give `command` as an argv list, e.g. "
+        "[\"npm\", \"test\"]. No shell syntax (pipes/globs won't work). Add a `justification`; "
+        "set `cwd`/`timeout` if needed."
     )
     parameters = {
         "type": "object",
@@ -34,10 +37,6 @@ class RunCommandTool(BaseSandboxTool):
         },
         "required": ["command"],
     }
-    fill_prompt = (
-        "Give `command` as an argv list, e.g. [\"npm\", \"test\"]. No shell syntax "
-        "(pipes/globs won't work). Add a `justification`; set `cwd`/`timeout` if needed."
-    )
     declared_requests = ["run_process"]
     view = "params_only"
     max_calls = 20

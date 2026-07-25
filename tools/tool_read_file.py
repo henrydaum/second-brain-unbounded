@@ -8,20 +8,23 @@ needs tracking.
 """
 
 import sandbox_kit as kit
-from plugins.BaseSandboxTool import BaseSandboxTool
+from plugins.BaseTool import BaseTool
 from effects.vocabulary import ReadFile, Respond
 
 MAX_CHARS = 20_000
 _BIG = 1_000_000_000
 
 
-class ReadFileTool(BaseSandboxTool):
+class ReadFileTool(BaseTool):
+    contract = "effects"
     name = "read_file"
     description = (
-        "Read a text file by path. Use this when you need the exact contents of "
-        "source code, templates, docs, or sandbox plugins. Paths may be absolute "
-        "or relative to the project root. Output is line-windowed (offset/limit) "
-        "and capped at ~20k chars; .log files are read newest-first."
+        "Read a text file by path. Use this when you need the exact contents of source code, "
+        "templates, docs, or sandbox plugins. Paths may be absolute or relative to the "
+        "project root. Output is line-windowed (offset/limit) and capped at ~20k chars; .log "
+        "files are read newest-first. Give the file `path`. Page big files with "
+        "`offset`/`limit`. Pass `line_numbers=false` when you'll copy the text into "
+        "edit_file's old_text."
     )
     parameters = {
         "type": "object",
@@ -33,10 +36,6 @@ class ReadFileTool(BaseSandboxTool):
         },
         "required": ["path"],
     }
-    fill_prompt = (
-        "Give the file `path`. Page big files with `offset`/`limit`. Pass "
-        "`line_numbers=false` when you'll copy the text into edit_file's old_text."
-    )
     declared_requests = ["read_file"]
     view = "params_only"
     max_calls = 10

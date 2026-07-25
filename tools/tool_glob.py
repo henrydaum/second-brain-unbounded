@@ -8,18 +8,20 @@ touches the filesystem itself.
 """
 
 import sandbox_kit as kit
-from plugins.BaseSandboxTool import BaseSandboxTool
+from plugins.BaseTool import BaseTool
 from effects.vocabulary import ListDir, Respond
 
 
-class GlobTool(BaseSandboxTool):
+class GlobTool(BaseTool):
+    contract = "effects"
     name = "glob"
     description = (
-        "Find files by glob pattern, returned newest-first. Searches the project "
-        "root by default; paths may be absolute or relative to it. Patterns: '*.py' "
-        "matches top-level files only, '**/*.py' matches any depth, 'src/**/*.ts' "
-        "scopes to a subtree. Skips junk dirs (.git, node_modules, __pycache__, ...). "
-        "Use grep instead to search file contents."
+        "Find files by glob pattern, returned newest-first. Searches the project root by "
+        "default; paths may be absolute or relative to it. Patterns: '*.py' matches top-level "
+        "files only, '**/*.py' matches any depth, 'src/**/*.ts' scopes to a subtree. Skips "
+        "junk dirs (.git, node_modules, __pycache__, ...). Use grep instead to search file "
+        "contents. Give a glob in `pattern`. Use '**' to match any depth ('**/*.py') or a "
+        "plain '*' for a single level ('*.md'). Scope with `path` when you know the subtree."
     )
     parameters = {
         "type": "object",
@@ -30,10 +32,6 @@ class GlobTool(BaseSandboxTool):
         },
         "required": ["pattern"],
     }
-    fill_prompt = (
-        "Give a glob in `pattern`. Use '**' to match any depth ('**/*.py') or a plain "
-        "'*' for a single level ('*.md'). Scope with `path` when you know the subtree."
-    )
     declared_requests = ["list_dir"]
     view = "params_only"
     max_calls = 10

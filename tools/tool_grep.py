@@ -10,22 +10,25 @@ the resumable request loop is doing exactly what it was designed for.
 import re
 
 import sandbox_kit as kit
-from plugins.BaseSandboxTool import BaseSandboxTool
+from plugins.BaseTool import BaseTool
 from effects.vocabulary import ListDir, ReadFiles, Respond
 
 MAX_FILE_BYTES = 2_000_000
 BATCH = 100
 
 
-class GrepTool(BaseSandboxTool):
+class GrepTool(BaseTool):
+    contract = "effects"
     name = "grep"
     description = (
-        "Search file contents on disk with a Python regular expression (re syntax, "
-        "not PCRE). Searches the project root by default; paths may be absolute or "
-        "relative to it. Filter files with 'glob' ('*.py' = top level, '**/*.py' = "
-        "any depth). Skips binary and very large files and junk dirs (.git, "
-        "node_modules, __pycache__, ...). Reads live files on disk right now, so it "
-        "sees uncommitted and unindexed content."
+        "Search file contents on disk with a Python regular expression (re syntax, not PCRE). "
+        "Searches the project root by default; paths may be absolute or relative to it. "
+        "Filter files with 'glob' ('*.py' = top level, '**/*.py' = any depth). Skips binary "
+        "and very large files and junk dirs (.git, node_modules, __pycache__, ...). Reads "
+        "live files on disk right now, so it sees uncommitted and unindexed content. Give a "
+        "Python `re` regex in `pattern`. Narrow the search with `path` and/or `glob` when you "
+        "can. Choose `output_mode`: files_with_matches to locate files, content to see "
+        "matching lines, count to tally hits."
     )
     parameters = {
         "type": "object",
@@ -41,11 +44,6 @@ class GrepTool(BaseSandboxTool):
         },
         "required": ["pattern"],
     }
-    fill_prompt = (
-        "Give a Python `re` regex in `pattern`. Narrow the search with `path` and/or "
-        "`glob` when you can. Choose `output_mode`: files_with_matches to locate files, "
-        "content to see matching lines, count to tally hits."
-    )
     declared_requests = ["list_dir", "read_files"]
     view = "params_only"
     max_calls = 10
