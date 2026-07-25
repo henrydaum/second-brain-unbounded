@@ -296,6 +296,39 @@ def _pipe_fulfil(out, inp):
     return fulfil
 
 
+def _serve(instance, fulfil, out, inp) -> int:
+    """Resident mode: serve calls from one long-lived plugin instance.
+
+    The instance is constructed **once** and reused, which is the whole point:
+    state held between calls stays in the child, so a plugin can keep a cache, a
+    connection, or a background thread of its own without any of it reaching the
+    kernel. That is what makes threads and long-lived services sandboxable at all
+    — subprocess-per-call has no place to put them.
+
+    It also removes the ~450 ms of import cost from every call after the first.
+
+    A failing call is reported and the worker stays up: one bad call should not
+    cost the resident state of every future one. The parent decides when to
+    recycle.
+    """
+    write_message(out, {"ready": True})
+    while True:
+        message = read_message(inp)
+        if message is None or message.get("shutdown"):
+            return 0
+        call = message.get("job") or {}
+        try:
+            final = drive(instance, call.get("params") or {}, fulfil,
+                          call.get("method", "run"))
+            write_message(out, {"final": final})
+        except MemoryError:
+            write_message(out, {"error": {
+                "error_type": "MemoryCap", "message": "call exceeded the memory cap"}})
+            return 1
+        except Exception as exc:  # noqa: BLE001 — report and keep serving
+            write_message(out, {"error": _diagnostic(exc)})
+
+
 def main() -> int:
     """Entry point: read job, exec, drive, report."""
     out, inp = sys.stdout, sys.stdin
@@ -313,9 +346,12 @@ def main() -> int:
         tool_cls = _find_tool_class(namespace)
         instance = tool_cls()
 
-        final = drive(instance, params, _pipe_fulfil(out, inp), job.get("method", "run"))
-        write_message(out, {"final": final})
-        return 0
+        fulfil = _pipe_fulfil(out, inp)
+        if not job.get("resident"):
+            final = drive(instance, params, fulfil, job.get("method", "run"))
+            write_message(out, {"final": final})
+            return 0
+        return _serve(instance, fulfil, out, inp)
     except MemoryError:
         # The kernel cap (Job Object / RLIMIT_AS) refused an allocation. Report it
         # as the same MemoryCap the parent watchdog produces. Keep this path tiny:

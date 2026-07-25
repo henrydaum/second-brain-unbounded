@@ -47,6 +47,10 @@ class BaseService(EffectsContract, ABC):
         base implementation raises NotImplementedError to make misuse obvious.
     """
 
+    # A service's sandbox stays open: its caches, connections and background
+    # threads are the capability, not an artifact of a call.
+    persistent_sandbox: bool = True
+
     model_name: str = ""
     shared: bool = True
     is_llm_backend: bool = False
@@ -153,7 +157,13 @@ class BaseService(EffectsContract, ABC):
         return True
 
     def unload(self):
-        """Release all resources. Must be safe to call even if not loaded."""
+        """Release all resources. Must be safe to call even if not loaded.
+
+        Subclasses that override this **must** call ``super().unload()`` if they
+        use the effects contract, or their resident sandbox child outlives the
+        service. Legacy services have no worker, so the call is a no-op for
+        them."""
+        self.release_sandbox()
         self.loaded = False
 
     def get_client(self):

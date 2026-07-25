@@ -110,24 +110,52 @@ class EffectsContract:
             return True
         return is_trusted(getattr(self, "_source_path", ""))
 
+    # Whether this plugin's sandbox should stay open between calls. False for
+    # tools/commands/tasks — each call is complete in itself, and a fresh child
+    # is the stronger isolation. Services override it to True: their state,
+    # caches and background threads are the capability, so the child persists
+    # for the service's lifetime.
+    persistent_sandbox: bool = False
+
     def _perform_effects(self, context, params: dict, *, method: str = "run"):
         """Run one body through the applicable executor. Returns a
         ``SandboxOutcome``; the family maps it onto its own result type.
 
-        Both executors drive the same generator through the same interpreter, so
-        the mode changes only whether a process boundary exists."""
+        Every path drives the same generator through the same interpreter, so
+        what changes is only *where* the body runs and *how long that place
+        lives* — never what the body may do."""
         ectx = self.build_effect_context(context)
+        timeout = float((getattr(context, "config", None) or {})
+                        .get("tool_timeout", self.timeout_s))
         if self.trusted(context):
             from sandbox.local import run_local_tool
             return run_local_tool(
                 instance=self, params=params, declared=self.declared_requests,
                 effect_ctx=ectx, method=method)
+        if self.persistent_sandbox:
+            from sandbox.worker import POOL
+            worker = POOL.acquire(
+                source=self._source_text(), memory_mb=self.memory_mb,
+                cpu_seconds=self.cpu_seconds, persistent=True)
+            return worker.call(
+                params=params, declared=self.declared_requests, effect_ctx=ectx,
+                method=method, timeout=timeout)
         from sandbox.runner import run_sandbox_tool
         return run_sandbox_tool(
             source=self._source_text(), params=params,
             declared=self.declared_requests, effect_ctx=ectx, method=method,
-            timeout=float((getattr(context, "config", None) or {}).get("tool_timeout", self.timeout_s)),
-            memory_mb=self.memory_mb, cpu_seconds=self.cpu_seconds)
+            timeout=timeout, memory_mb=self.memory_mb, cpu_seconds=self.cpu_seconds)
+
+    def release_sandbox(self) -> None:
+        """Close this plugin's resident worker, if it has one (a service's
+        unload path). Safe to call when there is none."""
+        if not self.persistent_sandbox or self.contract != "effects":
+            return
+        try:
+            from sandbox.worker import POOL
+            POOL.release(self._source_text())
+        except Exception:  # noqa: BLE001 — teardown must not raise
+            logger.debug("releasing sandbox worker failed", exc_info=True)
 
     def _source_text(self) -> str:
         """The plugin's own source, read lazily and cached. Only the untrusted
