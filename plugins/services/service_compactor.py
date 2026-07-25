@@ -25,33 +25,33 @@ class CompactorService(BaseService):
         "unless knowing an approach failed prevents repeating the mistake."
     )
 
-    def compact(self, *, runtime, session_key: str | None, transcript: str) -> str | None:
-        """Return a continuation summary for a rendered transcript."""
-        if not transcript:
-            return ""
-        llm = self._llm_for_session(runtime, session_key) or self.services.get("llm")
-        if llm is None or not getattr(llm, "loaded", False):
-            logger.warning("Compaction skipped: LLM service is not loaded.")
-            return None
-        response = llm.chat_with_tools([
-            {"role": "system", "content": self.SYSTEM_PROMPT},
-            {"role": "user", "content": transcript},
-        ], None)
-        if getattr(response, "is_error", False):
-            logger.warning("Compaction failed: %s", getattr(response, "error", None) or "unknown error")
-            return None
-        return (getattr(response, "content", "") or "").strip()
+    # Compaction is pure text work over one model call, so it needs none of the
+    # five capabilities that force the always-trusted exception (see
+    # effects/PRIMITIVES.md): no live handle, no thread, no registry mutation,
+    # no mid-operation callback, no callable handed to the kernel. It is
+    # therefore an ordinary sandboxable service — and the first one to prove a
+    # service can cross the boundary at all.
+    contract = "effects"
+    declared_requests = ["complete"]
 
-    @staticmethod
-    def _llm_for_session(runtime, session_key: str | None):
-        if not runtime or not session_key:
-            return None
-        try:
-            from runtime.runtime_config import active_llm
-            return active_llm(runtime, runtime.sessions.get(session_key))
-        except Exception:
-            logger.exception("Failed to resolve session LLM for compaction")
-            return None
+    def compact(self, params):
+        """Return a continuation summary for a rendered transcript.
+
+        The LLM is reached as a ``Complete`` request rather than as an object, so
+        keys and sockets stay kernel-side. The kernel resolves *which* model —
+        the session's profile-selected brain, matching the conversation being
+        compacted — before the request is served."""
+        from effects.vocabulary import Complete, Respond
+
+        transcript = (params or {}).get("transcript") or ""
+        if not transcript:
+            return Respond(data="")
+        answer = yield Complete(prompt=transcript, system=self.SYSTEM_PROMPT)
+        if not answer.ok:
+            # Compaction failing is not fatal: the loop keeps the history it has
+            # and warns. Returning None keeps that contract.
+            return Respond(success=False, error=answer.error, data=None)
+        return Respond(data=(str(answer.value or "")).strip())
 
 
 def build_services(config: dict) -> dict:

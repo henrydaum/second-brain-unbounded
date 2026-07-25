@@ -155,7 +155,7 @@ class EffectsContract:
         services = getattr(context, "services", None) or {}
         ectx = EffectContext(
             db=getattr(context, "db", None),
-            llm=services.get("llm"),
+            llm=self._llm_for(context, services),
             embedder=services.get("text_embedder"),
             read_roots=self._read_roots(context),
             write_roots=self._write_roots(context),
@@ -174,6 +174,24 @@ class EffectsContract:
         # has already read. Attached after construction for that reason.
         ectx.egress_gate = self._egress_gate(context, ectx)
         return ectx
+
+    def _llm_for(self, context, services: dict):
+        """The model a ``Complete`` should reach: the session's, not the global.
+
+        A session can select a profile, so ``services["llm"]`` (the router's
+        global default) is the wrong answer whenever one has. Resolving here
+        means a plugin's model call uses the same brain as the conversation it
+        is running inside — which is what makes a sandboxed compactor equivalent
+        to the in-process one it replaces. Falls back to the router if profile
+        resolution is unavailable."""
+        runtime = getattr(context, "runtime", None)
+        if runtime is None:
+            return services.get("llm")
+        try:
+            from runtime.runtime_config import active_llm
+            return active_llm(runtime, self._session(context)) or services.get("llm")
+        except Exception:  # noqa: BLE001 — profile resolution is best-effort
+            return services.get("llm")
 
     def _config(self, context) -> dict:
         """The live config dict, or an empty one."""

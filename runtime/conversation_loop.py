@@ -925,7 +925,8 @@ class ConversationLoop:
             transcript = _truncate_middle(transcript, 20000)
             if self.on_notice:
                 self.on_notice("Compacting conversation...")
-            summary = compactor.compact(runtime=self.runtime, session_key=self.session_key, transcript=transcript)
+            summary = compactor.perform(
+                "compact", {"transcript": transcript}, self._service_context())
             if not summary:
                 logger.warning("Compaction returned no summary. History will not shrink via summary.")
                 return
@@ -960,6 +961,23 @@ class ConversationLoop:
                 self.on_notice(f"Compacted {old_count} messages.")
         except Exception as e:
             logger.debug("Compaction failed: %s", e, exc_info=True)
+
+    def _service_context(self):
+        """A ``SecondBrainContext`` for calling a service from the loop.
+
+        Services used to receive ``runtime`` itself, which handed a plugin the
+        whole kernel — db, sessions, registries, hooks. Building a context here
+        instead means an effects-contract service gets only what the boundary
+        allows, and a legacy one gets the same shape every other caller uses."""
+        from runtime.context import build_context
+
+        return build_context(
+            self._active_db,
+            getattr(self.runtime, "config", {}) or {},
+            getattr(self.runtime, "services", {}) or {},
+            runtime=self.runtime,
+            session_key=self.session_key,
+        )
 
     def _shrink_for_tail(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Aggressively truncate any oversized message preserved through

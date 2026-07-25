@@ -292,7 +292,7 @@ def test_compaction_emits_session_compacted_event():
     class _Compactor:
         loaded = True
 
-        def compact(self, **kwargs):
+        def perform(self, method, params, context):
             return "Earlier summary."
 
     seen = []
@@ -577,8 +577,8 @@ def test_compaction_uses_compactor_service_directly():
         def __init__(self):
             self.calls = []
 
-        def compact(self, **kwargs):
-            self.calls.append(kwargs)
+        def perform(self, method, params, context):
+            self.calls.append((method, params, context))
             return "Earlier summary."
 
     notices = []
@@ -601,8 +601,15 @@ def test_compaction_uses_compactor_service_directly():
 
     loop._compact(history)
 
-    assert compactor.calls[0]["runtime"] is runtime
-    assert compactor.calls[0]["session_key"] == "chat"
+    method, params, context = compactor.calls[0]
+    assert method == "compact"
+    # The service receives the transcript and a context -- never the runtime.
+    # Handing a plugin the whole kernel was the old shape; the boundary now
+    # narrows it to what a SecondBrainContext exposes.
+    assert set(params) == {"transcript"}
+    assert "one" in params["transcript"]
+    assert context is not runtime
+    assert context.session_key == "chat"
     assert history[0]["content"].startswith("[Conversation summary from earlier]")
     assert history[0]["content"].endswith("Earlier summary.")
     # The synthesized turn carries the compaction ground rules: the full
@@ -641,7 +648,7 @@ class _CountingCompactor:
     def __init__(self):
         self.calls = 0
 
-    def compact(self, **kwargs):
+    def perform(self, method, params, context):
         self.calls += 1
         return "Earlier summary."
 

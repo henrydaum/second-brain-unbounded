@@ -11,13 +11,15 @@ import threading
 import time
 from abc import ABC
 
+from plugins.EffectsContract import EffectsContract
+
 logger = logging.getLogger("BaseService")
 
 MANAGED = "managed"
 EXTENSION = "extension"
 
 
-class BaseService(ABC):
+class BaseService(EffectsContract, ABC):
     """
     The contract every service implements.
 
@@ -68,10 +70,12 @@ class BaseService(ABC):
     def __init_subclass__(cls, **kwargs):
         """Internal helper to handle init subclass."""
         super().__init_subclass__(**kwargs)
-        for attr in ("config_settings", "dependencies_files", "dependencies_pip"):
+        for attr in ("config_settings", "dependencies_files", "dependencies_pip",
+                     "declared_requests"):
             value = getattr(cls, attr)
             if isinstance(value, (dict, list)):
                 setattr(cls, attr, value.copy())
+        cls.validate_effects_declaration()
 
     # --- Agent system-prompt contribution ---
     # Static guidance injected into the agent's system prompt when this service
@@ -195,3 +199,32 @@ def is_user_managed_service(svc) -> bool:
 def should_autoload_service(name: str, svc, config: dict) -> bool:
     """Whether startup should load a service."""
     return is_extension_service(svc) or name in (config.get("autoload_services") or [])
+
+    # ── kernel entry point ───────────────────────────────────────────────
+
+    def perform(self, method: str, params: dict, context):
+        """Call one service method. The entry point kernel callers should use.
+
+        Services are the one family without a single ``run``: they expose named
+        capabilities (``compact``, ``encode``, …), so the method is named at the
+        call site rather than fixed by the contract.
+
+        A ``legacy`` service is called directly with keyword arguments — the
+        historical behaviour. An ``effects`` service has that method driven as a
+        generator through the shared boundary, and the caller receives the
+        body's returned data.
+
+        Services that need a live handle, own a thread, mutate kernel
+        registries, are called back mid-operation, or hand the kernel a callable
+        cannot use the effects contract at all; see "What requires the
+        always-trusted exception" in effects/PRIMITIVES.md.
+        """
+        if self.contract != "effects":
+            return getattr(self, method)(**(params or {}))
+        outcome = self._perform_effects(context, dict(params or {}), method=method)
+        if not outcome.success:
+            logger.warning("Service %r method %r failed: %s",
+                           getattr(self, "model_name", type(self).__name__),
+                           method, outcome.error)
+            return None
+        return outcome.data if outcome.data is not None else outcome.summary
