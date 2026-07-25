@@ -26,6 +26,7 @@ from pathlib import Path
 # resolve.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from sandbox.driver import drive  # noqa: E402
 from sandbox.protocol import read_message, write_message  # noqa: E402
 from sandbox.validate import assert_valid, _import_allowed, _BANNED_NAMES  # noqa: E402
 
@@ -167,28 +168,22 @@ def _restricted_builtins() -> dict:
     return safe
 
 
-class _Result:
-    """What a tool sees back from ``yield <request>`` — the effect result."""
-
-    __slots__ = ("ok", "value", "error", "denied")
-
-    def __init__(self, wire: dict):
-        """Build from an effect-result wire dict."""
-        self.ok = bool(wire.get("ok", True))
-        self.value = wire.get("value")
-        self.error = wire.get("error", "")
-        self.denied = bool(wire.get("denied", False))
-
-
 def _find_tool_class(namespace: dict):
-    """Locate the BaseSandboxTool subclass in the exec'd namespace."""
-    from plugins.BaseSandboxTool import BaseSandboxTool
+    """Locate the effects-contract tool class in the exec'd namespace.
+
+    Matches any ``BaseTool`` subclass declaring ``contract = "effects"``, which
+    covers both the current form (subclass ``BaseTool`` directly) and the
+    deprecated ``BaseSandboxTool`` shim, since the shim is itself such a subclass.
+    """
+    from plugins.BaseTool import BaseTool
 
     for value in namespace.values():
-        if (isinstance(value, type) and issubclass(value, BaseSandboxTool)
-                and value is not BaseSandboxTool):
+        if (isinstance(value, type) and issubclass(value, BaseTool)
+                and value is not BaseTool
+                and getattr(value, "contract", "") == "effects"
+                and value.__name__ != "BaseSandboxTool"):
             return value
-    raise ValueError("no BaseSandboxTool subclass found in tool file")
+    raise ValueError("no effects-contract tool class found in tool file")
 
 
 def _diagnostic(exc: BaseException) -> dict:
@@ -203,39 +198,19 @@ def _diagnostic(exc: BaseException) -> dict:
     }
 
 
-def _drive(instance, params: dict, out, inp) -> dict:
-    """Drive the tool generator, speaking the protocol. Returns the final wire."""
-    result = instance.run(params)
-    if not hasattr(result, "send"):
-        # Not a generator: the tool returned a Respond (or a plain value) directly.
-        return _as_final(result)
+def _pipe_fulfil(out, inp):
+    """The untrusted mode's fulfilment: ship the request to the parent and block.
 
-    to_send = None
-    while True:
-        try:
-            request = result.send(to_send)
-        except StopIteration as stop:
-            return _as_final(stop.value)
-        wire = request.to_wire() if hasattr(request, "to_wire") else dict(request)
-        if wire.get("type") == "respond":
-            return wire
+    This closure is the *entire* difference between untrusted and trusted
+    execution — the generator loop itself lives in ``sandbox.driver``."""
+    def fulfil(wire: dict) -> dict:
         write_message(out, {"yield": wire})
         reply = read_message(inp)
         if reply is None:
             raise RuntimeError("parent closed the pipe before fulfilling a request")
-        to_send = _Result(reply.get("resume") or {})
+        return reply.get("resume") or {}
 
-
-def _as_final(value) -> dict:
-    """Coerce a tool's return value into a Respond wire dict."""
-    if value is None:
-        raise RuntimeError("tool finished without a Respond")
-    if hasattr(value, "to_wire"):
-        return value.to_wire()
-    if isinstance(value, dict) and value.get("type") == "respond":
-        return value
-    # A bare value: wrap it as a successful Respond payload.
-    return {"type": "respond", "summary": str(value), "data": value, "success": True, "error": ""}
+    return fulfil
 
 
 def main() -> int:
@@ -255,7 +230,7 @@ def main() -> int:
         tool_cls = _find_tool_class(namespace)
         instance = tool_cls()
 
-        final = _drive(instance, params, out, inp)
+        final = drive(instance, params, _pipe_fulfil(out, inp))
         write_message(out, {"final": final})
         return 0
     except MemoryError:

@@ -37,6 +37,7 @@ except ImportError:  # POSIX rlimits remain the only memory enforcement
 from effects.declarations import UndeclaredRequestError
 from effects.interpreter import EffectContext, Interpreter, TurnJournal
 from effects.vocabulary import from_wire
+from sandbox.driver import SandboxOutcome, outcome_from_respond
 from sandbox.protocol import write_message
 from sandbox.validate import SandboxValidationError, assert_valid
 
@@ -53,23 +54,6 @@ _POLL_INTERVAL = 0.03  # memory-watchdog sampling period (seconds)
 class SandboxRunError(RuntimeError):
     """A sandboxed tool run failed at the harness level (timeout, protocol,
     validation) rather than returning an unsuccessful ``Respond``."""
-
-
-@dataclass
-class SandboxOutcome:
-    """Neutral result of a sandbox run (mapped to ToolResult by the adapter)."""
-
-    success: bool = True
-    summary: str = ""
-    data: Any = None
-    error: str = ""
-    error_type: str = ""
-    attachment_paths: list[str] = field(default_factory=list)
-
-    @classmethod
-    def failed(cls, error: str, error_type: str = "SandboxError") -> "SandboxOutcome":
-        """Build a failed outcome."""
-        return cls(success=False, error=error, error_type=error_type)
 
 
 def run_sandbox_tool(
@@ -247,7 +231,7 @@ def _handle_message(message: dict, interp: Interpreter, proc) -> tuple[str, Sand
         return "yield", None, False
 
     if "final" in message:
-        return "final", _outcome_from_respond(message["final"]), True
+        return "final", outcome_from_respond(message["final"]), True
 
     if "error" in message:
         diag = message["error"] or {}
@@ -255,18 +239,6 @@ def _handle_message(message: dict, interp: Interpreter, proc) -> tuple[str, Sand
             diag.get("message") or "tool raised", diag.get("error_type") or "ToolError"), True
 
     return "unknown", None, False
-
-
-def _outcome_from_respond(wire: dict) -> SandboxOutcome:
-    """Map a Respond wire dict to a SandboxOutcome."""
-    wire = wire or {}
-    return SandboxOutcome(
-        success=bool(wire.get("success", True)),
-        summary=wire.get("summary") or "",
-        data=wire.get("data"),
-        error=wire.get("error") or "",
-        attachment_paths=list(wire.get("attachment_paths") or []),
-    )
 
 
 def _terminate(proc) -> None:

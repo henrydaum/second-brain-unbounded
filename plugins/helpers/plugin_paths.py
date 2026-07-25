@@ -82,6 +82,65 @@ def is_builtin_path(path) -> bool:
     return resolved == _BUILTIN_ROOT or _BUILTIN_ROOT in resolved.parents
 
 
+def trusted_hashes() -> set[str]:
+    """SHA-256 hexdigests the user has reviewed and marked trusted.
+
+    Trust binds to *reviewed bytes*, never to an origin: "it came from the
+    store" is not evidence, because a store is just a place code arrives from.
+    Editing a file changes its hash and silently drops it back to untrusted,
+    which is the property that makes review meaningful.
+
+    Read fresh each call from ``DATA_DIR/trusted_plugins.txt`` (one hexdigest per
+    line, ``#`` comments allowed) so revoking trust takes effect without a
+    restart. A missing file means "nothing extra is trusted" — fail closed.
+    """
+    registry = DATA_DIR / "trusted_plugins.txt"
+    try:
+        lines = registry.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    out = set()
+    for line in lines:
+        entry = line.split("#", 1)[0].strip().lower()
+        if len(entry) == 64 and all(c in "0123456789abcdef" for c in entry):
+            out.add(entry)
+    return out
+
+
+def file_digest(path) -> str | None:
+    """SHA-256 of a plugin source file, or ``None`` if unreadable."""
+    import hashlib
+
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except (OSError, TypeError):
+        return None
+
+
+def is_trusted(path, *, trusted: set[str] | None = None) -> bool:
+    """Whether a plugin at ``path`` may run in-process (trusted mode).
+
+    Provenance decides, never self-assertion:
+
+    1. Built-in kernel plugins are trusted — they ship with the kernel and are
+       already inside the trusted computing base.
+    2. Anything else is trusted only if its content hash is registered as
+       reviewed (see :func:`trusted_hashes`).
+
+    Everything else — sandbox-authored plugins, store installs, and any file
+    that changed since review — runs sandboxed. An unreadable path is untrusted:
+    the conservative direction here is the *opposite* of ``is_builtin_path``,
+    because that gate protects against auto-disabling and this one protects
+    against granting authority.
+    """
+    if is_builtin_path(path) and path:
+        return True
+    digest = file_digest(path)
+    if digest is None:
+        return False
+    return digest in (trusted_hashes() if trusted is None else trusted)
+
+
 def resolve_plugin_path(raw: str) -> tuple[Path | None, str | None]:
     """Resolve plugin path."""
     if not raw:

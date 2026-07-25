@@ -129,7 +129,7 @@ class ToolRegistry:
         # the thread count without adding safety.
         if getattr(_exec_state, "in_tool", False):
             try:
-                result = tool.run(context, **kwargs)
+                result = tool.perform(context, **kwargs)
                 logger.debug(f"Tool '{tool_name}' completed in {time.time() - t0:.3f}s")
                 return result
             except Exception as e:
@@ -143,7 +143,7 @@ class ToolRegistry:
             supervised worker thread so nested call_tool runs inline)."""
             _exec_state.in_tool = True
             try:
-                return tool.run(context, **kwargs)
+                return tool.perform(context, **kwargs)
             finally:
                 _exec_state.in_tool = False
 

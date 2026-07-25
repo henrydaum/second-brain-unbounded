@@ -8,11 +8,11 @@ parse the tool source and reject:
 - introspection attributes that escape the sandbox (``__globals__``,
   ``__subclasses__``, ``f_back``, …).
 
-The allowlist is stdlib-pure modules plus exactly two kernel imports the tool
-needs: ``plugins.BaseSandboxTool`` (its base class) and ``effects.vocabulary``
-(the request types it yields). Neither pulls a db, socket, or filesystem handle
-into scope — the whole point is that the tool can construct a request but never
-fulfil one.
+The allowlist is stdlib-pure modules plus the few kernel imports a tool needs:
+its base class (``plugins.BaseTool``, or the deprecated ``plugins.BaseSandboxTool``
+shim) and ``effects.vocabulary`` (the request types it yields). None pulls a db,
+socket, or filesystem handle into scope — the whole point is that the tool can
+construct a request but never fulfil one.
 """
 
 from __future__ import annotations
@@ -25,7 +25,8 @@ import ast
 # urllib.parse is admitted (string munging, no sockets) while bare ``urllib`` is
 # not — that would reach urllib.request.
 _LITERAL_ALLOWED = {
-    "plugins.BaseSandboxTool",
+    "plugins.BaseTool",          # the contract (a tool sets contract = "effects")
+    "plugins.BaseSandboxTool",   # deprecated shim; kept until the store is converted
     "effects.vocabulary",
     "sandbox_kit",
     "urllib.parse",

@@ -31,14 +31,11 @@ future store) — *not* by deleting them. What remains:
   install/uninstall substrate). If another tracked service remains, treat it as
   kernel-boundary debt unless the user explicitly keeps it.
 - **Tasks:** none.
-- **Tools:** the kernel ships the **two-tool interface** and nothing else:
-  `search_tools` (BM25 over the catalog's one-line descriptions), `execute_tool`
-  (select a tool by name + intent), and the fill-time escape hatch `abort_fill`.
-  The agent never sees a catalog of schemas — every other capability
-  (`read_file`, shell/SQL/editing tools, …) is discovered via `search_tools` and
-  invoked via `execute_tool`, which triggers a separate forced parameter-fill
-  model call. See "The effect system + two-tool agent" below. Catalog tools are
-  package capabilities unless discovery shows they are installed.
+- **Tools:** none. The kernel ships no built-in tools; the agent is presented
+  the full schema list of whatever is registered
+  (`tool_registry.get_all_schemas()`). Every capability (`read_file`,
+  shell/SQL/editing tools, …) is a package capability unless discovery shows it
+  is installed.
 - **Frontend:** `frontend_repl` only. Telegram and the MCP server
   (`frontend_mcp_server` — exposes Second Brain to external MCP clients over
   streamable HTTP; tested from main via `tests/test_frontend_mcp.py`, which
@@ -98,7 +95,7 @@ guidance from each in-scope plugin's `agent_prompt_for(ctx)` (see `_collect` in
 `agent/system_prompt.py`), so missing plugins degrade silently and correctly —
 uninstalling a package removes its prompt text with it.
 
-## The effect system + two-tool agent
+## The effect system
 
 The tool layer is being rearchitected (ported from Second Brain Art's
 canvas/technique model) so tools are **pure functions in subprocess sandboxes**
@@ -125,28 +122,39 @@ behavior at a small fixed boundary.
   yielded request through an `Interpreter`, wall-clock timeout), `protocol.py`
   (JSON-lines yield/resume wire format). A sandboxed tool's `run(self, params)`
   is a **generator** that yields requests and returns a `Respond`.
-  `plugins/BaseSandboxTool.py` is the artifact contract (code + `fill_prompt` +
-  `declared_requests` + `view`) plus a `SandboxToolAdapter(BaseTool)` so a
-  sandboxed tool is indistinguishable from an in-process one to the registry,
-  state machine, `_absorb`, and ledger. Discovery wraps `BaseSandboxTool`
-  subclasses via `build_sandbox_adapters` (see `plugin_discovery.discover_tools`).
+  `sandbox/driver.py` holds the transport-agnostic generator loop shared by both
+  execution modes; `sandbox/local.py` is the trusted (in-process) executor.
 
-- **The two-tool agent** — the agent's whole tool surface collapses to
-  `search_tools` + `execute_tool` (`plugins/tools/`), so per-turn context cost is
-  one catalog line and the catalog can grow without bound. The collapse lives in
-  the ConversationLoop (`_agent_facing_schemas`, hard cutover when the interface
-  is installed; falls back to the full registry only on a bare kernel — not a
-  config mode). `execute_tool` parks a selection on `session.pending_fill`; the
-  loop's `_prepare_fill_call` shapes a single **forced** model call presenting
-  only the chosen target + `abort_fill` (reusing the doorman's
-  `_tools_override_once`/`_tool_choice_once` once-flags). Fill is a separate,
-  on-distribution tool call; `abort_fill` is the escape hatch so forced choice can
-  decline. Usefulness (selection rate, fill-abort rate) is read straight off the
-  action ledger — no metrics table.
+- **One base class per family.** There is no `BaseSandbox*` hierarchy. A tool
+  sets `contract = "effects"` on `BaseTool` and writes a generator `run(self,
+  params)`; the kernel always enters through `BaseTool.perform`, so the registry,
+  state machine, `_absorb`, and ledger cannot tell an effects tool from a legacy
+  one. `plugins/BaseSandboxTool.py` is a deprecated shim (a `BaseTool` with
+  `contract` preset) kept only until the store tree is converted.
+
+- **Trusted vs untrusted execution.** Where a body runs is decided by
+  *provenance* (`plugin_paths.is_trusted`): built-in ⇒ trusted (in-process);
+  everything else ⇒ sandboxed unless its SHA-256 is registered in
+  `DATA_DIR/trusted_plugins.txt`. Trust binds to reviewed **bytes**, so editing a
+  file drops it back to untrusted. Trusted mode is **not** a bypass — both modes
+  drive the same generator through the same `Interpreter`, so tiers, argument
+  checks, journalling, the egress gate, and ledger rows are identical
+  (`tests/test_execution_modes.py` pins this, ledger rows included). Cold cost:
+  ~520 ms untrusted vs ~4.6 ms trusted, dominated by the child's imports.
+
+The admission policy for the vocabulary — why a definitive list is possible, why
+exactly three tiers, and the generality bar every candidate primitive must pass —
+lives in [effects/PRIMITIVES.md](effects/PRIMITIVES.md). Read it before adding a
+request type.
 
 Deferred (recorded, not yet built): the conversation-as-DAG / content-addressed
 turn hashing / branch-and-replay UI (Art's pool-hash pattern applied to
 conversations), and a warm sandbox worker pool (v1 is subprocess-per-call).
+
+In progress: extending the sandbox from tools to **every** plugin family, with a
+trusted (in-process) / untrusted (subprocess) execution mode behind one contract
+per family. See the plan at
+`C:\Users\henry\.claude\plans\okay-we-re-gonna-plan-immutable-kettle.md`.
 
 ## Hardening applied for kernel reliability
 

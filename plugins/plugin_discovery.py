@@ -265,16 +265,9 @@ def discover_tools(root_dir: Path, tool_registry, config: dict, reload: bool = F
                 _collect_config_settings(instance, plugin_type="tool")
                 seen_names.add(instance.name)
                 count += 1
-            # Sandboxed tools (BaseSandboxTool) are pure generators that run in a
-            # subprocess; discovery wraps each in a BaseTool adapter so the rest
-            # of the system sees a normal tool.
-            for adapter in _find_sandbox_tool_adapters(module, module_name, py_file):
-                if adapter.name in seen_names:
-                    logger.warning(f"Sandbox tool '{adapter.name}' from {plugin_dir.root.name} collides with an earlier root — skipped")
-                    continue
-                tool_registry.register(adapter)
-                seen_names.add(adapter.name)
-                count += 1
+            # Effects-contract tools need no separate pass: they are ordinary
+            # BaseTool subclasses whose ``contract`` selects how ``invoke`` runs
+            # them. One loop, one namespace, one collision rule.
 
     logger.info(f"Discovered {count} tool(s) in {time.time() - t0:.2f}s")
 
@@ -735,20 +728,6 @@ def _find_subclass_instances(module, base_class, module_name: str) -> list:
         except Exception as e:
             logger.error(f"Could not instantiate {cls.__name__}: {e}", exc_info=True)
     return instances
-
-
-def _find_sandbox_tool_adapters(module, module_name: str, py_file) -> list:
-    """Wrap every BaseSandboxTool subclass in ``module`` as a registry adapter.
-
-    Imported lazily so the sandbox/effects packages are only pulled in when a
-    sandbox tool is actually present (keeps a bare kernel's import surface small).
-    """
-    try:
-        from plugins.BaseSandboxTool import build_sandbox_adapters
-    except Exception as e:  # noqa: BLE001
-        logger.debug(f"Sandbox tool support unavailable: {e}")
-        return []
-    return build_sandbox_adapters(module, module_name, _source_path(py_file))
 
 
 def _find_subclasses(module, base_class, module_name: str) -> list:

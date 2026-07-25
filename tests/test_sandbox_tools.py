@@ -316,14 +316,17 @@ def test_slow_fulfillment_does_not_count_against_the_tool():
     assert outcome.data is True  # the denial reached the tool
 
 
-# ── the adapter / discovery path ─────────────────────────────────────────
+# ── the discovery path ───────────────────────────────────────────────────
 
-def test_sandbox_adapter_presents_as_a_normal_tool(tmp_path):
-    """build_sandbox_adapters wraps a sandbox tool so the registry sees a
-    BaseTool with the derived danger tier and a working run()."""
+def test_effects_tool_is_an_ordinary_base_tool(tmp_path):
+    """An effects-contract tool needs no adapter: it *is* a BaseTool, with the
+    derived danger tier, a normal schema, and a working invoke().
+
+    This is the one-contract-per-family property — the registry, state machine,
+    and ledger cannot tell an effects tool from a legacy one."""
     import importlib.util
 
-    from plugins.BaseSandboxTool import build_sandbox_adapters
+    from plugins.BaseTool import BaseTool
 
     tool_file = tmp_path / "tool_read_one.py"
     tool_file.write_text(_READ_TOOL, encoding="utf-8")
@@ -331,14 +334,18 @@ def test_sandbox_adapter_presents_as_a_normal_tool(tmp_path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    adapters = build_sandbox_adapters(module, "tool_read_one", str(tool_file))
-    assert len(adapters) == 1
-    adapter = adapters[0]
-    assert adapter.name == "read_one"
-    assert adapter.danger_tier == "read"
-    assert adapter.to_schema()["function"]["name"] == "read_one"
+    cls = next(v for v in vars(module).values()
+               if isinstance(v, type) and issubclass(v, BaseTool) and v is not BaseTool
+               and v.__module__ == "tool_read_one")
+    tool = cls()
+    tool._source_path = str(tool_file)
 
-    # Run it through the adapter with a minimal context pointing read at tmp.
+    assert isinstance(tool, BaseTool)
+    assert tool.contract == "effects"
+    assert tool.name == "read_one"
+    assert tool.danger_tier == "read"
+    assert tool.to_schema()["function"]["name"] == "read_one"
+
     data = tmp_path / "data.txt"
     data.write_text("adapter path", encoding="utf-8")
     context = SimpleNamespace(
@@ -346,6 +353,6 @@ def test_sandbox_adapter_presents_as_a_normal_tool(tmp_path):
         runtime=None, session_key=None, root_dir=str(tmp_path), user_id=1,
         approve_command=None, approval_denial_reason="",
     )
-    result = adapter.run(context, path=str(data))
+    result = tool.perform(context, path=str(data))
     assert result.success, result.error
     assert result.data == "adapter path"
