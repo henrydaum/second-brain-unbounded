@@ -24,7 +24,7 @@ class CommandsCommand(BaseCommand):
     def run(self, _params):
         """Execute `/commands` for the active session."""
         from effects.vocabulary import ReadContext, Respond
-        from plugins.frontends.helpers.formatters import md_table
+        from sandbox_kit import md_table
 
         result = yield ReadContext(view="commands")
         if not result.ok:

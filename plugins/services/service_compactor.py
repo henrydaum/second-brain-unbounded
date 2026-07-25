@@ -1,10 +1,6 @@
 """Conversation compaction service."""
 
-import logging
-
 from plugins.BaseService import BaseService, EXTENSION
-
-logger = logging.getLogger("CompactorService")
 
 
 class CompactorService(BaseService):
