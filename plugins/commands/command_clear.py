@@ -4,31 +4,30 @@ from plugins.BaseCommand import BaseCommand
 
 
 class ClearCommand(BaseCommand):
-    """Slash-command handler for `/clear`."""
+    """Slash-command handler for `/clear`.
+
+    Clearing is four coupled steps — wipe messages, mark the title, close the
+    session, reload it preserving the bound user — that must not be half-done.
+    So the body names the *intent* and the kernel carries out the sequence,
+    rather than the plugin driving four mutations and owning the ordering.
+    """
     name = "clear"
     description = "Clear all messages in the current conversation"
     category = "Conversation"
 
-    def run(self, _args, context):
+    contract = "effects"
+    declared_requests = ["conversation_op", "read_context"]
+
+    def run(self, _params):
         """Execute `/clear` for the active session."""
-        runtime = getattr(context, "runtime", None)
-        session_key = getattr(context, "session_key", None)
-        db = getattr(context, "db", None)
-        if runtime is None or not session_key or db is None:
-            return "No active session."
-        session = runtime.sessions.get(session_key)
-        conv_id = session.conversation_id if session else None
-        if conv_id is None:
-            return "No conversation loaded."
-        db.clear_conversation_messages(conv_id)
-        conv = db.get_conversation(conv_id) or {}
-        title = (conv.get("title") or "").strip()
-        if title and not title.endswith(" (cleared)"):
-            db.update_conversation_title(conv_id, f"{title} (cleared)")
-        # Preserve the session's bound identity across the close/reload, so the
-        # ownership guard still sees the right user when re-loading.
-        uid = runtime.session_user_id(session_key)
-        runtime.close_session(session_key)
-        runtime.set_session_user(session_key, uid)
-        runtime.load_conversation(session_key, conv_id)
-        return "Conversation cleared."
+        from effects.vocabulary import ConversationOp, ReadContext, Respond
+
+        current = yield ReadContext(view="conversation_id")
+        conversation_id = current.value
+        if conversation_id is None:
+            return Respond(data="No conversation loaded.")
+
+        done = yield ConversationOp(action="clear", conversation_id=conversation_id)
+        if not done.ok:
+            return Respond(data=f"Could not clear the conversation: {done.error}")
+        return Respond(data="Conversation cleared.")

@@ -1,40 +1,80 @@
 """Slash command plugin for `/locations`."""
 
-from pathlib import Path
-
-from paths import DATA_DIR, INSTALLED_PLUGINS, ROOT_DIR, SANDBOX_PLUGINS
 from plugins.BaseCommand import BaseCommand
-from plugins.frontends.helpers.formatters import format_locations
-from state_machine.conversation import FormStep
-
-
-KINDS = {
-    "root": (ROOT_DIR, DATA_DIR),
-    "plugins": (ROOT_DIR / "plugins", DATA_DIR),
-    "sandbox": (SANDBOX_PLUGINS, SANDBOX_PLUGINS),
-    "installed": (INSTALLED_PLUGINS, INSTALLED_PLUGINS),
-}
 
 
 class LocationsCommand(BaseCommand):
-    """Slash-command handler for `/locations`."""
+    """Slash-command handler for `/locations`.
+
+    Was importing ``paths`` directly for ROOT_DIR / DATA_DIR / SANDBOX_PLUGINS
+    and walking them with ``Path.iterdir``. Both halves now cross the boundary:
+    the locations arrive as the ambient ``paths`` view, the listings as
+    ``ListDir``. So the confinement policy applies to ``/locations`` like
+    anything else — it can only show directories the run may read.
+    """
     name = "locations"
     description = "Show project and plugin directories"
     category = "System"
 
-    def form(self, args, context):
-        """Handle form."""
-        return [FormStep("kind", "Choose which location map to show.", True, enum=list(KINDS))]
+    contract = "effects"
+    declared_requests = ["read_context", "list_dir"]
 
-    def run(self, args, context):
+    # Which entries of the ambient path map each choice shows. Names, not paths:
+    # the plugin never learns where these actually live.
+    KINDS = {
+        "root": ("Project root", "root", "Data directory", "data"),
+        "sandbox": ("Sandbox plugins", "scratch", "Data directory", "data"),
+        "memory": ("Memory", "memory_root", "Data directory", "data"),
+    }
+
+    def form(self, _params):
+        """Offer the location maps."""
+        return []
+        yield  # noqa: unreachable — marks this a generator for the contract
+
+    def run(self, params):
         """Execute `/locations` for the active session."""
-        root, data = KINDS.get(args.get("kind") or "root", KINDS["root"])
-        return format_locations({"root_path": str(root), "root_tree": _tree(root), "data_path": str(data), "data_tree": _tree(data)})
+        from effects.vocabulary import ReadContext, Respond
+
+        known = (yield ReadContext(view="paths")).value or {}
+        left_label, left_key, right_label, right_key = self.KINDS.get(
+            params.get("kind") or "root", self.KINDS["root"])
+
+        left = yield from _section(left_label, known.get(left_key, ""))
+        right = yield from _section(right_label, known.get(right_key, ""))
+        return Respond(data=f"{left}\n\n{right}")
 
 
-def _tree(path):
-    """Internal helper to handle tree."""
-    path = Path(path)
-    if not path.exists():
-        return ["(missing)"]
-    return [p.name + ("/" if p.is_dir() else "") for p in sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))]
+def _section(label: str, path: str):
+    """Render one labelled, fenced top-level listing.
+
+    Fenced because rich renderers collapse the single newlines of a bare
+    listing.
+
+    ``ListDir`` enumerates *files*, so a non-recursive call would omit
+    directories entirely — which is most of what this command exists to show.
+    Taking the first segment of each recursive entry recovers them. The walk is
+    capped kernel-side, so a large data directory costs a bounded scan rather
+    than an unbounded one.
+    """
+    from effects.vocabulary import ListDir
+
+    if not path:
+        return f"**{label}**\n`(unknown)`\n```\n(unavailable)\n```"
+
+    result = yield ListDir(root=path, recursive=True)
+    if not result.ok:
+        return f"**{label}**\n`{path}`\n```\n({result.error})\n```"
+
+    value = result.value or {}
+    names = set()
+    for entry in value.get("entries", []):
+        rel = (entry.get("path") or "").strip()
+        if not rel:
+            continue
+        head, _, tail = rel.partition("/")
+        names.add(head + "/" if tail else head)
+    listing = "\n".join(sorted(names, key=lambda n: (not n.endswith("/"), n.lower())))
+    if value.get("truncated"):
+        listing += "\n… (listing truncated)"
+    return f"**{label}**\n`{path}`\n```\n{listing or '(empty)'}\n```"

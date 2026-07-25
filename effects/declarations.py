@@ -82,6 +82,53 @@ def validate_declared(tool_name: str, request: Request, declared: Iterable[str])
         raise UndeclaredRequestError(tool_name, rtype, declared or ())
 
 
+# ── requests whose danger is borrowed ────────────────────────────────────
+
+
+def tool_danger_tier(name: str, tools: dict, *, _seen: frozenset[str] = frozenset()) -> str:
+    """How dangerous is it to call the tool ``name``? Its own derived tier.
+
+    ``CallTool`` is the one verb whose danger is not a property of the verb.
+    Every other request names a resource — a file, a socket, a row — and the
+    resource fixes the grade. This one names *a thing that has its own
+    declarations*, so grading it by the wrapper would be meaningless: calling
+    ``read_file`` and calling ``run_process`` through the same verb are not the
+    same act, and any fixed tier would over-gate one or under-gate the other.
+
+    So the tier is borrowed from the target, which keeps "derive, never assert"
+    intact — the target already declared its requests, and its tier already falls
+    out of those. Nothing new is asserted. This is the same transitive move
+    ``channel_danger_tier`` makes for bus emits.
+
+    Transitive: a tool that can itself call tools extends the blast radius, so
+    the walk follows ``call_tool`` declarations. ``_seen`` breaks cycles, which
+    resolve to the highest tier found along the way.
+
+    Fails **closed**: an unknown target is egress, not read. A name that does not
+    resolve is either a typo or an attempt to reach something the caller should
+    not, and neither deserves the benefit of the doubt.
+    """
+    from effects.vocabulary import TIER_EGRESS, TIER_ORDER, TIER_READ
+
+    if name in _seen:
+        return TIER_READ           # cycle: this arm contributes nothing further
+    tool = (tools or {}).get(name)
+    if tool is None:
+        return TIER_EGRESS
+
+    tier = getattr(tool, "danger_tier", TIER_EGRESS)
+    if "call_tool" in (getattr(tool, "declared_requests", None) or []):
+        # The target can call onward, so its reach is at least its own.
+        seen = _seen | {name}
+        for onward in (tools or {}):
+            if onward in seen:
+                continue
+            downstream = tool_danger_tier(onward, tools, _seen=seen)
+            if TIER_ORDER.get(downstream, 0) > TIER_ORDER.get(tier, 0):
+                tier = downstream
+    return tier
+
+
 # ── who is asking ────────────────────────────────────────────────────────
 #
 # Tier answers "how dangerous is this operation?" and is a property of the
@@ -101,6 +148,10 @@ PRINCIPAL_AGENT = "agent"
 # keeping the set explicit means adding a verb does not silently opt it in.
 ADMIN_REQUESTS: frozenset[str] = frozenset({
     "write_config", "service_control", "package_op", "conversation_op",
+    # Cancelling your own form is the clearest case for the policy: friction-free
+    # for the human who typed /cancel, gated when an agent wants to reach into a
+    # live session it does not own.
+    "session_action",
 })
 
 ALLOW, APPROVE, REFUSE = "allow", "approve", "refuse"

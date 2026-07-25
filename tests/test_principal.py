@@ -30,7 +30,8 @@ from effects.declarations import (
 )
 from effects.interpreter import EffectContext, Interpreter
 from effects.vocabulary import (
-    ConversationOp, HttpRequest, PackageOp, ServiceControl, WriteConfig,
+    CallTool, ConversationOp, HttpRequest, PackageOp, ServiceControl,
+    SessionAction, WriteConfig,
 )
 
 ADMIN_DECLARED = sorted(ADMIN_REQUESTS)
@@ -270,3 +271,145 @@ def test_sandbox_trust_all_relocates_execution_without_granting_authority():
 
     assert tool.trusted(context) is True, "the flag should force in-process execution"
     assert tool.provenance_trusted() is False, "but must not make the code trusted"
+
+
+# ── CallTool: danger that is borrowed, not fixed ─────────────────────────
+#
+# Every other verb names a resource, and the resource fixes the grade. CallTool
+# names a thing that carries its own declarations, so a fixed tier would be
+# meaningless -- calling a read-only tool and calling a shell tool through the
+# same wrapper are not the same act.
+
+def _tool(name, declared, tier=None):
+    """A stand-in tool exposing the two attributes tier derivation reads."""
+    from effects.declarations import derive_tier
+
+    return SimpleNamespace(name=name, declared_requests=list(declared),
+                           danger_tier=tier or derive_tier(declared))
+
+
+def test_calling_a_read_only_tool_borrows_read_tier():
+    """The point of borrowing: a read-only target must not be gated as egress,
+    or people learn to click through approvals that never mattered."""
+    from effects.declarations import tool_danger_tier
+
+    tools = {"reader": _tool("reader", ["read_file"])}
+
+    assert tool_danger_tier("reader", tools) == "read"
+
+
+def test_calling_an_egress_tool_borrows_egress_tier():
+    from effects.declarations import tool_danger_tier
+
+    tools = {"poster": _tool("poster", ["http_request"])}
+
+    assert tool_danger_tier("poster", tools) == "egress"
+
+
+def test_an_unknown_tool_fails_closed():
+    """A name that does not resolve is a typo or an attempt to reach something
+    the caller should not. Neither earns the benefit of the doubt."""
+    from effects.declarations import tool_danger_tier
+
+    assert tool_danger_tier("nope", {}) == "egress"
+
+
+def test_tier_derivation_follows_onward_calls():
+    """A tool that can call tools extends the blast radius, so the walk is
+    transitive -- the same move channel_danger_tier makes for bus emits."""
+    from effects.declarations import tool_danger_tier
+
+    tools = {
+        "front": _tool("front", ["call_tool"]),
+        "shell": _tool("shell", ["run_process"]),
+    }
+
+    assert tool_danger_tier("front", tools) == "egress", \
+        "a tool that can reach a shell tool is as dangerous as one"
+
+
+def test_tier_derivation_terminates_on_a_cycle():
+    """Two tools that can call each other must resolve, not recurse forever."""
+    from effects.declarations import tool_danger_tier
+
+    tools = {"a": _tool("a", ["call_tool"]), "b": _tool("b", ["call_tool"])}
+
+    assert tool_danger_tier("a", tools) in {"read", "write", "egress"}
+
+
+def test_a_read_tier_call_is_not_gated():
+    """The derived tier decides gating, not the verb's class-level tier."""
+    prompts = []
+    ctx = _ctx(principal=PRINCIPAL_AGENT, plugin_trusted=False,
+               call_tool=lambda name, params: {"summary": f"ran {name}"},
+               tools={"reader": _tool("reader", ["read_file"])},
+               egress_gate=lambda r: (prompts.append(r), (True, ""))[1])
+
+    result = Interpreter(ctx, declared=["call_tool"]).fulfill(
+        CallTool(name="reader", params={}))
+
+    assert result.ok
+    assert prompts == [], "calling a read-only tool should not prompt"
+
+
+def test_an_egress_tier_call_is_gated():
+    prompts = []
+    ctx = _ctx(principal=PRINCIPAL_AGENT, plugin_trusted=False,
+               call_tool=lambda name, params: {"summary": f"ran {name}"},
+               tools={"poster": _tool("poster", ["http_request"])},
+               egress_gate=lambda r: (prompts.append(r), (True, ""))[1])
+
+    Interpreter(ctx, declared=["call_tool"]).fulfill(CallTool(name="poster"))
+
+    assert len(prompts) == 1, "calling an egress tool must reach the approval surface"
+
+
+def test_a_tool_cannot_call_itself_into_a_loop():
+    """A sandbox that can recurse without bound is a resource-exhaustion hole."""
+    ctx = _ctx(principal=PRINCIPAL_AGENT, plugin_trusted=True,
+               call_tool=lambda name, params: {"summary": "ran"},
+               tools={"loop": _tool("loop", ["call_tool"])},
+               call_chain=("loop",))
+
+    result = Interpreter(ctx, declared=["call_tool"]).fulfill(CallTool(name="loop"))
+
+    assert not result.ok
+    assert "recursive" in result.error
+
+
+# ── SessionAction is separate from ConversationOp on purpose ─────────────
+
+def test_session_and_conversation_are_different_verbs():
+    """A session is the ephemeral interaction; a conversation is durable owned
+    state. Folding them together would put `cancel` -- which stores nothing and
+    destroys nothing -- behind the same gate as deleting history."""
+    from effects.vocabulary import REQUEST_TYPES
+
+    assert "session_action" in REQUEST_TYPES
+    assert "conversation_op" in REQUEST_TYPES
+    assert REQUEST_TYPES["session_action"] is not REQUEST_TYPES["conversation_op"]
+
+
+def test_cancelling_your_own_form_is_friction_free():
+    """The clearest case for the principal policy."""
+    prompts = []
+    ctx = _ctx(principal=PRINCIPAL_USER, plugin_trusted=True,
+               session_action=lambda action, payload: {"ok": True, "messages": []},
+               egress_gate=lambda r: (prompts.append(r), (True, ""))[1])
+
+    result = Interpreter(ctx, declared=["session_action"]).fulfill(
+        SessionAction(action="cancel"))
+
+    assert result.ok
+    assert prompts == [], "the user cancelling their own form should not prompt"
+
+
+def test_an_agent_reaching_into_a_session_is_gated():
+    prompts = []
+    ctx = _ctx(principal=PRINCIPAL_AGENT, plugin_trusted=True,
+               session_action=lambda action, payload: {"ok": True, "messages": []},
+               egress_gate=lambda r: (prompts.append(r), (True, ""))[1])
+
+    Interpreter(ctx, declared=["session_action"]).fulfill(SessionAction(action="cancel"))
+
+    assert len(prompts) == 1

@@ -218,6 +218,9 @@ class EffectsContract:
             ask_user=self._ask_user(context),
             administer=getattr(context, "administer", None),
             inventory=self._inventory(context),
+            call_tool=self._call_tool(context),
+            tools=getattr(getattr(context, "tool_registry", None), "tools", None),
+            session_action=self._session_action(context),
             # Both ceilings on the administration verbs. The principal comes off
             # the context -- i.e. off the dispatch path that built it -- and is
             # never inferred from what family this plugin belongs to, so a
@@ -361,6 +364,52 @@ class EffectsContract:
         prompt already knows it."""
         from plugins.helpers.inventory import build_inventory
         return build_inventory(context)
+
+    def _call_tool(self, context):
+        """Wire ``CallTool`` to the tool registry, if one is reachable.
+
+        The plugin names a tool; the kernel holds the registry and the objects.
+        The call is marked user-initiated only when this run itself is — a
+        command the human typed calling a tool keeps the human's principal,
+        while an agent-driven body does not get to launder one by going through
+        a command."""
+        registry = getattr(context, "tool_registry", None)
+        if registry is None or not hasattr(registry, "call"):
+            return None
+        from effects.declarations import PRINCIPAL_USER
+
+        user_initiated = getattr(context, "principal", None) == PRINCIPAL_USER
+
+        def call(name: str, params: dict):
+            """Invoke one registered tool and return its result as plain data."""
+            result = registry.call(
+                name, _session_key=getattr(context, "session_key", None),
+                _user_initiated=user_initiated, **(params or {}))
+            return {"success": bool(getattr(result, "success", True)),
+                    "summary": getattr(result, "summary", "") or "",
+                    "data": getattr(result, "data", None),
+                    "error": getattr(result, "error", "") or ""}
+
+        return call
+
+    def _session_action(self, context):
+        """Wire ``SessionAction`` to the runtime's state machine, if present."""
+        runtime = getattr(context, "runtime", None)
+        session_key = getattr(context, "session_key", None)
+        if runtime is None or not session_key or not hasattr(runtime, "handle_action"):
+            return None
+
+        def act(action: str, payload: dict):
+            """Drive one state-machine action and return its outcome as data."""
+            result = runtime.handle_action(session_key, action, **(payload or {}))
+            error = getattr(result, "error", None)
+            if isinstance(error, dict):
+                error = error.get("message")
+            return {"ok": bool(getattr(result, "ok", True)),
+                    "messages": list(getattr(result, "messages", None) or []),
+                    "error": str(error) if error else ""}
+
+        return act
 
     def _ask_user(self, context):
         """Wire ``AskUser`` to the session's input prompt, if a human is there.

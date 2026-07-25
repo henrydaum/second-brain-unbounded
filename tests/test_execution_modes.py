@@ -247,6 +247,16 @@ def _drive_command(cls, source_path, tmp_path, *, trusted: bool, **overrides):
     return command.perform({}, _command_ctx(tmp_path, trust_all=trusted, **overrides))
 
 
+def _cancel_runtime():
+    """A runtime whose state machine reports one handled action."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        sessions={"s1": SimpleNamespace(conversation_id=7)},
+        handle_action=lambda _k, action, **_kw: SimpleNamespace(
+            ok=True, messages=[f"handled {action}"], error=None))
+
+
 def _fake_command_registry():
     """A registry with two commands, so /commands has real content to render."""
     from types import SimpleNamespace
@@ -266,6 +276,10 @@ def _fake_command_registry():
      {"command_registry": _fake_command_registry}),
     ("command_debug", "plugins.commands.command_debug", "DebugCommand",
      ["**Conversation state**", "**Recent log warnings/errors**"], {}),
+    ("command_locations", "plugins.commands.command_locations", "LocationsCommand",
+     ["**Project root**", "app.log"], {}),
+    ("command_cancel", "plugins.commands.command_cancel", "CancelCommand",
+     ["handled cancel"], {"runtime": _cancel_runtime}),
 ])
 def test_a_converted_kernel_command_agrees_across_modes(
         stem, module, class_name, expected, overrides, tmp_path):
@@ -297,10 +311,14 @@ def test_the_converted_commands_are_actually_on_the_contract():
     """Guards against a conversion being silently reverted: if one of these went
     back to ``legacy`` the both-modes test above would still pass, because a
     legacy command ignores the mode entirely."""
+    from plugins.commands.command_cancel import CancelCommand
+    from plugins.commands.command_clear import ClearCommand
     from plugins.commands.command_commands import CommandsCommand
     from plugins.commands.command_debug import DebugCommand
+    from plugins.commands.command_locations import LocationsCommand
     from plugins.commands.command_update import UpdateCommand
 
-    for cls in (CommandsCommand, DebugCommand, UpdateCommand):
+    for cls in (CancelCommand, ClearCommand, CommandsCommand, DebugCommand,
+                LocationsCommand, UpdateCommand):
         assert cls.contract == "effects", f"{cls.__name__} is no longer on the contract"
         assert cls.declared_requests, f"{cls.__name__} declares no requests"

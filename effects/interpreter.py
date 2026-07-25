@@ -45,6 +45,7 @@ from effects.vocabulary import (
     TIER_READ,
     TIER_WRITE,
     AskUser,
+    CallTool,
     Complete,
     ConversationOp,
     DeleteFile,
@@ -62,6 +63,7 @@ from effects.vocabulary import (
     Respond,
     RunProcess,
     ServiceControl,
+    SessionAction,
     Stat,
     WriteConfig,
     WriteDb,
@@ -331,6 +333,17 @@ class EffectContext:
     # (view) -> list/dict. ``None`` means inventory is unavailable and such a
     # read fails rather than returning a misleading empty list.
     inventory: Callable[[str], Any] | None = None
+    # Invokes a registered tool: (name, params) -> result payload. ``None``
+    # means CallTool is unavailable.
+    call_tool: Callable[[str, dict], Any] | None = None
+    # The registered tools, by name — read *only* to derive a CallTool's tier
+    # from its target (see declarations.tool_danger_tier). Never handed to a
+    # plugin; the plugin names a tool, the kernel holds the objects.
+    tools: dict | None = None
+    # Names already on the call stack, so a tool cannot call itself into a loop.
+    call_chain: tuple[str, ...] = ()
+    # Acts on the live session (cancel/back/skip): (action, payload) -> result.
+    session_action: Callable[[str, dict], Any] | None = None
     # ── who is asking ────────────────────────────────────────────────────
     # Derived from the *dispatch path*, never from the plugin's family: a slash
     # command is the user acting, a tool call in an agent turn is the agent
@@ -417,6 +430,16 @@ class Interpreter:
         The policy's job is only to decide whether "allow silently", "ask", or
         "never" applies.
         """
+        # Recursion is refused *structurally*, before any policy runs. A
+        # sandbox that can recurse without bound is a resource-exhaustion hole,
+        # and that is true whether or not an approval gate happens to be wired —
+        # checking it after the gate would let a denial mask the real reason.
+        if isinstance(request, CallTool) and request.name in self.ctx.call_chain:
+            chain = " -> ".join([*self.ctx.call_chain, request.name])
+            return EffectResult(
+                ok=False, denied=True, tier=request.tier,
+                error=f"refusing recursive call to {request.name!r}: {chain}")
+
         if request.type not in ADMIN_REQUESTS:
             return None
         disposition = admin_disposition(self.ctx.principal, self.ctx.plugin_trusted)
@@ -439,6 +462,33 @@ class Interpreter:
         """
         return (request.type in ADMIN_REQUESTS
                 and admin_disposition(self.ctx.principal, self.ctx.plugin_trusted) == ALLOW)
+
+    def effective_tier(self, request: Request) -> str:
+        """The tier this request should actually be graded at.
+
+        Almost always the class-level tier: danger is a property of the operation
+        and does not vary. ``CallTool`` is the exception, and deliberately so —
+        it names a thing that carries its own declarations, so its danger is
+        *borrowed* from the target rather than fixed by the wrapper. Grading it
+        as a flat egress would gate a call to a read-only tool as though it
+        posted to an API, which trains people to click through approvals."""
+        if isinstance(request, CallTool):
+            from effects.declarations import tool_danger_tier
+            return tool_danger_tier(request.name, self.ctx.tools or {})
+        return request.tier
+
+    def _needs_gate(self, request: Request) -> bool:
+        """Whether this egress-tier request must pass the approval surface.
+
+        Two ways out. An administration request in the ``allow`` corner is the
+        user acting through reviewed code, and the human already expressed the
+        intent by typing the command. A ``CallTool`` whose target is not itself
+        egress borrows that lower tier, so it is gated the way the target would
+        have been — which is to say, by the target's own requests when it runs.
+        """
+        if self._admin_allowed_without_prompt(request):
+            return False
+        return self.effective_tier(request) == TIER_EGRESS
 
     # ── compositional tracking ───────────────────────────────────────────
 
@@ -612,10 +662,26 @@ class Interpreter:
         default because read-then-summarise is the common wanted case — but the
         taint is always recorded, so the composition is visible in the ledger
         even when it is not gated."""
-        if not self._admin_allowed_without_prompt(request):
+        if self._needs_gate(request):
             allowed, reason = self.ctx.egress_gate(request)
             if not allowed:
                 return EffectResult(ok=False, denied=True, error=reason or "egress denied", tier=TIER_EGRESS)
+
+        if isinstance(request, CallTool):
+            caller = self.ctx.call_tool
+            if caller is None:
+                return EffectResult(ok=False, tier=TIER_EGRESS,
+                                    error="no tool registry is available")
+            return EffectResult(value=caller(request.name, dict(request.params or {})),
+                                tier=TIER_EGRESS)
+
+        if isinstance(request, SessionAction):
+            act = self.ctx.session_action
+            if act is None:
+                return EffectResult(ok=False, tier=TIER_EGRESS,
+                                    error="no active session to act on")
+            return EffectResult(value=act(request.action, dict(request.payload or {})),
+                                tier=TIER_EGRESS)
 
         if isinstance(request, (WriteConfig, ServiceControl, PackageOp, ConversationOp)):
             administer = self.ctx.administer

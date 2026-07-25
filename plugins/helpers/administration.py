@@ -106,6 +106,25 @@ def build_administer(db, config: dict, services: dict, runtime, session_key: str
                 return runtime.delete_conversation(session_key, cid)
             if action == "load":
                 return runtime.load_conversation(session_key, cid) is not None
+            if action == "clear":
+                # Kernel-side because it is four coupled steps that must not be
+                # half-done: wipe messages, mark the title, then reload the
+                # session *preserving its bound user* so the ownership guard
+                # still sees the right identity on the way back in.
+                if db is None:
+                    raise RuntimeError("no database available to clear a conversation")
+                if cid is None:
+                    raise ValueError("clear needs a conversation_id")
+                db.clear_conversation_messages(cid)
+                conv = db.get_conversation(cid) or {}
+                title = (conv.get("title") or "").strip()
+                if title and not title.endswith(" (cleared)"):
+                    db.update_conversation_title(cid, f"{title} (cleared)")
+                uid = runtime.session_user_id(session_key)
+                runtime.close_session(session_key)
+                runtime.set_session_user(session_key, uid)
+                runtime.load_conversation(session_key, cid)
+                return True
             if action == "categorize":
                 return runtime.set_conversation_category(session_key, cid, fields.get("category"))
             if action == "notification_mode":

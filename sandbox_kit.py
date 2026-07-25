@@ -196,3 +196,68 @@ def md_table(headers: list, rows: list) -> str:
              "|" + "|".join(" --- " for _ in headers) + "|"]
     lines += ["| " + " | ".join(cell(v) for v in row) + " |" for row in rows]
     return "\n".join(lines)
+
+
+def detail_card(title: str, pairs: Iterable[tuple]) -> str:
+    """A titled key/value block: a two-column table whose header row carries the
+    title, so describe-style output renders as a card. The house style for
+    "here are the facts about one thing"."""
+    return md_table([title, ""], list(pairs))
+
+
+def quote_block(text: str) -> str:
+    """Render *text* as a markdown blockquote — the house style for prose under
+    a detail card (descriptions, previews, payloads). Rich frontends collapse
+    single newlines in bare prose, which is why this exists."""
+    return "\n".join(f"> {line}" if line.strip() else ">"
+                     for line in (text or "").splitlines())
+
+
+def sections(entries: Iterable[dict], key: str = "category",
+             order: Sequence[str] = ()) -> list[tuple[str, list[dict]]]:
+    """Group *entries* into ``(section, rows)`` pairs for a sectioned listing.
+
+    Sections named in ``order`` come first in that order; anything else follows
+    in first-seen order. Entries missing ``key`` land in ``"Other"``. Every
+    listing command (/commands, /tools, /services) does this same grouping, and
+    doing it by hand is where their output drifts apart."""
+    grouped: dict[str, list[dict]] = {}
+    for entry in entries or []:
+        grouped.setdefault(entry.get(key) or "Other", []).append(entry)
+    ordered = [s for s in order if s in grouped] + [s for s in grouped if s not in order]
+    return [(section, grouped[section]) for section in ordered]
+
+
+def badge(value: Any, yes: str = "✓", no: str = "—") -> str:
+    """Render a boolean-ish *value* as a status glyph. Keeps listing columns
+    aligned and reads the same across every command."""
+    return yes if value else no
+
+
+# ── request results ──────────────────────────────────────────────────────
+# Every request a body yields comes back as a result object with .ok/.value/
+# .error. Unwrapping it is the single most repeated line in plugin code, and
+# writing it by hand is how a body ends up silently treating a failure as an
+# empty list.
+
+
+def unwrap(result, default=None):
+    """Return ``result.value`` when the request succeeded, else *default*.
+
+    Use when a failure is genuinely tolerable and the default is meaningful —
+    an empty listing, a missing optional file. When a failure should change what
+    the body does, check ``result.ok`` yourself and say something useful about
+    ``result.error``; silently defaulting is how a broken request becomes a
+    confusing empty answer instead of a clear one."""
+    return result.value if getattr(result, "ok", False) else default
+
+
+def failed(*results) -> str:
+    """Return the first error among *results*, or ``""`` if all succeeded.
+
+    The guard clause for a body that issues several requests and should abort on
+    the first problem: ``if err := kit.failed(a, b): return Respond(...)``."""
+    for result in results:
+        if not getattr(result, "ok", False):
+            return getattr(result, "error", "") or "request failed"
+    return ""

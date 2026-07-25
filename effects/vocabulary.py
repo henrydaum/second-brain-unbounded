@@ -370,10 +370,64 @@ class PackageOp(Request):
 
 
 @dataclass(frozen=True)
+class SessionAction(Request):
+    """Act on the live conversation *session*: cancel, go back, skip a field.
+
+    A separate verb from ``ConversationOp`` rather than an action on it, because
+    they are different resources. A conversation is durable state with an owner;
+    a session is the ephemeral in-flight interaction — cancelling a form changes
+    no stored data and destroys no history. Folding them together would force one
+    tier onto both, and would put ``cancel`` (trivially reversible: run the
+    command again) behind the same gate as ``delete`` (irreversible).
+
+    Egress rather than write only because the state machine's transitions are not
+    journalled, so the kernel cannot offer to undo one. The principal policy is
+    what keeps this from being friction: the user cancelling their own form is
+    the ``allow`` corner.
+    """
+
+    type: ClassVar[str] = "session_action"
+    tier: ClassVar[str] = TIER_EGRESS
+    action: str
+    payload: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class CallTool(Request):
+    """Invoke a registered tool by name.
+
+    **This request's tier is not fixed — it is the called tool's tier.** Every
+    other verb in this vocabulary names a resource whose danger is a property of
+    the verb itself; this one names a *thing that has its own declarations*, so
+    grading it by the verb would be meaningless. Calling ``read_file`` and
+    calling ``run_process`` through the same wrapper are not the same act, and a
+    fixed tier would either over-gate the first or under-gate the second.
+
+    The class-level ``tier`` below is therefore only the floor used when the
+    target cannot be resolved. ``effects/declarations.py::effective_tier``
+    computes the real one, the same transitive move ``channel_danger_tier``
+    already makes for bus emits: the danger of a thing that triggers other things
+    is the maximum danger of what it triggers.
+
+    A tool may not call itself, directly or through a cycle — the interpreter
+    tracks the call chain and refuses, because a sandbox that can recurse without
+    bound is a resource-exhaustion hole.
+    """
+
+    type: ClassVar[str] = "call_tool"
+    tier: ClassVar[str] = TIER_EGRESS
+    name: str
+    params: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class ConversationOp(Request):
-    """Create, delete, load, or recategorize a conversation. Egress: deleting a
-    conversation destroys history that no journal can restore, and ownership is
-    enforced kernel-side via ``runtime.assert_conversation_access``."""
+    """Create, delete, load, clear, or recategorize a conversation. Egress:
+    deleting or clearing destroys history that no journal can restore, and
+    ownership is enforced kernel-side via ``runtime.assert_conversation_access``.
+
+    Unlike ``SessionAction`` this touches durable, owned state — which is exactly
+    why the two are separate verbs."""
 
     type: ClassVar[str] = "conversation_op"
     tier: ClassVar[str] = TIER_EGRESS
@@ -390,7 +444,8 @@ REQUEST_TYPES: dict[str, type[Request]] = {
         ReadFile, ReadFiles, ListDir, Stat, QueryDb, ReadContext, AskUser,
         WriteFile, WriteDb, DeleteFile, Respond,
         HttpRequest, Complete, Embed, ExecSql, RunProcess, ReloadPlugin,
-        WriteConfig, ServiceControl, PackageOp, ConversationOp,
+        WriteConfig, ServiceControl, PackageOp, ConversationOp, SessionAction,
+        CallTool,
     )
 }
 
