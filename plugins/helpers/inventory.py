@@ -50,6 +50,8 @@ def build_inventory(context):
                 return _packages(context)
             if view == "pipeline":
                 return _pipeline(context)
+            if view == "settings":
+                return _settings_catalog()
         except Exception:  # noqa: BLE001 — introspection must not break a turn
             logger.exception("inventory view %r failed", view)
             return []
@@ -273,6 +275,40 @@ def _packages(context) -> dict:
     return {"installed": installed, "available": available,
             "removable": package_manager.removable_packages(),
             "bundles": bundles}
+
+
+def _settings_catalog() -> list[dict]:
+    """Every declared setting, as metadata — **never** current values.
+
+    The split is the load-bearing part. A setting's *declaration* (its title,
+    type, which plugins use it, whether it is user-scoped) is as public as a
+    plugin's name and belongs on an ungated read. Its *value* may be an API key,
+    so reading one is ``ReadConfig``, which is principal-graded. Putting values
+    here would route them around that gate."""
+    from config.config_data import SETTINGS_DATA
+    from plugins.plugin_discovery import (
+        get_plugin_setting_scope, get_plugin_settings, get_setting_plugin_names)
+
+    plugin_entries = get_plugin_settings()
+    plugin_keys = {entry[1] for entry in plugin_entries}
+
+    out = []
+    for title, key, description, default, info in [*SETTINGS_DATA, *plugin_entries]:
+        info = info if isinstance(info, dict) else {}
+        if info.get("hidden") is True:
+            continue
+        scope = ("user" if info.get("scope") == "user"
+                 else (_safe(lambda k=key: get_plugin_setting_scope(k), "global")
+                       if key in plugin_keys else "global"))
+        owners = _safe(lambda k=key: get_setting_plugin_names(k), []) or []
+        out.append({
+            "key": key, "title": title, "description": description,
+            "default": default, "type_info": info, "scope": scope,
+            "owners": owners,
+            "category": ("user" if scope == "user"
+                         else "plugin" if key in plugin_keys else "kernel"),
+        })
+    return out
 
 
 def _frontend_of(context):

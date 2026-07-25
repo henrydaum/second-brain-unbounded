@@ -1,5 +1,5 @@
 """Tests for command-UX polish: parse-error propagation, /services toggles,
-config quicklinks, the Used-by map, and the session-conversation banner event.
+the Used-by map, and the session-conversation banner event.
 """
 
 from types import SimpleNamespace
@@ -11,7 +11,6 @@ from events.event_channels import SESSION_CONVERSATION_CHANGED
 from pipeline.database import Database
 from plugins.BaseFrontend import BaseFrontend, FrontendCapabilities
 from plugins.commands.command_services import ServicesCommand
-from plugins.commands.helpers.setting_links import quicklink_run, quicklink_value_steps, quicklinks
 from runtime.conversation_runtime import ConversationRuntime
 
 
@@ -163,34 +162,15 @@ def test_an_agent_cannot_toggle_a_service():
     assert "Could not" in out
 
 
-# ── Quicklinks ───────────────────────────────────────────────────────
+# The "Edit <Setting>" quicklinks that /tools, /tasks, /services, and
+# /frontends used to offer are gone in this pass. They worked by importing
+# command_config's internals for each setting's current value -- which a
+# sandboxed body cannot do. The pieces to rebuild them now exist (the settings
+# inventory view for declarations, ReadConfig for values, and the setting_type /
+# setting_prompt / format_value helpers in sandbox_kit), so restoring the
+# shortcut is a small addition rather than a redesign. /config edits every
+# setting in the meantime.
 
-def test_quicklinks_skip_hidden_and_missing_settings():
-    class Tool:
-        config_settings = [
-            ("Visible", "vis_key", "d", 1, {"type": "text"}),
-            ("Hidden", "hid_key", "d", 1, {"hidden": True}),
-        ]
-    values, labels = quicklinks(Tool())
-    assert values == ["edit_setting:vis_key"]
-    assert labels == ["Edit Visible"]
-    assert quicklinks(None) == ([], [])
-    assert quicklink_run("call", {}, None) is None
-    assert quicklink_value_steps("call", None) == []
-
-
-def test_quicklink_value_step_and_run_route_to_config(monkeypatch):
-    steps = quicklink_value_steps("edit_setting:data_retention_days", None)
-    assert len(steps) == 1 and steps[0].name == "value"
-
-    monkeypatch.setattr("config.config_manager.save", lambda cfg: None)
-    context = SimpleNamespace(config={"data_retention_days": 0}, db=None, user_id=1, runtime=None)
-    out = quicklink_run("edit_setting:data_retention_days", {"value": "30"}, context)
-    assert out == "Set data_retention_days = 30"
-    assert context.config["data_retention_days"] == 30
-
-
-# ── Used-by map ──────────────────────────────────────────────────────
 
 def test_setting_plugin_names_accumulate_across_declarers():
     from plugins import plugin_discovery as pd

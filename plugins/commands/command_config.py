@@ -1,27 +1,13 @@
 """Slash command plugin for `/config`."""
 
-import json
-
-from config.config_data import SETTINGS_DATA
-from config import config_manager
 from plugins.BaseCommand import BaseCommand
-from plugins.frontends.helpers.formatters import detail_card, md_table, quote_block
-from plugins.plugin_discovery import get_plugin_setting_scope, get_plugin_setting_type, get_plugin_settings, get_setting_plugin_names
-from state_machine.conversation import FormStep
 
-
-def _hidden(info):
-    """Internal helper to handle hidden."""
-    return isinstance(info, dict) and info.get("hidden") is True
-
-
-CORE = {name: (title, desc) for title, name, desc, _, info in SETTINGS_DATA if not _hidden(info)}
 ACTIONS = ["edit"]
 
-# Browse gate: settings are shown one category at a time — there are too many
-# to pick from a single flat list. Values are stable tokens (usable one-shot:
+# Browse gate: settings are shown one category at a time — there are too many to
+# pick from a single flat list. Values are stable tokens (usable one-shot:
 # `/config plugin`); labels are the button text. "all" is the explicit escape
-# hatch that reproduces the old flat everything-at-once view one tap deeper.
+# hatch that reproduces the flat everything-at-once view one tap deeper.
 _REAL_CATEGORIES = ("kernel", "plugin", "user")
 CATEGORIES = ["kernel", "plugin", "user", "all"]
 _CATEGORY_LABELS = {
@@ -30,312 +16,262 @@ _CATEGORY_LABELS = {
     "user": "User Settings",
     "all": "All Settings",
 }
-# Where each real category is stored — shown as the section header on list views.
+# Where each real category is stored — the section header on list views.
 _CATEGORY_STORAGE = {
     "kernel": "config.json",
     "plugin": "plugin_config.json",
     "user": "per-user",
 }
 
-# Global settings the filesystem watcher reads. Changing any of these triggers a
-# live watcher rescan so the sync starts immediately rather than after a restart.
-_WATCHER_KEYS = {"sync_directories", "ignored_extensions", "ignored_folders", "skip_hidden_folders"}
-
-
-def _rescan_watcher(context):
-    """Trigger a live watcher rescan if the watcher is reachable from context."""
-    orchestrator = getattr(context, "orchestrator", None)
-    watcher = getattr(orchestrator, "watcher", None)
-    if watcher is not None and hasattr(watcher, "rescan"):
-        watcher.rescan()
-
 
 class ConfigCommand(BaseCommand):
-    """Slash-command handler for `/config`."""
+    """Slash-command handler for `/config`.
+
+    Two requests over two different kinds of knowledge, and keeping them apart is
+    the whole design: the settings **catalog** (titles, types, owners, scope) is
+    an ungated inventory read, because a declaration is as public as a plugin's
+    name — while a setting's **value** goes through ``ReadConfig``, which is
+    principal-graded, because a value may be an API key. Folding values into the
+    catalog would route them around that gate.
+
+    Values are read in one batch. Listing forty settings as forty round trips
+    would be absurd, and it would put forty ledger rows behind one user action.
+    """
     name = "config"
     description = "Select a config setting, then edit it"
     category = "Config & System"
 
-    def form(self, args, context):
-        """Handle form."""
+    contract = "effects"
+    declared_requests = ["read_context", "read_config", "write_config"]
+
+    def form(self, params):
+        """Walk category → (plugin) → setting → action → value."""
+        catalog = yield from _catalog()
+        category = params.get("category")
         steps = []
-        category = args.get("category")
-        if not args.get("setting_name"):
-            # Required enum: the category gate is always the first thing browsed.
-            # There is no one-shot `/config <setting>` fall-through — the setting
-            # is always reached through its category (`/config kernel max_workers
-            # edit`) or the explicit `all` (`/config all max_workers edit`). Being
-            # required also means the frontend never offers a redundant "skip"
-            # (skip would just mean "all", which is already an explicit button).
-            steps.append(FormStep(
-                "category", "Which settings do you want to browse?", True,
-                enum=CATEGORIES,
-                enum_labels=[_CATEGORY_LABELS[c] for c in CATEGORIES]))
-            # Second drill-down level, only for plugin settings: pick the owning
-            # plugin before its settings. Optional (skippable) here is meaningful,
-            # not redundant — skipping shows every plugin setting flat, which no
-            # single button offers.
+
+        if not params.get("setting_name"):
+            # Required: the category gate is always the first thing browsed.
+            # There is no one-shot `/config <setting>` fall-through — a setting is
+            # always reached through its category or the explicit `all`. Required
+            # also means the frontend never offers a redundant "skip", which would
+            # just mean "all" and is already a button.
+            steps.append({"name": "category", "required": True, "enum": CATEGORIES,
+                          "enum_labels": [_CATEGORY_LABELS[c] for c in CATEGORIES],
+                          "prompt": "Which settings do you want to browse?"})
+            # Second drill-down, plugin settings only. Optional here is
+            # meaningful rather than redundant: skipping shows every plugin
+            # setting flat, which no single button offers.
             if category == "plugin":
-                groups = _plugin_groups()
-                steps.append(FormStep(
-                    "plugin_name", "Which plugin's settings do you want to browse?", False,
-                    enum=sorted(groups),
-                    enum_labels=[f"{p}" for p in sorted(groups)], columns=2,
-                    prompt_when_missing=True))
-        steps.append(FormStep("setting_name", "Select a setting to inspect or edit.", True,
-                              enum=sorted(_settings_for(category, args.get("plugin_name"))), columns=2))
-        if args.get("setting_name"):
-            steps.append(FormStep("action", f"What do you want to do with this setting?\n\n{_describe(context, args['setting_name'])}", True, enum=ACTIONS, enum_labels=["Edit setting"]))
-        if args.get("action") == "edit":
-            steps.append(value_step_for(args.get("setting_name"), context))
+                owners = sorted(_by_owner(catalog))
+                steps.append({"name": "plugin_name", "required": False, "columns": 2,
+                              "enum": owners, "enum_labels": owners,
+                              "prompt_when_missing": True,
+                              "prompt": "Which plugin's settings do you want to browse?"})
+
+        visible = _filter(catalog, category, params.get("plugin_name"))
+        steps.append({"name": "setting_name", "required": True, "columns": 2,
+                      "enum": sorted(s["key"] for s in visible),
+                      "prompt": "Select a setting to inspect or edit."})
+
+        chosen = _find(catalog, params.get("setting_name"))
+        if chosen:
+            card = yield from _describe(chosen)
+            steps.append({"name": "action", "required": True, "enum": ACTIONS,
+                          "enum_labels": ["Edit setting"],
+                          "prompt": f"What do you want to do with this setting?\n\n{card}"})
+        if chosen and params.get("action") == "edit":
+            steps.append(_value_step(chosen))
         return steps
 
-    def run(self, args, context):
+    def run(self, params):
         """Execute `/config` for the active session."""
-        key = args.get("setting_name")
+        from effects.vocabulary import Respond
+
+        catalog = yield from _catalog()
+        key = params.get("setting_name")
         if not key:
-            return _list(context, args.get("category"), args.get("plugin_name"))
-        if key not in _settings():
-            return f"Unknown setting: {key}"
-        if args.get("action") != "edit":
-            return _describe(context, key)
-        return apply_edit(context, key, args.get("value"))
+            listing = yield from _listing(catalog, params.get("category"),
+                                          params.get("plugin_name"))
+            return Respond(data=listing)
+
+        setting = _find(catalog, key)
+        if setting is None:
+            return Respond(data=f"Unknown setting: {key}")
+        if params.get("action") != "edit":
+            return Respond(data=(yield from _describe(setting)))
+        return (yield from apply_edit(setting, params.get("value")))
 
 
-def value_step_for(key, _context=None) -> FormStep:
-    """The value-entry form step for one setting (shared with quicklinks)."""
-    return FormStep("value", _value_prompt(key), True, _value_type(key))
+def apply_edit(setting: dict, raw_value):
+    """Write one setting through the scope-aware path.
 
-
-def apply_edit(context, key, raw_value) -> str:
-    """Write one setting through the scope-aware persistence path.
-
-    Shared by /config and the Edit-setting quicklinks on /tools, /tasks,
-    /services, and /frontends.
+    Scope travels on the request: a user-scoped setting lands on the caller's
+    config blob, a global one on the config file (and on plugin_config.json when
+    a plugin declared it). The plugin no longer picks a writer.
     """
-    config = context.config if context.config is not None else {}
-    if key not in _settings():
-        return f"Unknown setting: {key}"
-    value = _parse(raw_value, key)
+    import sandbox_kit as kit
+    from effects.vocabulary import Respond, WriteConfig
 
-    # User-scoped settings write only to the current user's config blob —
-    # never to global config.json / plugin_config.json.
-    if _scope(key) == "user":
-        db = getattr(context, "db", None)
-        if db is None:
-            return "User settings are not available in this context."
-        uid = getattr(context, "user_id", None)
-        user_cfg = db.get_user_config(uid)
-        user_cfg[key] = value
-        db.set_user_config(uid, user_cfg)
-        context.config[key] = value
-        runtime = getattr(context, "runtime", None)
-        if key == "active_agent_profile" and runtime and hasattr(runtime, "refresh_session_specs"):
-            runtime.refresh_session_specs()
-        return f"Set {key} = {_format_value(value)}"
+    value = _coerce(setting, raw_value)
+    result = yield WriteConfig(key=setting["key"], value=value, scope=setting["scope"])
+    if not result.ok:
+        return Respond(data=f"Could not set {setting['key']}: {result.error}")
 
-    old = config.get(key)
-    config[key] = value
-    config_manager.save(config)
-    if key in _plugin_keys():
-        saved = config_manager.load_plugin_config()
-        saved[key] = value
-        config_manager.save_plugin_config(saved)
-    runtime = getattr(context, "runtime", None)
-    # context.config is a per-call copy; write through to the canonical
-    # runtime config so the next /config (a fresh copy) shows the new value.
-    if runtime is not None and getattr(runtime, "config", None) is not None:
-        runtime.config[key] = value
-    if runtime and value != old and hasattr(runtime, "refresh_session_specs"):
-        runtime.refresh_session_specs()
-    # Watch-affecting keys take effect live: re-read directories and run a
-    # fresh scan so the database starts syncing without a restart.
-    if value != old and key in _WATCHER_KEYS:
-        _rescan_watcher(context)
-    if value != old and get_plugin_setting_type(key) == "frontend":
-        return f"Set {key} = {_format_value(value)}. Restart required."
-    return f"Set {key} = {_format_value(value)}"
+    message = f"Set {setting['key']} = {kit.format_value(value)}"
+    if (result.value or {}).get("restart_required"):
+        message += ". Restart required."
+    return Respond(data=message)
 
 
-def _settings():
-    """Internal helper to handle settings."""
-    return CORE | {name: (title, desc) for title, name, desc, _, info in get_plugin_settings() if not _hidden(info)}
+def _catalog():
+    """Yield the settings catalog (declarations only, never values)."""
+    from effects.vocabulary import ReadContext
+
+    result = yield ReadContext(view="settings")
+    return result.value or []
 
 
-def _category_of(key) -> str:
-    """Which /config browse category a setting belongs to."""
-    if _scope(key) == "user":
-        return "user"
-    return "plugin" if key in _plugin_keys() else "kernel"
+def _values(settings: list[dict]) -> dict:
+    """Yield current values for *settings*, batched by scope.
 
+    Two requests at most, not one per setting — user-scoped and global keys are
+    stored in different places, so they cannot share a single read."""
+    from effects.vocabulary import ReadConfig
 
-def _settings_for(category=None, plugin_name=None):
-    """The settings dict, filtered to one browse category (and, for the plugin
-    category, one owning plugin) when given. "all"/None mean everything."""
-    all_settings = _settings()
-    if category == "plugin" and plugin_name:
-        keys = _plugin_groups().get(plugin_name, [])
-        return {k: all_settings[k] for k in keys if k in all_settings}
-    if category not in _REAL_CATEGORIES:
-        return all_settings
-    return {k: v for k, v in all_settings.items() if _category_of(k) == category}
-
-
-def _plugin_groups() -> dict:
-    """Plugin-category settings grouped by owning plugin name:
-    ``{plugin_name: [setting_key, ...]}``. A setting declared by several plugins
-    appears under each of them; ones with no known owner fall under "(unknown)"."""
-    groups: dict = {}
-    for key in _settings():
-        if _category_of(key) != "plugin":
+    out = {}
+    for scope in ("global", "user"):
+        keys = [s["key"] for s in settings if s["scope"] == scope]
+        if not keys:
             continue
-        for owner in get_setting_plugin_names(key) or ["(unknown)"]:
-            groups.setdefault(owner, []).append(key)
-    return groups
-
-
-def _category_counts() -> dict:
-    """Setting count per browse category, for the gate labels."""
-    counts = dict.fromkeys(_REAL_CATEGORIES, 0)
-    for key in _settings():
-        counts[_category_of(key)] += 1
-    counts["all"] = len(_settings())
-    return counts
-
-
-def _scope(key) -> str:
-    """"user" (stored in the current user's config) or "global". Core settings are
-    global unless their type_info opts into user scope; plugins use the same flag."""
-    entry = _setting_data(key)
-    info = entry[4] if entry and isinstance(entry[4], dict) else {}
-    return "user" if info.get("scope") == "user" else (get_plugin_setting_scope(key) if key in _plugin_keys() else "global")
-
-
-def _default_for(key):
-    """Declared default value for a setting key."""
-    entry = _setting_data(key)
-    return entry[3] if entry else None
-
-
-def _current_value(context, key):
-    """The value to display/edit: per-user for user-scoped keys (defaulting to the
-    declared default), else the global config value."""
-    if _scope(key) == "user":
-        db = getattr(context, "db", None)
-        if db is None:
-            return _default_for(key)
-        uid = getattr(context, "user_id", None)
-        return db.get_user_config(uid).get(key, (context.config or {}).get(key, _default_for(key)))
-    return (context.config or {}).get(key)
-
-
-def _plugin_keys():
-    """Internal helper to handle plugin keys."""
-    return {entry[1] for entry in get_plugin_settings()}
-
-
-def _setting_data(key):
-    """Internal helper to handle setting data."""
-    return next((entry for entry in [*SETTINGS_DATA, *get_plugin_settings()] if entry[1] == key), None)
-
-
-def _value_type(key):
-    """Internal helper to handle value type."""
-    entry = _setting_data(key) or (None, None, None, None, {})
-    default, info = entry[3], entry[4] if isinstance(entry[4], dict) else {}
-    type_ = info.get("type")
-    if type_ in {"path", "path_list"}:
-        return type_
-    if type_ == "json_list":
-        return "array"
-    if type_ == "json_dict":
-        return "object"
-    if type_ in {"bool", "boolean"}:
-        return "boolean"
-    if type_ == "slider":
-        return "number" if info.get("is_float") else "integer"
-    return "array" if isinstance(default, list) else "object" if isinstance(default, dict) else "string"
-
-
-def _value_prompt(key):
-    """Internal helper to handle value prompt."""
-    vtype = _value_type(key)
-    if vtype == "path_list":
-        return ("Enter one folder path per line. / and \\ are both accepted; each folder must already exist. Example:\n\nC:\\Users\\you\\Notes\nD:\\Archive")
-    if vtype == "path":
-        return "Enter a path. / and \\ are both accepted; the parent folder must exist."
-    if vtype == "array":
-        return "Enter a list of items, one on each line, like so:\n\nitem 1\nitem 2"
-    return "Enter the new value."
-
-
-def _format_value(value):
-    """Render a setting value for display without Python repr artifacts —
-    list brackets/quotes and the doubled backslashes that str(list) produces
-    on Windows paths. Each list item is shown via str(), so a stored
-    'C:\\Users\\me' displays with single separators."""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, list):
-        return "(none)" if not value else ", ".join(str(item) for item in value)
-    return str(value)
-
-
-def _describe(context, key):
-    """Internal helper to handle describe."""
-    title, desc = _settings().get(key, (key, ""))
-    tag = " (per-user)" if _scope(key) == "user" else ""
-    users = get_setting_plugin_names(key)
-    card = detail_card(f"{title}{tag}", [
-        (key, _format_value(_current_value(context, key))),
-        ("Used by", ", ".join(users) if users else "kernel"),
-    ])
-    out = card + (f"\n\n{quote_block(desc)}" if desc.strip() else "")
-    if len(users) > 1:
-        # Shared setting: one value, several plugins. Warn that an edit here is
-        # not local to whichever plugin the user navigated in through.
-        out += f"\n\n⚠ Shared setting — changing this also affects: {', '.join(users)}."
+        result = yield ReadConfig(keys=keys, scope=scope)
+        out.update(result.value or {})
     return out
 
 
-def _settings_table(context, keys) -> str:
-    """A Setting/Value table for the given keys."""
-    rows = [(k, _format_value(_current_value(context, k))) for k in keys]
-    return md_table(["Setting", "Value"], rows)
+def _find(catalog, key):
+    """One setting's declaration, or None."""
+    return next((s for s in catalog if s["key"] == key), None) if key else None
 
 
-def _list(context, category=None, plugin_name=None):
-    """Internal helper to list config, grouped by browse category. For the plugin
-    category with no plugin chosen, settings are grouped by owning plugin."""
+def _by_owner(catalog) -> dict:
+    """Plugin-category settings grouped by owning plugin.
+
+    A setting declared by several plugins appears under each; ones with no known
+    owner fall under "(unknown)"."""
+    groups: dict = {}
+    for setting in catalog:
+        if setting["category"] != "plugin":
+            continue
+        for owner in setting["owners"] or ["(unknown)"]:
+            groups.setdefault(owner, []).append(setting)
+    return groups
+
+
+def _filter(catalog, category=None, plugin_name=None) -> list[dict]:
+    """The catalog narrowed to a browse category, and optionally one plugin."""
+    if category == "plugin" and plugin_name:
+        return _by_owner(catalog).get(plugin_name, [])
+    if category not in _REAL_CATEGORIES:
+        return list(catalog)
+    return [s for s in catalog if s["category"] == category]
+
+
+def _value_step(setting: dict) -> dict:
+    """The value-entry step for one setting."""
+    import sandbox_kit as kit
+
+    return {"name": "value", "required": True,
+            "type": kit.setting_type(setting),
+            "prompt": kit.setting_prompt(setting)}
+
+
+def _coerce(setting: dict, value):
+    """Normalise a submitted value to the setting's declared type.
+
+    Kept lenient on purpose: the value arrives as text from a form, and the
+    kernel re-coerces through the form step anyway."""
+    import json
+
+    import sandbox_kit as kit
+
+    kind = kit.setting_type(setting)
+    if kind in ("array", "object") and isinstance(value, str):
+        try:
+            return json.loads(value or ("[]" if kind == "array" else "{}"))
+        except (TypeError, ValueError):
+            if kind == "array":
+                return [line.strip() for line in value.splitlines() if line.strip()]
+            return {}
+    if kind == "boolean" and isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    if kind in ("integer", "number") and isinstance(value, str):
+        try:
+            return int(value) if kind == "integer" else float(value)
+        except (TypeError, ValueError):
+            return setting.get("default")
+    return value
+
+
+def _describe(setting: dict):
+    """A describe card for one setting, including its current value."""
+    import sandbox_kit as kit
+
+    values = yield from _values([setting])
+    tag = " (per-user)" if setting["scope"] == "user" else ""
+    owners = setting["owners"] or []
+    card = kit.detail_card(f"{setting['title']}{tag}", [
+        (setting["key"], kit.format_value(values.get(setting["key"], setting.get("default")))),
+        ("Used by", ", ".join(owners) if owners else "kernel"),
+    ])
+    description = (setting.get("description") or "").strip()
+    out = card + (f"\n\n{kit.quote_block(description)}" if description else "")
+    if len(owners) > 1:
+        # Shared setting: one value, several plugins. An edit here is not local
+        # to whichever plugin the user navigated in through.
+        out += f"\n\n⚠ Shared setting — changing this also affects: {', '.join(owners)}."
+    return out
+
+
+def _listing(catalog, category=None, plugin_name=None):
+    """The settings listing, grouped the way the browse gate implies."""
     if category == "plugin" and not plugin_name:
-        groups = _plugin_groups()
+        groups = _by_owner(catalog)
         if not groups:
             return "No plugin settings found."
-        return "\n\n".join(f"{plugin}:\n\n" + _settings_table(context, sorted(groups[plugin]))
-                           for plugin in sorted(groups))
+        values = yield from _values([s for group in groups.values() for s in group])
+        return "\n\n".join(f"{owner}:\n\n" + _table(sorted(groups[owner], key=_key), values)
+                           for owner in sorted(groups))
+
     if category == "plugin" and plugin_name:
-        keys = sorted(_settings_for("plugin", plugin_name))
-        if not keys:
+        settings = _filter(catalog, "plugin", plugin_name)
+        if not settings:
             return f"No settings for plugin: {plugin_name}"
-        return f"{plugin_name}:\n\n" + _settings_table(context, keys)
+        values = yield from _values(settings)
+        return f"{plugin_name}:\n\n" + _table(sorted(settings, key=_key), values)
+
+    wanted = [category] if category in _REAL_CATEGORIES else list(_REAL_CATEGORIES)
+    shown = [s for s in catalog if s["category"] in wanted]
+    values = yield from _values(shown)
     sections = []
-    wanted = [category] if category in _REAL_CATEGORIES else _REAL_CATEGORIES
-    for cat in wanted:
-        keys = sorted(_settings_for(cat))
-        if not keys:
+    for name in wanted:
+        settings = sorted((s for s in shown if s["category"] == name), key=_key)
+        if not settings:
             continue
-        header = f"{_CATEGORY_LABELS[cat]} ({_CATEGORY_STORAGE[cat]})"
-        sections.append(f"{header}:\n\n" + _settings_table(context, keys))
+        header = f"{_CATEGORY_LABELS[name]} ({_CATEGORY_STORAGE[name]})"
+        sections.append(f"{header}:\n\n" + _table(settings, values))
     return "\n\n".join(sections) or "No settings found."
 
 
-def _parse(value, key=None):
-    """Internal helper to parse config."""
-    if key:
-        return FormStep("value", type=_value_type(key)).coerce(value)
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return value
-    return value
+def _table(settings: list[dict], values: dict) -> str:
+    """A Setting/Value table."""
+    import sandbox_kit as kit
+
+    rows = [(s["key"], kit.format_value(values.get(s["key"], s.get("default"))))
+            for s in settings]
+    return kit.md_table(["Setting", "Value"], rows)
+
+
+def _key(setting: dict) -> str:
+    """Sort key."""
+    return setting["key"]

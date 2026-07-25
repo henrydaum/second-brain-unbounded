@@ -97,7 +97,7 @@ _MAX_EGRESS_BYTES = 200_000
 # means adding a name here and a branch in the provider, deliberately.
 INVENTORY_VIEWS: frozenset[str] = frozenset({
     "commands", "tools", "tasks", "services", "frontends", "session_state",
-    "packages", "pipeline",
+    "packages", "pipeline", "settings",
 })
 
 # Tables a sandboxed request may never touch, by identifier. ``users`` is the

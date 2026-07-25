@@ -24,6 +24,40 @@ from __future__ import annotations
 from pipeline.database import DEFAULT_USER_ID
 
 
+# Global settings the filesystem watcher reads. Changing any of these triggers a
+# live rescan so syncing starts immediately rather than after a restart.
+_WATCHER_KEYS = frozenset({
+    "sync_directories", "ignored_extensions", "ignored_folders", "skip_hidden_folders",
+})
+
+
+def _is_plugin_setting(key: str) -> bool:
+    """Whether *key* was declared by a plugin rather than by the kernel."""
+    from plugins.plugin_discovery import get_plugin_settings
+
+    return any(entry[1] == key for entry in get_plugin_settings())
+
+
+def _needs_restart(key: str) -> bool:
+    """Whether changing *key* only takes effect after a restart.
+
+    Frontend settings are the case: a frontend's transport is started once at
+    boot, so re-reading its config mid-run changes nothing."""
+    from plugins.plugin_discovery import get_plugin_setting_type
+
+    try:
+        return get_plugin_setting_type(key) == "frontend"
+    except Exception:  # noqa: BLE001 — an unknown key simply needs no restart
+        return False
+
+
+def _rescan_watcher(context) -> None:
+    """Trigger a live watcher rescan, if the watcher is reachable."""
+    watcher = getattr(getattr(context, "orchestrator", None), "watcher", None)
+    if watcher is not None and hasattr(watcher, "rescan"):
+        watcher.rescan()
+
+
 def _progress_sink(runtime, session_key):
     """Where long-running administration reports its progress.
 
@@ -75,6 +109,12 @@ def build_administer(db, config: dict, services: dict, runtime, session_key: str
                 saved = config_manager.load()
                 saved[request.key] = request.value
                 config_manager.save(saved)
+                # Plugin-declared settings live in their own file as well, so a
+                # plugin's setting survives independently of the kernel config.
+                if _is_plugin_setting(request.key):
+                    plugin_saved = config_manager.load_plugin_config()
+                    plugin_saved[request.key] = request.value
+                    config_manager.save_plugin_config(plugin_saved)
                 # ``config`` here is the live kernel dict; write through so the
                 # change takes effect without a restart, exactly as the imperative
                 # commands did.
@@ -82,9 +122,14 @@ def build_administer(db, config: dict, services: dict, runtime, session_key: str
                     config[request.key] = request.value
                 if runtime is not None and getattr(runtime, "config", None) is not None:
                     runtime.config[request.key] = request.value
-                    if hasattr(runtime, "refresh_session_specs"):
-                        runtime.refresh_session_specs()
-            return {"key": request.key, "scope": request.scope}
+            if runtime is not None and hasattr(runtime, "refresh_session_specs"):
+                runtime.refresh_session_specs()
+            # Watch-affecting keys take effect live: re-read directories and run
+            # a fresh scan so syncing starts without a restart.
+            if request.key in _WATCHER_KEYS:
+                _rescan_watcher(context)
+            return {"key": request.key, "scope": request.scope,
+                    "restart_required": _needs_restart(request.key)}
 
         if rtype == "read_config":
             # No masking here on purpose. The protection is the principal
@@ -96,7 +141,15 @@ def build_administer(db, config: dict, services: dict, runtime, session_key: str
                 if db is None:
                     raise RuntimeError("user-scoped config needs a database")
                 uid = runtime.session_user_id(session_key) if (runtime and session_key) else DEFAULT_USER_ID
-                return db.get_user_config(uid).get(request.key)
+                blob = db.get_user_config(uid)
+                if request.keys is not None:
+                    # Fall back to the effective config, which already merges the
+                    # declared defaults -- otherwise a setting the user has never
+                    # touched reads as None rather than as its default.
+                    return {k: blob.get(k, (config or {}).get(k)) for k in request.keys}
+                return blob.get(request.key, (config or {}).get(request.key))
+            if request.keys is not None:
+                return {k: (config or {}).get(k) for k in request.keys}
             return (config or {}).get(request.key)
 
         if rtype == "service_control":

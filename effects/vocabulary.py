@@ -442,11 +442,17 @@ class ReadConfig(Request):
     It is egress tier for the same reason: what makes a config read dangerous is
     that it composes onward, and pretending otherwise by grading it ``read``
     would let it slip past every gate that matters.
+
+    ``keys`` reads several at once and returns a dict — the ``ReadFiles`` to
+    ``ReadFile``'s single read. ``/config`` lists dozens of settings with their
+    values, and one round trip per setting would be absurd; batching also means
+    one ledger row for one user action rather than forty.
     """
 
     type: ClassVar[str] = "read_config"
     tier: ClassVar[str] = TIER_EGRESS
     key: str = ""
+    keys: list[str] | None = None
     scope: str = "global"
 
 

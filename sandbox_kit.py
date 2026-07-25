@@ -252,6 +252,65 @@ def unwrap(result, default=None):
     return result.value if getattr(result, "ok", False) else default
 
 
+# ── settings ─────────────────────────────────────────────────────────────
+# Five commands present plugin settings (/config, /tools, /tasks, /services,
+# /frontends) and each needs the same three answers from a setting's declared
+# ``type_info``: what form field to render, what prompt to show, how to display
+# the stored value. Shared here so their UX cannot drift apart.
+
+
+def setting_type(setting: dict) -> str:
+    """The form-field type for a setting, from its declaration.
+
+    Maps the declaration vocabulary (``json_list``, ``slider``, ``bool``…) onto
+    form-step types, falling back to the shape of the declared default."""
+    info = setting.get("type_info") or {}
+    declared, default = info.get("type"), setting.get("default")
+    if declared in {"path", "path_list"}:
+        return declared
+    if declared == "json_list":
+        return "array"
+    if declared == "json_dict":
+        return "object"
+    if declared in {"bool", "boolean"}:
+        return "boolean"
+    if declared == "slider":
+        return "number" if info.get("is_float") else "integer"
+    if isinstance(default, list):
+        return "array"
+    if isinstance(default, dict):
+        return "object"
+    return "string"
+
+
+def setting_prompt(setting: dict) -> str:
+    """The value-entry prompt for a setting, matched to its type."""
+    kind = setting_type(setting)
+    if kind == "path_list":
+        return ("Enter one folder path per line. / and \\ are both accepted; each "
+                "folder must already exist. Example:\n\nC:\\Users\\you\\Notes\nD:\\Archive")
+    if kind == "path":
+        return "Enter a path. / and \\ are both accepted; the parent folder must exist."
+    if kind == "array":
+        return "Enter a list of items, one on each line, like so:\n\nitem 1\nitem 2"
+    return "Enter the new value."
+
+
+def format_value(value) -> str:
+    """Render a setting value for display, without Python repr artifacts.
+
+    List brackets, quotes, and the doubled backslashes ``str(list)`` produces on
+    Windows paths are all noise to a reader, so each item is shown via ``str()``.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        return "(none)" if not value else ", ".join(str(item) for item in value)
+    if value is None:
+        return "(unset)"
+    return str(value)
+
+
 def failed(*results) -> str:
     """Return the first error among *results*, or ``""`` if all succeeded.
 
