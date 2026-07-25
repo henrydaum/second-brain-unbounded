@@ -64,11 +64,77 @@ logger = logging.getLogger("Effects")
 _VALID_TABLE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _MAX_EGRESS_BYTES = 200_000
 
+# Tables a sandboxed request may never touch, by identifier. ``users`` is the
+# credential store (``password_hash``) and the per-user config blob; a read there
+# is *read*-tier and ungated, and ``Complete``/``Embed`` are allowed by default,
+# so the pair composes directly into credential exfiltration — precisely the
+# hazard PRIMITIVES.md records for the kernel-state domain. Identity is available
+# the safe way through ``ReadContext("user_id")``.
+#
+# Scanned as whole identifiers, which covers quoting, schema qualification, CTEs
+# and subqueries alike (`"users"`, `main.users`, `FROM users u`) because the
+# identifier still appears literally. Conservative by construction: a false
+# positive refuses a query, never leaks one.
+DENIED_SQL_IDENTIFIERS: frozenset[str] = frozenset({"users"})
+
 # Leading keywords that mean "read only" — an ExecSql starting with one of these
 # is refused (it belongs on QueryDb, which is ungated read tier). Comments and
 # whitespace are stripped first.
 _READ_ONLY_SQL = ("select", "pragma", "explain", "with")
 _SQL_COMMENT = re.compile(r"^\s*(--[^\n]*\n|/\*.*?\*/)", re.DOTALL)
+
+
+def _check_egress_url(raw: str) -> str:
+    """Validate an outbound URL at the point of use. Raises ``PermissionError``.
+
+    Scheme is the load-bearing check: ``HttpRequest`` is graded egress and gated
+    accordingly, but a ``file://`` URL is not egress at all — it is a *local
+    read* wearing an egress badge, and urllib will happily serve it, bypassing
+    ``read_roots`` entirely. Only http/https reach the network, so only they are
+    admitted; every other scheme (file, ftp, data, gopher) is refused outright.
+
+    Also refused: credentials embedded in the URL (``user:pass@host`` leaks a
+    secret into ledger rows and the approval dialog) and link-local addresses
+    (169.254/16, notably the 169.254.169.254 cloud-metadata endpoint, which is
+    an unauthenticated credential source reachable from any host). Broader
+    private-network access stays *allowed but gated* — a human sees the target
+    in the approval dialog, and local services are a legitimate use.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit((raw or "").strip())
+    except ValueError as e:
+        raise PermissionError(f"malformed url: {e}") from e
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise PermissionError(
+            f"url scheme {scheme or '(none)'!r} is not permitted; "
+            f"HttpRequest speaks http/https only (use ReadFile for local files)")
+    if parts.username or parts.password:
+        raise PermissionError("credentials embedded in a url are not permitted")
+    host = (parts.hostname or "").strip()
+    if not host:
+        raise PermissionError("url has no host")
+    if host.lower().startswith("169.254.") or host.lower() == "metadata.google.internal":
+        raise PermissionError(f"link-local/metadata host {host!r} is not permitted")
+    return raw
+
+
+def _check_sql_tables(sql: str, denied: frozenset[str] | None) -> str:
+    """Refuse SQL that references a denied table. Raises ``PermissionError``.
+
+    Argument-level authorization for the database domain: the tier says *reads
+    are safe*, which is true only of resources the tool is entitled to. Whether
+    a given SELECT is entitled is a property of its arguments, not its verb, so
+    it is decided here at the point of use."""
+    if not denied:
+        return sql
+    for identifier in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", sql or ""):
+        if identifier.lower() in denied:
+            raise PermissionError(
+                f"table {identifier!r} is not readable from a sandboxed request")
+    return sql
 
 
 def _is_read_only_sql(sql: str) -> bool:
@@ -199,6 +265,10 @@ class EffectContext:
     paths: dict | None = None
     # Resolves a ReadContext(view, k) request to conversation text.
     context_provider: Callable[[str, int | None], str] | None = None
+    # Table identifiers no SQL request may reference (see
+    # DENIED_SQL_IDENTIFIERS). ``None`` disables the check entirely — reserved
+    # for tests; production contexts should keep the default.
+    denied_sql_identifiers: frozenset[str] | None = DENIED_SQL_IDENTIFIERS
     # Gate for egress requests: (request) -> (allowed, reason).
     egress_gate: Callable[[Request], tuple[bool, str]] = default_egress_gate
     # Identity for ledger rows.
@@ -251,6 +321,7 @@ class Interpreter:
         if isinstance(request, QueryDb):
             if self.ctx.db is None:
                 return EffectResult(ok=False, error="no database available", tier=TIER_READ)
+            _check_sql_tables(request.sql, self.ctx.denied_sql_identifiers)
             out = self.ctx.db.query(request.sql, max_rows=request.max_rows)
             return EffectResult(value=out, tier=TIER_READ)
         if isinstance(request, ListDir):
@@ -318,6 +389,8 @@ class Interpreter:
             table = request.table
             if not _VALID_TABLE.match(table):
                 return EffectResult(ok=False, error=f"invalid table name {table!r}", tier=TIER_WRITE)
+            _check_sql_tables(table, self.ctx.denied_sql_identifiers)
+            _check_sql_tables(request.schema_sql, self.ctx.denied_sql_identifiers)
             db.ensure_output_table(table, request.schema_sql)
             prev = db.query(f"SELECT COALESCE(MAX(rowid), 0) AS m FROM {table}")
             prev_max = prev["rows"][0][0] if prev["rows"] else 0
@@ -360,8 +433,11 @@ class Interpreter:
             return EffectResult(ok=False, denied=True, error=reason or "egress denied", tier=TIER_EGRESS)
 
         if isinstance(request, HttpRequest):
+            # Re-validated here, after the gate: the gate asks "may this leave?",
+            # this asks "is this actually an outbound http call at all?".
+            url = _check_egress_url(request.url)
             req = urllib.request.Request(
-                request.url, method=request.method.upper(),
+                url, method=request.method.upper(),
                 headers=request.headers or {},
                 data=request.body.encode("utf-8") if request.body else None,
             )
@@ -410,6 +486,7 @@ class Interpreter:
                 return EffectResult(
                     ok=False, tier=TIER_EGRESS,
                     error="ExecSql is for mutations; use QueryDb for SELECT/PRAGMA/EXPLAIN")
+            _check_sql_tables(request.sql, self.ctx.denied_sql_identifiers)
             result = db.execute_write(request.sql)
             rowcount = result if isinstance(result, int) else getattr(result, "rowcount", None)
             return EffectResult(value={"rowcount": rowcount}, tier=TIER_EGRESS)

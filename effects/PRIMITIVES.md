@@ -97,6 +97,36 @@ to a tool, only the single mediated `RunProcess` verb, with the kernel owning th
 handle, confining the cwd, capping output, and routing every call through the
 approval surface. CPU/memory/time remain sandbox *budgets*, not requests.
 
+## Argument-level authorization
+
+Tier answers *what kind of effect is this?* It cannot answer *is this particular
+call entitled?* — that is a property of the arguments, decided at the point of
+use, after normalization. `ReadFile("./notes.md")` and `ReadFile("~/.ssh/id_rsa")`
+are one verb and two very different acts.
+
+Three checks live in the interpreter, each guarding a domain:
+
+- **Filesystem** — `_check_path` resolves (collapsing `..` and symlinks) and then
+  compares *path components* via `Path.relative_to`, never string prefixes, so a
+  grant over `src` never admits `src2`. Never weaken this to a prefix test.
+- **Egress URLs** — `_check_egress_url` admits only `http`/`https`. This is not
+  redundant with the egress gate: `file://` is a **local read wearing an egress
+  badge**, and urllib serves it happily, bypassing `read_roots` entirely. Also
+  refused: credentials in the URL (they would land in ledger rows and the
+  approval dialog) and link-local/metadata hosts (169.254.169.254 is an
+  unauthenticated credential source). Broader private-network access stays
+  allowed-but-gated — a human sees the target, and local services are legitimate.
+- **SQL identifiers** — `_check_sql_tables` refuses any statement naming a denied
+  table (`DENIED_SQL_IDENTIFIERS`, currently `users`). Read tier does not mean
+  every row is fair game: `users` holds `password_hash` and the per-user config
+  blob, `QueryDb` is *ungated* read tier, and `Complete`/`Embed` are allowed by
+  default — so the pair composes directly into credential exfiltration. This is
+  the kernel-state hazard in the domain table made executable. Identity is
+  available the safe way through `ReadContext("user_id")`.
+
+Confinement remains context, not vocabulary: these are policies on
+`EffectContext`, not new request types.
+
 ## Standing rules
 
 - **The deferred-execution rule.** A write that something later *executes* is
@@ -105,6 +135,17 @@ approval surface. CPU/memory/time remain sandbox *budgets*, not requests.
   config, the DB file as a raw path. A write aimed there is refused or
   reclassified as gated. This is the classic capability-security failure mode;
   it also keeps journal *rollback* safe in both directions.
+
+  **Concretely:** `discover_tools` instantiates every `BaseTool` subclass under
+  the sandbox plugin root and runs it **in-process with the live context**. So an
+  approval-free write into that tree is a complete escape — a sandboxed tool
+  authors a plain (non-sandboxed) plugin and has full authority on the next load.
+  The tree therefore stays inside `write_roots` (authoring still works) but is
+  **not** in `free_write_roots` (it costs one approval). Pinned by
+  `tests/test_effect_authorization.py::test_plugin_tree_is_not_a_free_write_root`.
+  Once the trust model below lands, provenance contains such a plugin
+  automatically — but the approval stays, because two independent controls on the
+  one path that converts data into code is the right number.
 - **Nondeterminism enters through the boundary.** Time, randomness, and LLM
   completions must be requests (or params), never ambient — this is what makes
   a tool run replayable, and it is exactly what will make conversation layers
@@ -116,7 +157,63 @@ approval surface. CPU/memory/time remain sandbox *budgets*, not requests.
   and the egress gate live in `EffectContext` — policy per run, not new
   request types.
 
+## Trust: two execution modes, one contract
+
+Every plugin declares its requests and runs its body as a generator over this
+vocabulary. **Where** that body runs is a separate axis:
+
+- **untrusted** — a subprocess (`sandbox/`). Isolation by construction.
+- **trusted** — in-process. No subprocess, no AST gate.
+
+**Trusted mode is not a bypass.** Both modes drive the same generator
+(`sandbox/driver.py`) through the same `Interpreter`, so tiers, argument-level
+checks, journalling, the egress gate, and ledger rows are identical. The mode
+selects only whether a process boundary exists — pinned by
+`tests/test_execution_modes.py`, which asserts the same plugin produces the same
+result *and the same ledger rows* both ways.
+
+Measured: a request crossing the pipe costs 0.013 ms and a resident child ~4 MB,
+but a cold untrusted call costs **~520 ms** against **~4.6 ms** trusted — and that
+gap is startup, dominated by the child's imports rather than by spawn. So the
+modes buy speed as well as debuggability, and a warm worker pool is a
+requirement rather than an optimization.
+
+Two consequences that must not erode:
+
+- **Trust is a flag, never a rewrite.** One contract per family — there is no
+  parallel `BaseSandbox<Family>` hierarchy. If switching modes required editing a
+  plugin, demotion would be expensive enough that it would never happen, and the
+  whole model would decay into "everything is trusted".
+- **Trusted mode does not hand out live objects.** A trusted plugin still yields
+  `QueryDb`; it does not receive `context.db`. The moment live objects are handed
+  over as a convenience, trust becomes a rewrite again. Wanting live objects is
+  exactly what defines the exemption list below.
+
+**Trust is provenance, not origin.** Built-in kernel plugins are trusted.
+Everything else — including everything installed from the store — is untrusted
+unless its SHA-256 is recorded as reviewed. Trust binds to *reviewed bytes*, so
+any edit silently drops a plugin back to untrusted, and "it came from the
+registry" is never evidence of anything.
+
+**The TCB (permanently trusted, imperative, exempt from the contract).** These
+cannot express themselves as generators over this vocabulary, and saying so
+plainly is better than pretending otherwise:
+
+| Component | Why it cannot cross |
+|---|---|
+| `service_llm` | holds sockets/keys; streams through `on_delta` callbacks; escorts swap `request.llm` as a pointer; live exception classification |
+| `parser_registry` | a process-global registry of function objects; the orchestrator reads it in-process |
+| `service_plugin_watcher` | owns a watchdog Observer; its entire purpose is mutating host registries |
+| `service_timekeeper` | owns a background thread and the in-process bus |
+| frontend transports | own sockets and event loops (the render/parse half is *not* exempt) |
+
+This list is closed. Growth in it is the metric to watch — a test enumerates
+plugins still on the imperative contract and fails if it exceeds this set.
+
+---
+
 Prior art this deliberately follows: object-capability security (no ambient
 authority), WASI (capability-scoped, resource-oriented syscalls), Capsicum.
 The egress-dominates rule is taint-sink analysis done dynamically at one
-chokepoint instead of statically over all code.
+chokepoint instead of statically over all code. The trust/authority split —
+affordances may evolve, authority may not — follows Agent libOS (arXiv 2606.03895).
