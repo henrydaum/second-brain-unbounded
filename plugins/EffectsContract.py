@@ -110,6 +110,20 @@ class EffectsContract:
             return True
         return is_trusted(getattr(self, "_source_path", ""))
 
+    def provenance_trusted(self) -> bool:
+        """Whether this plugin is trusted **by provenance alone**.
+
+        Distinct from :meth:`trusted` on purpose. ``trusted`` answers "where does
+        this body run?" and honours ``sandbox_trust_all``; this answers "whose
+        code is it?" and never does. The two must not be conflated for the
+        administration ceiling: flipping the debug flag should relocate execution
+        into the parent process, not hand agent-authored code the authority to
+        rewrite config. Keeping them separate is also what lets the all-trusted
+        equivalence run mean anything -- it proves the mode is a *placement*
+        switch, not a permission one."""
+        from plugins.helpers.plugin_paths import is_trusted
+        return is_trusted(getattr(self, "_source_path", ""))
+
     # Periodic work, without a thread of the plugin's own. A service declaring
     # tick_interval_s > 0 has its ``tick`` body called by the kernel's single
     # clock thread (runtime/service_ticker.py). ``tick`` returns the events it
@@ -188,6 +202,7 @@ class EffectsContract:
 
         This is the narrowing: everything the plugin is *not* given (db handles,
         service objects, the runtime) stays on this side of the line."""
+        from effects.declarations import PRINCIPAL_AGENT
         from effects.interpreter import EffectContext
 
         services = getattr(context, "services", None) or {}
@@ -201,6 +216,14 @@ class EffectsContract:
             paths=self._paths(context),
             context_provider=self._context_provider(context),
             ask_user=self._ask_user(context),
+            administer=getattr(context, "administer", None),
+            # Both ceilings on the administration verbs. The principal comes off
+            # the context -- i.e. off the dispatch path that built it -- and is
+            # never inferred from what family this plugin belongs to, so a
+            # command reached through a bridge keeps the caller's principal
+            # rather than being promoted to "user" for being a command.
+            principal=getattr(context, "principal", None) or PRINCIPAL_AGENT,
+            plugin_trusted=self.provenance_trusted(),
             gate_model_calls_after_read=bool(
                 self._config(context).get("gate_model_calls_after_read")),
             tool_name=getattr(self, "name", "plugin"),

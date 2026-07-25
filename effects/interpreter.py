@@ -35,7 +35,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from effects.declarations import validate_declared
+from effects.declarations import (
+    ADMIN_REQUESTS, ALLOW, PRINCIPAL_AGENT, REFUSE, admin_disposition,
+    validate_declared,
+)
 from effects import fs_search
 from effects.vocabulary import (
     TIER_EGRESS,
@@ -43,11 +46,13 @@ from effects.vocabulary import (
     TIER_WRITE,
     AskUser,
     Complete,
+    ConversationOp,
     DeleteFile,
     Embed,
     ExecSql,
     HttpRequest,
     ListDir,
+    PackageOp,
     QueryDb,
     ReadContext,
     ReadFile,
@@ -56,7 +61,9 @@ from effects.vocabulary import (
     Request,
     Respond,
     RunProcess,
+    ServiceControl,
     Stat,
+    WriteConfig,
     WriteDb,
     WriteFile,
 )
@@ -293,6 +300,25 @@ class EffectContext:
     # means registry mutation is unavailable, and a ReloadPlugin request fails
     # rather than silently doing nothing.
     reload_plugin: Callable[[str, str], Any] | None = None
+    # Carries out an administration request (WriteConfig, ServiceControl,
+    # PackageOp, ConversationOp): (request) -> result value. Injected rather than
+    # imported so the interpreter stays free of kernel wiring and every one of
+    # these is testable without a live system. ``None`` means administration is
+    # unavailable and such a request fails rather than silently doing nothing.
+    administer: Callable[[Request], Any] | None = None
+    # ── who is asking ────────────────────────────────────────────────────
+    # Derived from the *dispatch path*, never from the plugin's family: a slash
+    # command is the user acting, a tool call in an agent turn is the agent
+    # acting. A caller that invokes another plugin propagates this rather than
+    # minting a fresh one, so a command/tool bridge cannot launder authority.
+    # Defaults to ``agent`` — the restrictive side — so a context that forgets to
+    # set it fails closed.
+    principal: str = PRINCIPAL_AGENT
+    # Whether the *body being run* is trusted by provenance. The second ceiling
+    # on administration: an agent-authored plugin gets no silent admin pass even
+    # when a human is the one invoking it. Defaults to False for the same
+    # fail-closed reason.
+    plugin_trusted: bool = False
     # Gate for egress requests: (request) -> (allowed, reason).
     egress_gate: Callable[[Request], tuple[bool, str]] = default_egress_gate
     # Local data this run has already read, as short human-readable labels.
@@ -334,6 +360,10 @@ class Interpreter:
         including egress denials and handler failures."""
         validate_declared(self.ctx.tool_name, request, self.declared)
         started = time.perf_counter()
+        refusal = self._check_principal(request)
+        if refusal is not None:
+            self._record(request, refusal, started)
+            return refusal
         try:
             if request.tier == TIER_READ:
                 result = self._fulfill_read(request)
@@ -348,6 +378,42 @@ class Interpreter:
         self._note_taint(request, result)
         self._record(request, result, started)
         return result
+
+    # ── who is asking ────────────────────────────────────────────────────
+
+    def _check_principal(self, request: Request) -> EffectResult | None:
+        """Apply the principal/provenance policy to administration requests.
+
+        Returns ``None`` to let the request proceed, or a denial. This runs
+        *before* the tier dispatch, so a refused administration request never
+        reaches its handler — and note it does not replace the egress gate: a
+        disposition of ``approve`` simply falls through to
+        ``_fulfill_egress``, which asks the human as it would for any egress.
+        The policy's job is only to decide whether "allow silently", "ask", or
+        "never" applies.
+        """
+        if request.type not in ADMIN_REQUESTS:
+            return None
+        disposition = admin_disposition(self.ctx.principal, self.ctx.plugin_trusted)
+        if disposition == REFUSE:
+            return EffectResult(
+                ok=False, denied=True, tier=request.tier,
+                error=(f"{request.type} refused: an untrusted plugin may not administer "
+                       "the kernel from an agent turn"))
+        return None
+
+    def _admin_allowed_without_prompt(self, request: Request) -> bool:
+        """Whether this administration request needs no approval prompt.
+
+        True only for the user acting through a trusted body: the human already
+        expressed the intent by typing the command, so prompting again would be
+        pure friction. Recomputed from the two context fields rather than
+        remembered from ``_check_principal`` -- interpreter instances outlive a
+        single request, and a remembered "already authorized" flag would leak
+        that authorization onto every later request in the run.
+        """
+        return (request.type in ADMIN_REQUESTS
+                and admin_disposition(self.ctx.principal, self.ctx.plugin_trusted) == ALLOW)
 
     # ── compositional tracking ───────────────────────────────────────────
 
@@ -516,9 +582,17 @@ class Interpreter:
         default because read-then-summarise is the common wanted case — but the
         taint is always recorded, so the composition is visible in the ledger
         even when it is not gated."""
-        allowed, reason = self.ctx.egress_gate(request)
-        if not allowed:
-            return EffectResult(ok=False, denied=True, error=reason or "egress denied", tier=TIER_EGRESS)
+        if not self._admin_allowed_without_prompt(request):
+            allowed, reason = self.ctx.egress_gate(request)
+            if not allowed:
+                return EffectResult(ok=False, denied=True, error=reason or "egress denied", tier=TIER_EGRESS)
+
+        if isinstance(request, (WriteConfig, ServiceControl, PackageOp, ConversationOp)):
+            administer = self.ctx.administer
+            if administer is None:
+                return EffectResult(ok=False, tier=TIER_EGRESS,
+                                    error=f"{request.type}: no administration surface is available")
+            return EffectResult(value=administer(request), tier=TIER_EGRESS)
 
         if isinstance(request, HttpRequest):
             # Re-validated here, after the gate: the gate asks "may this leave?",

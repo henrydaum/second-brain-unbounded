@@ -80,3 +80,55 @@ def validate_declared(tool_name: str, request: Request, declared: Iterable[str])
         return
     if rtype not in set(declared or ()):
         raise UndeclaredRequestError(tool_name, rtype, declared or ())
+
+
+# ── who is asking ────────────────────────────────────────────────────────
+#
+# Tier answers "how dangerous is this operation?" and is a property of the
+# operation alone. It is not the whole question for the administration verbs:
+# `/config` saving a setting is the *user* acting on their own system, while an
+# agent-authored tool saving the same setting is something else entirely. Same
+# verb, same tier, different principal.
+#
+# This generalises the rule already in PRIMITIVES.md — "the security level of a
+# request is based on what it triggers, which can depend" — from *what* to
+# *who*, and it is the only place that generalisation is encoded.
+
+PRINCIPAL_USER = "user"
+PRINCIPAL_AGENT = "agent"
+
+# The requests this policy governs. Everything else is decided by tier alone;
+# keeping the set explicit means adding a verb does not silently opt it in.
+ADMIN_REQUESTS: frozenset[str] = frozenset({
+    "write_config", "service_control", "package_op", "conversation_op",
+})
+
+ALLOW, APPROVE, REFUSE = "allow", "approve", "refuse"
+
+
+def admin_disposition(principal: str, plugin_trusted: bool) -> str:
+    """How an administration request should be treated, given both ceilings.
+
+    **Principal is derived from the dispatch path, never from the plugin's
+    family.** A slash command is the user acting; a tool call inside an agent
+    turn is the agent acting. Deriving it from the family would make a
+    command/tool bridge into a privilege escalation — the agent calls a tool
+    that calls a command that saves config — so the principal travels on the
+    context and a caller propagates it rather than minting a fresh one.
+
+    **Provenance is the second ceiling**, and it is why one axis is not enough.
+    The agent can write a command into ``sandbox_plugins/`` and wait for the user
+    to run it, laundering agent authority into user authority. Requiring both
+    axes closes that: an untrusted body never gets a silent administration pass,
+    whoever happens to be invoking it.
+
+    ============  ==================  ====================
+    principal     trusted plugin      untrusted plugin
+    ============  ==================  ====================
+    user          allow               approve
+    agent         approve             refuse
+    ============  ==================  ====================
+    """
+    if principal == PRINCIPAL_USER:
+        return ALLOW if plugin_trusted else APPROVE
+    return APPROVE if plugin_trusted else REFUSE

@@ -103,7 +103,8 @@ Apply, in order:
 | Network / services | `HttpRequest` · `Complete` · `Embed` (LLM/embedder served kernel-side; keys never enter the sandbox) | egress |
 | Compute / process | `RunProcess` (argv only — no shell string; cwd-confined; kernel owns the handle) | egress |
 | Kernel registries | `ReloadPlugin` (load/reload/unload by path; root-confined — loading *executes code*, so the deferred-execution rule puts it here rather than in write) | egress |
-| Kernel state | none — config holds API keys; a read there composes with egress into key theft | — |
+| Kernel administration | `WriteConfig` · `ServiceControl` · `PackageOp` · `ConversationOp` — the kernel administers itself through slash commands, and those commands must reach config, services, packages and conversations to run as pure bodies. Irreversible or code-executing, hence egress; additionally graded by **who is asking** (below). | egress |
+| Kernel state (reads) | none — config holds API keys; a read there composes with egress into key theft. Note `WriteConfig` must not become a read by returning the prior value. | — |
 | User | `AskUser` — *not* egress (the human is inside the trust domain, so requiring approval to request approval would be circular); gates on **attendance**, a liveness check, so an unattended session fails fast instead of hanging on a prompt nobody will see. The answer is untrusted text, like file contents. | read |
 
 **`ReadContext` ambient views.** Beyond conversation text, `ReadContext` resolves
@@ -182,6 +183,34 @@ Confinement remains context, not vocabulary: these are policies on
   `Now`/`Random` requests and drop those modules from the import allowlist; until
   then the cost is not worth paying. Recorded here so the gap is a decision
   rather than an oversight.
+- **Tier is a property of the operation; entitlement can also depend on the
+  asker.** Tier answers "how dangerous is this?" and never varies — a
+  `WriteConfig` is egress whoever issues it. But for the **administration
+  verbs**, the same operation is the user editing their own settings or an
+  autonomous agent rewriting them, and those are not the same act. So a second
+  axis grades them, in `effects/declarations.py::admin_disposition`:
+
+  | | trusted plugin | untrusted plugin |
+  |---|---|---|
+  | **principal = user** | allow | approve |
+  | **principal = agent** | approve | refuse |
+
+  Two rules make this safe rather than a loophole:
+
+  1. **Principal comes from the dispatch path, never the plugin's family.** A
+     slash command is the user acting; a tool call in an agent turn is the agent
+     acting. Inferring it from "this is a command" would make a command/tool
+     bridge a straight escalation — the agent calls a tool that calls a command
+     that saves config. A bridge must *propagate* its caller's principal.
+  2. **Provenance is the second ceiling.** Otherwise the agent writes a command
+     into `sandbox_plugins/` and waits for the user to run it, laundering agent
+     authority into user authority. Requiring both axes closes that.
+
+  Both default to the restrictive value, so a context that has not been taught
+  about principals fails closed. `sandbox_trust_all` is deliberately *not* the
+  trust input here: it answers "where does this body run?", not "whose code is
+  it?" — conflating them would let a debug flag grant authority and would make
+  the all-trusted equivalence run meaningless. Pinned by `tests/test_principal.py`.
 - **Covert channels are out of scope.** Timing and resource-exhaustion
   channels exist in every practical sandbox; they are low-bandwidth and
   accepted, not denied.

@@ -8,6 +8,7 @@ import shlex
 import uuid
 from typing import Callable
 
+from effects.declarations import PRINCIPAL_USER
 from plugins.BaseCommand import BaseCommand
 from plugins.frontends.helpers.formatters import md_table
 from state_machine.conversation import CallableSpec, FormStep
@@ -52,14 +53,31 @@ class CommandRegistry:
         """Unregister command registry."""
         self._commands.pop(name, None)
 
-    def context(self, session_key: str | None = None):
-        """Handle context."""
+    def context(self, session_key: str | None = None, principal: str | None = None):
+        """Build the context a command runs under.
+
+        ``principal`` records **who is acting**, which the effects interpreter
+        uses to grade the administration verbs (a command may save config
+        because the human typed it; the same body reached from an agent turn may
+        not). It is stamped from the *dispatch path* rather than inferred from
+        the fact that this is a command — see :meth:`dispatch_dict`.
+        """
         ctx = self._context_provider(session_key) if self._context_provider else None
         if ctx is not None:
             try:
                 ctx.command_registry = self
+                if principal is not None:
+                    ctx.principal = principal
+                # Administration is wired *only* here. A tool's context never
+                # gets one, so an agent-authored tool declaring write_config
+                # finds no surface to reach even if the principal check were
+                # somehow satisfied -- policy and capability, not policy alone.
+                if getattr(ctx, "administer", None) is None:
+                    from plugins.helpers.administration import build_administer
+                    ctx.administer = build_administer(
+                        ctx.db, ctx.config, ctx.services, ctx.runtime, session_key)
             except Exception:
-                pass
+                logger.debug("wiring command context failed", exc_info=True)
         return ctx
 
     def get_completions(self, prefix: str) -> list[BaseCommand]:
@@ -67,8 +85,22 @@ class CommandRegistry:
         prefix = prefix.lower()
         return sorted([c for c in self._commands.values() if c.name.startswith(prefix)], key=lambda c: c.name)
 
-    def dispatch_dict(self, name: str, args: dict | None = None, *, session_key: str | None = None, _emit: bool = True) -> str | None:
-        """Handle dispatch dict."""
+    def dispatch_dict(self, name: str, args: dict | None = None, *,
+                      session_key: str | None = None, _emit: bool = True,
+                      principal: str = PRINCIPAL_USER) -> str | None:
+        """Run one command.
+
+        ``principal`` defaults to ``user`` because this is the slash-command
+        path: reaching here normally means a human typed ``/name``.
+
+        **A caller that is not the human must pass its own principal.** If a
+        command/tool bridge is ever added — letting the agent invoke slash
+        commands — it must forward ``principal=context.principal`` rather than
+        accept this default, or it becomes a privilege escalation: the agent
+        calls a tool that calls a command that saves config. The default is
+        convenience for the common path, not an assertion about the caller.
+        ``tests/test_principal.py`` pins this.
+        """
         entry = self._commands.get(name)
         if entry is None:
             return f"Unknown command: '/{name}'."
@@ -76,7 +108,7 @@ class CommandRegistry:
         if _emit:
             call_id = _emit_started(name, args or {}, session_key)
         try:
-            out = entry.perform(dict(args or {}), self.context(session_key))
+            out = entry.perform(dict(args or {}), self.context(session_key, principal))
         except Exception as e:
             logger.exception(f"Command '/{name}' handler raised")
             if _emit:

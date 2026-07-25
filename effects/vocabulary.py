@@ -314,6 +314,74 @@ class RunProcess(Request):
     timeout: float = 60.0
 
 
+# ── administration (egress tier; principal-gated) ────────────────────────
+#
+# The kernel administers itself through slash commands, and those commands have
+# to reach config, services, packages and conversations. Expressing that as
+# requests is what lets kernel commands run on the same contract as everything
+# else — but the same verb in an agent-authored tool would be a straight
+# escalation (a config write can rewrite ``sandbox_write_roots`` itself).
+#
+# The resolution is that these four are ordinary **egress-tier** requests — they
+# are irreversible or execute code, exactly like ``ExecSql`` and ``RunProcess`` —
+# and that *who is asking* decides whether the gate passes, needs approval, or
+# refuses. That policy lives in ``effects/declarations.py``; nothing about it is
+# encoded here, because the tier is a property of the operation alone.
+#
+# Note there is deliberately no ``ReadConfig``: config holds API keys, and a read
+# there composes with any egress into key theft (PRIMITIVES.md, Kernel state).
+# ``WriteConfig`` must not become a read by returning the prior value.
+
+@dataclass(frozen=True)
+class WriteConfig(Request):
+    """Set one config key. ``scope`` is ``"global"`` (the kernel config file) or
+    ``"user"`` (the current user's config blob). Irreversible in the sense that
+    matters: the value it overwrites is not journalled, and config governs the
+    confinement policy itself."""
+
+    type: ClassVar[str] = "write_config"
+    tier: ClassVar[str] = TIER_EGRESS
+    key: str
+    value: Any = None
+    scope: str = "global"
+
+
+@dataclass(frozen=True)
+class ServiceControl(Request):
+    """Start, stop, or reload a service by name. Egress because loading executes
+    module-level code and import side effects cannot be un-run — the same
+    reasoning that puts ``ReloadPlugin`` at this tier."""
+
+    type: ClassVar[str] = "service_control"
+    tier: ClassVar[str] = TIER_EGRESS
+    name: str
+    action: str = "start"
+
+
+@dataclass(frozen=True)
+class PackageOp(Request):
+    """Install or uninstall a store package by file stem. Egress twice over: it
+    fetches from the network and it lands code the kernel will later execute."""
+
+    type: ClassVar[str] = "package_op"
+    tier: ClassVar[str] = TIER_EGRESS
+    name: str
+    action: str = "install"
+
+
+@dataclass(frozen=True)
+class ConversationOp(Request):
+    """Create, delete, load, or recategorize a conversation. Egress: deleting a
+    conversation destroys history that no journal can restore, and ownership is
+    enforced kernel-side via ``runtime.assert_conversation_access``."""
+
+    type: ClassVar[str] = "conversation_op"
+    tier: ClassVar[str] = TIER_EGRESS
+    action: str
+    conversation_id: int | None = None
+    fields: dict[str, Any] | None = None
+
+
 # ── registry + wire helpers ──────────────────────────────────────────────
 
 REQUEST_TYPES: dict[str, type[Request]] = {
@@ -322,6 +390,7 @@ REQUEST_TYPES: dict[str, type[Request]] = {
         ReadFile, ReadFiles, ListDir, Stat, QueryDb, ReadContext, AskUser,
         WriteFile, WriteDb, DeleteFile, Respond,
         HttpRequest, Complete, Embed, ExecSql, RunProcess, ReloadPlugin,
+        WriteConfig, ServiceControl, PackageOp, ConversationOp,
     )
 }
 

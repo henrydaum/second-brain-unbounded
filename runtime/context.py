@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from config.config_manager import DEFAULTS, USER_CONFIG_KEYS
+from effects.declarations import PRINCIPAL_AGENT, PRINCIPAL_USER
 from pipeline.database import DEFAULT_USER_ID
 
 
@@ -55,6 +56,21 @@ class SecondBrainContext:
     user_initiated: bool = False # Explicit user command, not an autonomous agent call.
     current_tool_name: str | None = None
     approval_denial_reason: str = ""
+    # Who is acting: "user" (a slash command the human typed) or "agent" (a tool
+    # call, task, or tick). Derived from ``user_initiated`` in build_context, and
+    # read by the effects interpreter to grade the administration verbs — the
+    # same WriteConfig is the user editing their own settings or an autonomous
+    # agent rewriting them, and only this field distinguishes those.
+    #
+    # It is a property of the **dispatch path**, never of the plugin's family. A
+    # bridge that lets the agent invoke a slash command must pass its own
+    # principal through rather than letting the command path re-stamp it as
+    # "user"; otherwise the bridge is a privilege escalation. Defaults to the
+    # restrictive value so a context that forgets fails closed.
+    principal: str = "agent"
+    # Carries out an administration request. Wired by the kernel; handed to the
+    # interpreter so the effects layer never imports config/package machinery.
+    administer: Any = None
 
 
 def build_context(db, config: dict, services: dict, call_tool=None,
@@ -163,5 +179,6 @@ def build_context(db, config: dict, services: dict, call_tool=None,
         user_config=user_cfg,
         user_initiated=user_initiated,
         current_tool_name=current_tool_name,
+        principal=PRINCIPAL_USER if user_initiated else PRINCIPAL_AGENT,
     )
     return ctx
