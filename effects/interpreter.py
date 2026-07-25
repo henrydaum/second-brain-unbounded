@@ -52,6 +52,7 @@ from effects.vocabulary import (
     ReadContext,
     ReadFile,
     ReadFiles,
+    ReloadPlugin,
     Request,
     Respond,
     RunProcess,
@@ -288,6 +289,10 @@ class EffectContext:
     # session is available, and an AskUser request fails fast rather than
     # hanging a turn on a question nobody will see.
     ask_user: Callable[[str, str, list[str]], str | None] | None = None
+    # Loads/reloads/unloads a plugin: (path, action) -> summary dict. ``None``
+    # means registry mutation is unavailable, and a ReloadPlugin request fails
+    # rather than silently doing nothing.
+    reload_plugin: Callable[[str, str], Any] | None = None
     # Gate for egress requests: (request) -> (allowed, reason).
     egress_gate: Callable[[Request], tuple[bool, str]] = default_egress_gate
     # Local data this run has already read, as short human-readable labels.
@@ -573,6 +578,18 @@ class Interpreter:
             result = db.execute_write(request.sql)
             rowcount = result if isinstance(result, int) else getattr(result, "rowcount", None)
             return EffectResult(value={"rowcount": rowcount}, tier=TIER_EGRESS)
+
+        if isinstance(request, ReloadPlugin):
+            reloader = self.ctx.reload_plugin
+            if reloader is None:
+                return EffectResult(ok=False, tier=TIER_EGRESS,
+                                    error="no plugin loader is available")
+            try:
+                path = self._check_path(request.path, write=False)
+            except PermissionError as e:
+                return EffectResult(ok=False, tier=TIER_EGRESS, error=str(e))
+            result = reloader(str(path), request.action)
+            return EffectResult(value=result, tier=TIER_EGRESS)
 
         if isinstance(request, RunProcess):
             return self._run_process(request)

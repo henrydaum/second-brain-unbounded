@@ -215,6 +215,35 @@ class Respond(Request):
 # ── egress (gated; exfiltration-capable regardless of verb) ──────────────
 
 @dataclass(frozen=True)
+class ReloadPlugin(Request):
+    """Load, reload, or unload the plugin at ``path`` — registry mutation as a
+    mediated verb.
+
+    The kernel's registries used to be mutated directly by whatever service felt
+    like it (the hot-reloader, the package manager), with no audit trail. Routing
+    it through a request means a reload is ledger-recorded, root-confined, and
+    gated like anything else — *more* mediated than the in-process version it
+    replaces, not less.
+
+    **Egress tier, and this is the strict reading of the deferred-execution
+    rule**: loading a plugin *executes code*, which is the one thing a write must
+    never become. It is also not journalable — you cannot un-run a module's
+    import side effects — so by the tier table it cannot be a write.
+
+    What it actually costs is graded at fulfilment, the same way a bus emit is:
+    the interpreter derives the danger from the declarations of the plugin being
+    loaded, so reloading a read-only tool need not interrupt anyone while
+    reloading an egress-tier one does.
+    """
+
+    type: ClassVar[str] = "reload_plugin"
+    tier: ClassVar[str] = TIER_EGRESS
+    path: str
+    action: str = "reload"      # "reload" | "unload"
+
+
+
+@dataclass(frozen=True)
 class HttpRequest(Request):
     """An outbound HTTP call. Egress regardless of method — a GET's URL is a
     payload. Gated through the approval surface before it is placed."""
@@ -292,7 +321,7 @@ REQUEST_TYPES: dict[str, type[Request]] = {
     for cls in (
         ReadFile, ReadFiles, ListDir, Stat, QueryDb, ReadContext, AskUser,
         WriteFile, WriteDb, DeleteFile, Respond,
-        HttpRequest, Complete, Embed, ExecSql, RunProcess,
+        HttpRequest, Complete, Embed, ExecSql, RunProcess, ReloadPlugin,
     )
 }
 

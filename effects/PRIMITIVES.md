@@ -102,6 +102,7 @@ Apply, in order:
 | | `ExecSql` (arbitrary mutation — **not** journalable, so egress-graded and gated) | egress |
 | Network / services | `HttpRequest` · `Complete` · `Embed` (LLM/embedder served kernel-side; keys never enter the sandbox) | egress |
 | Compute / process | `RunProcess` (argv only — no shell string; cwd-confined; kernel owns the handle) | egress |
+| Kernel registries | `ReloadPlugin` (load/reload/unload by path; root-confined — loading *executes code*, so the deferred-execution rule puts it here rather than in write) | egress |
 | Kernel state | none — config holds API keys; a read there composes with egress into key theft | — |
 | User | `AskUser` — *not* egress (the human is inside the trust domain, so requiring approval to request approval would be circular); gates on **attendance**, a liveness check, so an unattended session fails fast instead of hanging on a prompt nobody will see. The answer is untrusted text, like file contents. | read |
 
@@ -243,7 +244,7 @@ already retired are the proof.
 |---|---|---|---|
 | 1 | **Hold a secret** — API keys, credentials | **irreducible** | none. See below. |
 | 2 | **Own a thread or event loop** | **retired** | kernel-driven `tick` + `declared_channels` (`runtime/service_ticker.py`) |
-| 3 | **Mutate kernel registries** — register tools, load plugins | open | registry-mutation verbs (`RegisterTool`, `ReloadPlugin`), graded against the bar. More mediated than today, where the watcher mutates registries with no audit trail. |
+| 3 | **Mutate kernel registries** — register tools, load plugins | **retired** | `ReloadPlugin` — egress tier (loading executes code, and import side effects cannot be un-run), root-confined and ledger-recorded. *More* mediated than the in-process version, which mutated registries with no audit trail at all. |
 | 4 | **Be called back mid-operation** — streaming, `proceed` escorts | open | invert to yield/resume: an escort `yield`s `Proceed()` and reads the response as the resume value; streaming yields chunks outward. |
 | 5 | **Hand the kernel a live callable** — a parser function, a validator | open | declare, don't hand over: a parser declares the extensions it handles as *data* and the kernel dispatches to it through the boundary. Blocked on parsers being helper modules rather than plugins, and on heavy parsers returning live PIL/numpy/`av` objects — which is really #1 in disguise, and whose own fix is to return a path instead of an object. |
 
@@ -291,7 +292,7 @@ cannot is a bug, not an exception):
 | Component | Capability |
 |---|---|
 | `service_llm` + LLM backends | 1, 4 |
-| `service_plugin_watcher` | 3 |
+| `service_plugin_watcher` | — *(retired: `ReloadPlugin` covers the mutation; still trusted only because it is built-in)* |
 | `service_timekeeper` | — *(retired: kept trusted only because it is built-in, not because it must be)* |
 | `parser_registry` / `service_parser` | 5 |
 | frontend transports (`start`/`stop`, sockets) | 1, 2 |
