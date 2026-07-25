@@ -108,3 +108,68 @@ def test_the_compactor_proves_a_service_can_cross():
     assert 'contract = "effects"' in source
     assert '"complete"' in source
     assert "service_compactor" not in TRUSTED_EXCEPTION
+
+
+# ── the entry points exist on the real classes ───────────────────────────
+#
+# Every family's kernel entry point is called through duck typing (the registry
+# calls tool.perform, the loop calls compactor.perform), and every test double
+# defines its own. So a base class that silently lost its entry point would pass
+# the entire suite while breaking in production -- which is exactly what
+# happened once: BaseService.perform was appended below the class body, nested
+# inside a module-level function, and live compaction broke with 700+ tests
+# green. These check the real classes.
+
+ENTRY_POINTS = {
+    "plugins.BaseTool": ("BaseTool", ["perform"]),
+    "plugins.BaseCommand": ("BaseCommand", ["perform", "form_steps"]),
+    "plugins.BaseTask": ("BaseTask", ["perform", "perform_event"]),
+    "plugins.BaseService": ("BaseService", ["perform"]),
+    "plugins.BaseFrontend": ("BaseFrontend", ["_render"]),
+}
+
+
+@pytest.mark.parametrize("module,spec", sorted(ENTRY_POINTS.items()))
+def test_each_family_exposes_its_kernel_entry_points(module, spec):
+    """The kernel calls these by name; if one is missing the family is broken
+    at runtime no matter how green the suite is."""
+    import importlib
+
+    class_name, methods = spec
+    cls = getattr(importlib.import_module(module), class_name)
+
+    missing = [m for m in methods if not callable(getattr(cls, m, None))]
+    assert not missing, f"{class_name} is missing kernel entry point(s): {missing}"
+
+
+@pytest.mark.parametrize("module,spec", sorted(ENTRY_POINTS.items()))
+def test_each_family_carries_the_effects_contract(module, spec):
+    """One contract per family, and the mixin is where it lives."""
+    import importlib
+
+    from plugins.EffectsContract import EffectsContract
+
+    cls = getattr(importlib.import_module(module), spec[0])
+    assert issubclass(cls, EffectsContract)
+    assert cls.contract == "legacy", "families default to legacy; plugins opt in"
+
+
+def test_the_real_compactor_can_be_called_through_its_entry_point():
+    """An end-to-end check on the one converted kernel service, because the
+    doubles cannot catch a missing method on the real class."""
+    from types import SimpleNamespace
+
+    from plugins.services.service_compactor import CompactorService
+
+    class _LLM:
+        def invoke(self, messages):
+            return SimpleNamespace(content="a summary", is_error=False)
+
+    service = CompactorService()
+    service._source_path = "plugins/services/service_compactor.py"
+    context = SimpleNamespace(
+        db=None, services={"llm": _LLM()}, runtime=None, session_key="s1", user_id=1,
+        root_dir=".", approve_command=None, approval_denial_reason="",
+        request_user_input=None, config={"sandbox_trust_all": True})
+
+    assert service.perform("compact", {"transcript": "USER: hi"}, context) == "a summary"

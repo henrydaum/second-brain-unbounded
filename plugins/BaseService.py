@@ -190,26 +190,6 @@ class BaseService(EffectsContract, ABC):
         """Receive the live runtime service registry."""
         self.services = services
 
-
-def service_lifecycle(svc) -> str:
-    """Return a service lifecycle, defaulting to managed."""
-    return getattr(svc, "lifecycle", MANAGED) or MANAGED
-
-
-def is_extension_service(svc) -> bool:
-    """Whether a service is an installed runtime extension."""
-    return service_lifecycle(svc) == EXTENSION
-
-
-def is_user_managed_service(svc) -> bool:
-    """Whether /services should offer load/unload controls."""
-    return service_lifecycle(svc) == MANAGED
-
-
-def should_autoload_service(name: str, svc, config: dict) -> bool:
-    """Whether startup should load a service."""
-    return is_extension_service(svc) or name in (config.get("autoload_services") or [])
-
     # ── kernel entry point ───────────────────────────────────────────────
 
     def perform(self, method: str, params: dict, context):
@@ -238,3 +218,25 @@ def should_autoload_service(name: str, svc, config: dict) -> bool:
                            method, outcome.error)
             return None
         return outcome.data if outcome.data is not None else outcome.summary
+
+
+
+
+def service_lifecycle(svc) -> str:
+    """Return a service lifecycle, defaulting to managed."""
+    return getattr(svc, "lifecycle", MANAGED) or MANAGED
+
+
+def is_extension_service(svc) -> bool:
+    """Whether a service is an installed runtime extension."""
+    return service_lifecycle(svc) == EXTENSION
+
+
+def is_user_managed_service(svc) -> bool:
+    """Whether /services should offer load/unload controls."""
+    return service_lifecycle(svc) == MANAGED
+
+
+def should_autoload_service(name: str, svc, config: dict) -> bool:
+    """Whether startup should load a service."""
+    return is_extension_service(svc) or name in (config.get("autoload_services") or [])
