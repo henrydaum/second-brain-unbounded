@@ -261,6 +261,9 @@ def _conversation_runtime(scaffold, shutdown_fn, tool_registry, services, config
         commands=registry.to_callable_specs(),
         emit_event=lambda channel, payload: bus.emit(channel, payload),
     )
+    plugin_security = getattr(scaffold, "plugin_security", None)
+    if plugin_security is not None:
+        plugin_security.bind_runtime(runtime)
     runtime.command_registry = registry
     runtime._orchestrator_ref = scaffold.orchestrator
     runtime.service_ticker = _start_ticker(scaffold, services, config, tool_registry, root_dir, ref)

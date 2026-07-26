@@ -126,6 +126,14 @@ Frontends do not own that flow. `BaseFrontend` turns transport input into runtim
 
 ## Plugin System
 
+> **Security refactor:** New extensions are immutable manifest packages and are
+> isolated by default. The single-file `Base*` system described below is the
+> legacy migration oracle for the existing kernel/store inventory; production
+> discovery no longer executes DATA_DIR Python files. See
+> [Capability-security architecture](docs/SECURITY_ARCHITECTURE.md),
+> [Trust and placement](sandbox/TRUST.md), and the
+> [capability-parity matrix](docs/CAPABILITY_PARITY.md).
+
 Everything user-extensible has its own plugin family:
 
 | Family | Built-in path | Sandbox path | Contract |
@@ -153,9 +161,24 @@ In other words, the system prompt has been fully engineered.
 
 ## Security
 
-Rogue plugins are the primary security issue for Second Brain. If a plugin gets an infection, it's important to prevent it from taking down the whole system. Second Brain monitors memory usage through the Plugin Supervisor, which automatically quarantines plugins that exceed the threshold. Also: tools, tasks, and service loads are given a timeout; if they can't get the job done within that timeframe, it gets cancelled. This fixes freezes. There's also a system fallback for crashes. If Second Brain crashes, then it will restart itself automatically. When this happens, all your conversations will be reloaded exactly where they were, even if you were in the middle of a command. Second Brain has a literal heartbeat which monitors for system-wide freezes. If there's no heartbeat for a long time, the system initiates a restart, like just discussed.
+The clean-break plugin runtime treats extension code and its dependency closure
+as potentially hostile. Discovery parses `plugin.toml` and the mandatory
+`plugin.lock` without importing code. Every regular file—including bytecode and
+locked dependency archives—is bound to the artifact digest. Workers receive no
+ambient authority, and every useful operation crosses a kernel reference
+monitor. Resource handles, provenance, information labels, scoped leases,
+durable inverses, output attachments, and audit decisions are kernel-owned.
 
-The bad news: rogue plugins can still kill Second Brain. All plugins run in-process, which means that there are no subprocesses. If a plugin calls `os._exit()`, then it will take down the whole process. Like malware, a plugin can theoretically prompt the agent to mine for private information and share it. Although no plugins like this exist in the store (they have been vetted by me personally), you should make sure you trust plugins before adding them to your runtime. And when writing new plugins for Second Brain, you should use an intelligent model that won't mess things up. Consider using Codex or Claude Code for in-depth coding exercises.
+Isolation is fail-closed. A platform must provide a verified native sandbox
+backend and pass hostile filesystem, network, process, IPC, and inherited-handle
+tests. Python `-I`, AST checks, timeouts, memory limits, the Plugin Supervisor,
+heartbeat, and crash restart remain useful layers, but none is represented as an
+OS security boundary.
+
+Store code is isolated by default. A local developer may explicitly pin an
+entire artifact digest for in-process execution, accepting that those exact
+bytes and dependencies can fully compromise Second Brain. This promotion is not
+agent-callable and takes effect only after restart.
 
 ## File Indexing And Retrieval
 

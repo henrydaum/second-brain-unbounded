@@ -28,3 +28,8 @@ from pathlib import Path
 _TEMP_ROOT = Path(__file__).parent / ".pytest_tmp"
 _TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("PYTEST_DEBUG_TEMPROOT", str(_TEMP_ROOT))
+
+# Existing store/plugin tests intentionally exercise the pre-manifest runtime
+# as a migration oracle.  Production executable discovery fails closed; only
+# the test process opts into this compatibility path.
+os.environ.setdefault("SECOND_BRAIN_ENABLE_LEGACY_PLUGIN_ORACLE", "1")

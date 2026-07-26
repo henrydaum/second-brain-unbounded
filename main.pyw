@@ -224,6 +224,7 @@ class Scaffold:
 	event_trigger: Any = None
 	frontend_runtime: Any = None
 	restart: Any = None
+	plugin_security: Any = None
 
 
 _ROOT = Path(__file__).parent
@@ -274,6 +275,10 @@ def main():
 	database = Database(config["db_path"])
 	logger.info(f"Database ready: {config['db_path']} ({time.time() - t0:.2f}s)")
 
+	# --- 2b. Initialize the fail-closed manifest plugin runtime ---
+	from runtime.plugin_security import start_plugin_security
+	plugin_security = start_plugin_security(database)
+
 	# --- 3. Initialize services ---
 	t0 = time.time()
 	services = discover_services(_ROOT, config)
@@ -309,13 +314,17 @@ def main():
 	tool_registry.orchestrator = orchestrator
 	orchestrator.tool_registry = tool_registry
 	discover_tools(_ROOT, tool_registry, config)
+	from plugins.manifest_adapters import register_manifest_tools
+	register_manifest_tools(plugin_security, tool_registry)
 	logger.info(f"Tools registered: {list(tool_registry.tools.keys())} ({time.time() - t0:.2f}s)")
 
 	# --- 5c. Reconcile plugin config defaults ---
 	config_manager.reconcile_plugin_config(config, get_plugin_settings())
 
 	# --- 6. Initialize app context ---
-	scaffold = Scaffold(orchestrator, database, services, config, tool_registry)
+	scaffold = Scaffold(
+		orchestrator, database, services, config, tool_registry,
+		plugin_security=plugin_security)
 
 	# --- 6b. Determine which frontends to start ---
 	frontends = set(config.get("enabled_frontends", ["repl", "telegram"]))
@@ -355,6 +364,7 @@ def main():
 		event_trigger.stop()
 		watcher.stop()
 		_stop_ticker(scaffold)
+		plugin_security.close()
 		orchestrator.stop()
 		for svc in services.values():
 			if getattr(svc, 'loaded', False):
@@ -417,6 +427,7 @@ def main():
 				event_trigger.stop()
 				watcher.stop()
 				_stop_ticker(scaffold)
+				plugin_security.close()
 				orchestrator.stop()
 				for svc in services.values():
 					if getattr(svc, "loaded", False):

@@ -41,6 +41,11 @@ SUBSTRATE = frozenset({
     # classes above (it *is* their shared half). The sandbox child imports it to
     # locate the plugin class it execs, whatever family that class belongs to.
     "plugins.EffectsContract",
+    # Data-only capability-security substrate.  These modules contain kernel
+    # facades and metadata proxies, never extension implementations.
+    "plugins.manifest_adapters",
+    "plugins.manifest_discovery",
+    "plugins.proxy",
     "plugins.plugin_discovery",
     "plugins.helpers.plugin_paths",
     "plugins.helpers.memory_paths",

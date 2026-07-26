@@ -28,6 +28,14 @@ SANDBOX_PLUGINS = DATA_DIR / "sandbox_plugins"
 INSTALLED_PLUGINS = DATA_DIR / "installed_plugins"
 PACKAGES_DIR = DATA_DIR / "packages"
 
+# Clean-break plugin packages.  Agent-authored source is staged under
+# ``PLUGIN_STAGING`` and is never discovered as executable code.  A verified
+# build is copied into an immutable digest-named directory under
+# ``PLUGIN_ARTIFACTS`` before a PluginProxy can be activated.
+PLUGIN_STAGING = DATA_DIR / "plugin_staging"
+PLUGIN_ARTIFACTS = DATA_DIR / "plugin_artifacts"
+PLUGIN_TRUST_STORE = DATA_DIR / "trusted_artifacts.json"
+
 # Agent scratch space: per-conversation working files, notes, and intermediate
 # outputs (``scratch/c<conversation_id>``). Announced to the agent by the
 # installed file tools (point-of-use); pruned by the single retention knob.

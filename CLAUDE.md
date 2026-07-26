@@ -79,19 +79,21 @@ Core code (`pipeline/`, `runtime/`, `state_machine/`, `agent/`, `events/`,
 1. `service_llm` — `runtime/conversation_loop.py`.
 2. `parser_registry` — `pipeline/orchestrator.py`, `pipeline/watcher.py`.
 
-`effects/` (typed-request vocabulary + interpreter) and `sandbox/` (the
-pure-tool subprocess rim) are core: pure Python with no plugin-implementation
-imports. The one plugin edge they carry is `sandbox/entry.py` →
-`plugins.EffectsContract` (and the `plugins.Base*` classes it admits through the
-import gate), which is plugin *substrate* — base classes and their shared mixin,
-not implementations. The child process needs them to locate the plugin class it
-execs, whatever family that class belongs to.
+`effects/` (the legacy migration oracle), `security/` (the reference monitor),
+and `sandbox/` (the native-confined worker rim) are core: pure kernel
+infrastructure with no plugin-implementation imports. Their allowed
+`plugins.*` edges are substrate only: base classes used by the legacy oracle,
+plus `manifest_discovery`, `proxy`, and `manifest_adapters`. The latter parse
+data-only manifests, hold kernel-owned metadata proxies, and adapt those proxies
+to kernel registries; none imports extension code. Manifest extension code is
+loaded only inside a verified OS-confined worker, or after an exact-digest local
+TCB promotion.
 
 This rule is executable: `tests/test_kernel_boundary.py` AST-walks every core
 module and pins the complete set of `plugins.*` import edges (the plugin
 substrate plus the two implementations above, including lazy function-local
-imports). Widening the boundary fails the suite until the test's allowlist —
-and this section — are updated deliberately.
+imports). Widening the boundary fails the suite until the test's allowlist and
+this section are updated deliberately.
 
 Everything else is discovery-based. The agent system prompt collects optional
 guidance from each in-scope plugin's `agent_prompt_for(ctx)` (see `_collect` in

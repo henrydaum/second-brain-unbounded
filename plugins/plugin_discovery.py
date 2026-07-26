@@ -19,6 +19,7 @@ import importlib
 import importlib.util
 import inspect
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -656,9 +657,21 @@ def _load_plugin_module(module_name: str, file_path: Path, built_in: bool, reloa
 def _load_external(module_name: str, file_path: Path, reload: bool):
     """Load a DATA_DIR plugin module via spec_from_file_location.
 
-    Always uses spec_from_file_location (never importlib.reload) because
-    reload() can't re-find specs for modules loaded this way.
+    This is the legacy compatibility oracle, not the production extension
+    loader.  Importing a file to discover its metadata executes hostile code in
+    the kernel before any subprocess boundary exists.  Production therefore
+    fails closed.  The test suite and explicit migration tooling may opt into
+    the oracle with ``SECOND_BRAIN_ENABLE_LEGACY_PLUGIN_ORACLE=1`` while store
+    plugins are ported to data-only manifests and PluginProxy.
     """
+    if os.environ.get("SECOND_BRAIN_ENABLE_LEGACY_PLUGIN_ORACLE") != "1":
+        logger.error(
+            "Refusing executable discovery of external plugin %s. "
+            "Package it with plugin.toml and activate it through the manifest "
+            "runtime. The legacy loader is available only to migration tests.",
+            file_path,
+        )
+        return None
     try:
         _ensure_external_namespaces(module_name)
         if reload:

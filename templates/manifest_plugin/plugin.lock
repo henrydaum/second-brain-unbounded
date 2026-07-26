@@ -1,0 +1,10 @@
+lock_version = 1
+
+# The isolated builder adds one [[packages]] table per resolved wheel:
+#
+# [[packages]]
+# name = "example"
+# version = "1.2.3"
+# artifact = "dependencies/example-1.2.3-py3-none-any.whl"
+# sha256 = "lowercase sha256"
+# dependencies = []

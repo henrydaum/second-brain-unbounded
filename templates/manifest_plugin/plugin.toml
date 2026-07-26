@@ -1,0 +1,33 @@
+# Clean-break manifest template. Discovery reads this file as data and does not
+# import plugin.py.
+schema_version = 1
+id = "example.my_plugin"
+version = "0.1.0"
+runtime = "python"
+description = "Describe the behavior, not the authority."
+
+[[handlers]]
+kind = "tool"
+name = "my_tool"
+entrypoint = "plugin:run"
+description = "Explain when the agent should call this tool."
+persistent = false
+
+[handlers.schema]
+type = "object"
+
+[handlers.schema.properties.input]
+type = "string"
+description = "Input text."
+
+[[capabilities]]
+right = "files.read"
+resource = "notes/*"
+labels = ["user-private"]
+
+[budgets]
+memory_mb = 128
+cpu_seconds = 10
+wall_seconds = 30
+max_output_bytes = 1048576
+max_concurrency = 1
